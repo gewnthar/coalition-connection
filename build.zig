@@ -1,14 +1,14 @@
 const std = @import("std");
 
 // Steps:
-//   zig build                 build everything (use --release=safe for production builds)
+//   zig build                 build everything (zig build --release builds ReleaseSafe)
 //   zig build test            unit tests in src/
 //   zig build fuzz -Dseed=N   seeded fuzz run (fuzz/main.zig)
 //   zig build sim -Dseed=N    seeded deterministic simulation run (sim/main.zig)
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
     const seed = b.option(u64, "seed", "Seed for the fuzz and simulation runs") orelse 0x5eed;
 
     const root = b.createModule(.{
@@ -40,9 +40,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = options_module },
             },
         });
+        // Test harnesses: built and run by their own steps, never installed with the program.
         const exe = b.addExecutable(.{ .name = runner.name, .root_module = module });
-        b.installArtifact(exe);
-
         const run = b.addRunArtifact(exe);
         const step = b.step(runner.name, runner.description);
         step.dependOn(&run.step);
