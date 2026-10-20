@@ -15,16 +15,20 @@
 //! Limits (src/constants.zig):
 //!   http_connections_max
 //!   http_request_size_max
+//!   http_headers_max
 //!   http_response_size_max
 //!   websocket_connections_max
 //!   websocket_message_size_max
 //!   live_events_backlog_max
 //!
-//! Status: stub. No feature code yet; see docs/roadmap.md (core milestone, live-update slices).
+//! Status: the HTTP/1.1 request parser (roadmap 1.5) is in `http_request.zig`; the rest is a
+//! stub. See docs/roadmap.md (core milestone, live-update slices).
 
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("../constants.zig");
+
+pub const http_request = @import("http_request.zig");
 
 comptime {
     assert(constants.websocket_connections_max <= constants.http_connections_max);
@@ -34,8 +38,13 @@ comptime {
 test "live: stub compiles and its limits are set" {
     try std.testing.expect(constants.http_connections_max > 0);
     try std.testing.expect(constants.http_request_size_max > 0);
+    try std.testing.expect(constants.http_headers_max > 0);
     try std.testing.expect(constants.http_response_size_max > 0);
     try std.testing.expect(constants.websocket_connections_max > 0);
     try std.testing.expect(constants.websocket_message_size_max > 0);
     try std.testing.expect(constants.live_events_backlog_max > 0);
+}
+
+test {
+    _ = http_request;
 }
