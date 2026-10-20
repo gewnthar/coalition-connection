@@ -149,15 +149,25 @@ that serves a page already runs this way.
 
 ### Containers
 
-Each process is a Quadlet unit (`.container` files under the service user's
-`~/.config/containers/systemd/`), which systemd turns into ordinary services. The units
-live in the repository under `deploy/`.
+Each process is a Quadlet unit under the service user's `~/.config/containers/systemd/`,
+which systemd turns into ordinary services. The units live in the repository under
+`deploy/`. All three containers join one pod (a Quadlet `.pod` unit), so they share a
+network namespace: the app reaches Postgres and Valkey on `localhost`, and only the app's
+web port is published.
 
 | Unit | Runs | Reachable from |
 | --- | --- | --- |
+| `coalition-connection.pod` | The shared network namespace; publishes the web port | - |
 | `coalition-connection.container` | The Zig binary | Cloudflare, through the web port |
-| `postgres.container` | Postgres | The app's container network only |
-| `valkey.container` | Valkey | The app's container network only |
+| `postgres.container` | Postgres, listening on `localhost` only | The app only |
+| `valkey.container` | Valkey, listening on `localhost` only | The app only |
+
+**The client's source address must survive the trip.** The Cloudflare checks below rely
+on the app seeing Cloudflare's address as its TCP peer. A rootless container on a Podman
+bridge network gets its published ports from `rootlessport`, which replaces the source
+address, so the pod does not use a bridge network. It uses `pasta`, the default rootless
+network mode in Podman 5, whose port forwarding keeps the original source address. The
+SELinux smoke test (roadmap 1.54) fails if the app sees anything other than the real peer.
 
 Rules for every unit:
 
@@ -166,9 +176,8 @@ Rules for every unit:
   never `SecurityLabelDisable=true` (`--security-opt label=disable`), never a host
   directory shared without a label.
 - No extra Linux capabilities. Rootless containers can't bind ports below 1024 by default,
-  so the app listens on a high port and firewalld forwards the public port to it. That
-  forward, and Podman's rootless networking, must preserve the client's source address,
-  because the Cloudflare checks below rely on it; the SELinux smoke test checks this.
+  so the pod publishes a high port and firewalld forwards the public port to it (a local
+  redirect, which keeps the source address).
 - The image is built from the ReleaseSafe binary and holds nothing else it doesn't need.
 
 ### Cloudflare
@@ -188,7 +197,7 @@ Cloudflare proxies every web request. Three rules follow from that:
    the host, so the two back each other up.
 
 Cloudflare publishes its ranges at <https://www.cloudflare.com/ips/>, and they can change,
-so they live in the config file (roadmap 1.8), not in code. `src/cidr.zig` (roadmap 1.48)
+so they live in the config file (roadmap 1.8), not in code. `src/cidr.zig` (roadmap 1.49)
 parses IPv4 and IPv6 CIDR ranges into a fixed table, sized by a new limit, `cloudflare_ranges_max`, in
 `src/constants.zig`, and answers whether an address is inside. Both the server and the
 installer's firewall rules read the same list.
@@ -197,12 +206,12 @@ installer's firewall rules read the same list.
 3 assume the Zig server sees Cloudflare's address as its TCP peer. That holds if the Zig
 server, or something that passes the connection through unchanged, faces Cloudflare. If a
 TLS proxy such as nginx terminates TLS in front of the app, the app's peer is the proxy,
-and the proxy has to apply both rules instead. Until this is decided, the Deployment
-slices that depend on it wait.
+and the proxy has to apply both rules instead. Roadmap 1.48 then builds whichever is
+chosen; until it is decided, the Deployment slices that depend on it wait.
 
 ### Installer
 
-After the core works (roadmap 1.54), one command sets up a host. It asks for the EVE
+After the core works (roadmap 1.55), one command sets up a host. It asks for the EVE
 application's client ID and secret, the callback URL, the domain, the database and the
 first admin character, then writes the config file and the Quadlet units, loads the
 Cloudflare ranges into firewalld, and starts the services. It checks that SELinux is
@@ -219,7 +228,7 @@ enforcing and stops with a clear message if it isn't; it never changes the SELin
 | SELinux | On an AlmaLinux 10 machine with SELinux enforcing: start the units, send a smoke request, and fail on any AVC denial or a lost client address |
 
 GitHub's hosted runners are Ubuntu and can't enforce SELinux, so the SELinux test runs
-on a separate AlmaLinux machine; where it runs is an open decision (roadmap 1.52).
+on a separate AlmaLinux machine; where it runs is an open decision (roadmap 1.53).
 
 ## Status
 

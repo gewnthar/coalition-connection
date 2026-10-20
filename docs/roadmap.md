@@ -84,7 +84,7 @@ maintainer; it is not started until that choice is written down.
 | 1.33 | Event ids, the catch-up backlog and the fall-back reload | unit; simulation with dropped sockets |
 | 1.34 | Fan-out from Valkey pub/sub to watching pages | simulation |
 | 1.35 | The small client script that swaps fragments in | browser test |
-| 1.36 | First pages: login, characters, groups | unit |
+| 1.36 | First pages: login, characters, groups (after the Deployment group below, so they run deployed from the start) | unit |
 | 1.37 | Leave alerts | unit; simulation |
 
 ### Importer
@@ -109,24 +109,26 @@ maintainer; it is not started until that choice is written down.
 ### Deployment
 
 Deployment comes with the core: the first slice that serves a page runs on AlmaLinux 10
-with SELinux enforcing, as a rootless Podman Quadlet behind Cloudflare. The requirements
-are in [architecture.md](architecture.md#deployment).
+with SELinux enforcing, as a rootless Podman Quadlet behind Cloudflare. So this group is
+built before 1.36, the first pages, even though it is listed here. The requirements are in
+[architecture.md](architecture.md#deployment).
 
 | # | Slice | Tests |
 | --- | --- | --- |
 | 1.47 | **Decision:** where TLS from Cloudflare ends on the origin (the Zig server, a pass-through, or a TLS proxy that then applies the Cloudflare rules itself) | - |
-| 1.48 | CIDR matcher: parse IPv4 and IPv6 ranges from the config into a fixed table sized by `cloudflare_ranges_max`, and test whether an address is inside; the ranges themselves come from the config file (1.8) | table-driven unit at the edges of every prefix length; fuzz the parser |
-| 1.49 | Real client IP: trust `CF-Connecting-IP` only from a peer inside the ranges; otherwise use the peer address and log it (needs 1.5, 1.47, 1.48) | unit; simulation with spoofed headers from outside the ranges |
-| 1.50 | Accept web traffic only from Cloudflare: close outside peers at accept, before reading a byte, and count them (needs 1.1, 1.3, 1.47, 1.48) | full-table simulation with mixed peers |
-| 1.51 | Rootless Podman Quadlet units in `deploy/`: unprivileged, read-only root, `:Z` volumes, never privileged or unlabeled (needs a server binary from 1.2 and 1.3) | CI builds the image and runs Quadlet's dry-run generator on each unit |
-| 1.52 | **Decision:** where the SELinux test runs (a VM or a self-hosted runner) | - |
-| 1.53 | SELinux enforcing smoke test: start the units on AlmaLinux 10, send a smoke request, fail on any AVC denial or a lost client address (needs 1.51, 1.52) | the script itself |
+| 1.48 | Origin TLS as chosen in 1.47: a TLS listener in the Zig server, or a proxy Quadlet unit in the pod that applies the Cloudflare rules (needs 1.47; its other dependencies follow from the choice) | unit or config check, as the choice allows; the smoke test in 1.54 |
+| 1.49 | CIDR matcher: parse IPv4 and IPv6 ranges into a fixed table sized by `cloudflare_ranges_max`, and test whether an address is inside; the ranges themselves come from the config file (1.8) | table-driven unit at the edges of every prefix length; fuzz the parser |
+| 1.50 | Real client IP: trust `CF-Connecting-IP` only from a peer inside the ranges; otherwise use the peer address and log it (needs 1.5, 1.47, 1.49) | unit; simulation with spoofed headers from outside the ranges |
+| 1.51 | Accept web traffic only from Cloudflare: close outside peers at accept, before reading a byte, and count them (needs 1.1, 1.3, 1.47, 1.49) | full-table simulation with mixed peers |
+| 1.52 | Rootless Podman Quadlet units in `deploy/`: one pod on `pasta` networking, unprivileged, read-only root, `:Z` volumes, never privileged or unlabeled (needs a server binary from 1.2 and 1.3) | CI builds the image and runs Quadlet's dry-run generator on each unit |
+| 1.53 | **Decision:** where the SELinux test runs (a VM or a self-hosted runner) | - |
+| 1.54 | SELinux enforcing smoke test: start the units on AlmaLinux 10, send a smoke request through Cloudflare's ranges, fail on any AVC denial or if the app sees a peer other than the real one (needs 1.48, 1.52, 1.53) | the script itself |
 
 ### After the core works
 
 | # | Slice | Tests |
 | --- | --- | --- |
-| 1.54 | Installer: one command that asks for the EVE app's client ID and secret, the callback URL, the domain, the database and the first admin character, then writes the config and Quadlet units, loads the Cloudflare ranges into firewalld and starts the services; checks that SELinux is enforcing and never changes its mode | run on the SELinux test machine from 1.53 |
+| 1.55 | Installer: one command that asks for the EVE app's client ID and secret, the callback URL, the domain, the database and the first admin character, then writes the config and Quadlet units, loads the Cloudflare ranges into firewalld and starts the services; checks that SELinux is enforcing and never changes its mode | run on the SELinux test machine from 1.54 |
 
 ## Milestone 2: taxes
 
