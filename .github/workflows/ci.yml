@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # The one place the Zig version is pinned.
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }} (SHA-256 checked against the download index)
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 https://ziglang.org/download/index.json -o "$RUNNER_TEMP/index.json"
+          url=$(jq -r --arg v "$ZIG_VERSION" '.[$v]["x86_64-linux"].tarball' "$RUNNER_TEMP/index.json")
+          sha=$(jq -r --arg v "$ZIG_VERSION" '.[$v]["x86_64-linux"].shasum' "$RUNNER_TEMP/index.json")
+          if [ "$url" = "null" ] || [ "$sha" = "null" ]; then
+            echo "Zig $ZIG_VERSION for x86_64-linux is not in the download index" >&2
+            exit 1
+          fi
+          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$sha  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Check the Zig version
+        run: test "$(zig version)" = "$ZIG_VERSION"
+
+      - name: zig fmt
+        run: zig fmt --check build.zig src fuzz sim
+
+      - name: ReleaseSafe build
+        run: zig build --release=safe
+
+      - name: Tests (Debug)
+        run: zig build test
+
+      - name: Tests (ReleaseSafe)
+        run: zig build test --release=safe
+
+      - name: Fuzz (fixed seed)
+        run: zig build fuzz --release=safe -Dseed=1
+
+      - name: Simulation (fixed seed)
+        run: zig build sim --release=safe -Dseed=1
