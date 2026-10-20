@@ -5,7 +5,9 @@ replacement for Alliance Auth. It's a hobby project, vibe coded for fun and test
 Stability comes before features: a coalition's auth has to just work. The headline
 upgrade is live updates: pages change the moment the data does, without reloads.
 
-It runs as one Zig binary beside Postgres and Valkey, with nginx in front for TLS.
+It runs as one Zig binary beside Postgres and Valkey, as rootless Podman containers on
+AlmaLinux 10 with SELinux enforcing, behind Cloudflare. [Deployment](#deployment) has the
+details.
 
 ## Rules every component follows
 
@@ -66,7 +68,7 @@ explicit inputs and outputs. The rules that keep it that way:
 ## Data flow
 
 ```
-browser --HTTPS--> nginx --> live  <--------------.
+browser --> Cloudflare ----> live  <--------------.
                               |                    |  change events
                               v                    |  (Valkey pub/sub)
                              sso --> access -------+--> services --> Mumble, XMPP
@@ -126,6 +128,98 @@ How each component is tested:
 | Taxes | ledger and rate math | ledger invariants vs a model | wallet and price feed gaps | a month of taxes, to the ISK |
 | Audits | per-route storage, alerts | ESI body parsers | partial and failed fetches | - |
 | SRP | each check and outcome | killmail and fit parsers | late killmails, missing skill history | past decisions replayed |
+
+## Deployment
+
+Version 1 runs on AlmaLinux 10 with SELinux enforcing, as rootless Podman Quadlets, behind
+Cloudflare. Deployment is part of the core milestone, not an afterthought: the first slice
+that serves a page already runs this way.
+
+### Host
+
+- **AlmaLinux 10, SELinux enforcing, always.** No setup step, script, doc or installer
+  ever runs `setenforce 0`, edits `/etc/selinux/config`, or suggests either. If something
+  is denied, the fix is a correct label or a small reviewed policy module, never turning
+  SELinux off. A denial is a bug.
+- **One unprivileged service user** owns the containers. `loginctl enable-linger` lets its
+  units start at boot without a login session. Nothing runs as root except the host's own
+  services (firewalld, sshd).
+- **firewalld** opens the web port only to Cloudflare's published address ranges, held in
+  an ipset. SSH is limited separately. Postgres and Valkey have no open port on the host.
+
+### Containers
+
+Each process is a Quadlet unit (`.container` files under the service user's
+`~/.config/containers/systemd/`), which systemd turns into ordinary services. The units
+live in the repository under `deploy/`.
+
+| Unit | Runs | Reachable from |
+| --- | --- | --- |
+| `coalition-connection.container` | The Zig binary | Cloudflare, through the web port |
+| `postgres.container` | Postgres | The app's container network only |
+| `valkey.container` | Valkey | The app's container network only |
+
+Rules for every unit:
+
+- Runs as the unprivileged service user, rootless, with a read-only root file system.
+- Volumes carry SELinux labels (`:Z`, private to that container). Never `--privileged`,
+  never `SecurityLabelDisable=true` (`--security-opt label=disable`), never a host
+  directory shared without a label.
+- No extra Linux capabilities. Rootless containers can't bind ports below 1024 by default,
+  so the app listens on a high port and firewalld forwards the public port to it. That
+  forward, and Podman's rootless networking, must preserve the client's source address,
+  because the Cloudflare checks below rely on it; the SELinux smoke test checks this.
+- The image is built from the ReleaseSafe binary and holds nothing else it doesn't need.
+
+### Cloudflare
+
+Cloudflare proxies every web request. Three rules follow from that:
+
+1. **Websockets pass through.** Cloudflare proxies websocket upgrades. It also closes
+   connections that sit idle, so the live-update socket sends pings well inside
+   Cloudflare's idle timeout (roadmap 1.32), and a dropped socket reconnects and catches
+   up from its last event id as it would after any other drop.
+2. **Real client IPs only from Cloudflare.** The client's address comes from the
+   `CF-Connecting-IP` header only when the TCP peer is inside Cloudflare's published
+   ranges. Otherwise the header is ignored, the peer address is used, and the event is
+   logged. Without this, anyone could fake their address by sending the header.
+3. **Web traffic only from Cloudflare.** The server closes connections from outside the
+   ranges at accept, before reading a byte, and counts them. firewalld does the same at
+   the host, so the two back each other up.
+
+Cloudflare publishes its ranges at <https://www.cloudflare.com/ips/>, and they can change,
+so they live in the config file (roadmap 1.8), not in code. `src/cidr.zig` (roadmap 1.48)
+parses IPv4 and IPv6 CIDR ranges into a fixed table, sized by a new limit, `cloudflare_ranges_max`, in
+`src/constants.zig`, and answers whether an address is inside. Both the server and the
+installer's firewall rules read the same list.
+
+**Open decision (roadmap 1.47): where TLS from Cloudflare ends on the origin.** Rules 2 and
+3 assume the Zig server sees Cloudflare's address as its TCP peer. That holds if the Zig
+server, or something that passes the connection through unchanged, faces Cloudflare. If a
+TLS proxy such as nginx terminates TLS in front of the app, the app's peer is the proxy,
+and the proxy has to apply both rules instead. Until this is decided, the Deployment
+slices that depend on it wait.
+
+### Installer
+
+After the core works (roadmap 1.54), one command sets up a host. It asks for the EVE
+application's client ID and secret, the callback URL, the domain, the database and the
+first admin character, then writes the config file and the Quadlet units, loads the
+Cloudflare ranges into firewalld, and starts the services. It checks that SELinux is
+enforcing and stops with a clear message if it isn't; it never changes the SELinux mode.
+
+### How deployment is tested
+
+| What | Test |
+| --- | --- |
+| CIDR matcher | Table-driven unit tests at the edges of every prefix length; fuzz the parser |
+| Real client IP | Unit tests; simulation with spoofed `CF-Connecting-IP` from outside the ranges |
+| Cloudflare-only accept | Full-table simulation with a mix of Cloudflare and outside peers |
+| Quadlet units | CI builds the image and runs Quadlet's dry-run generator on each unit |
+| SELinux | On an AlmaLinux 10 machine with SELinux enforcing: start the units, send a smoke request, and fail on any AVC denial or a lost client address |
+
+GitHub's hosted runners are Ubuntu and can't enforce SELinux, so the SELinux test runs
+on a separate AlmaLinux machine; where it runs is an open decision (roadmap 1.52).
 
 ## Status
 

@@ -106,6 +106,28 @@ maintainer; it is not started until that choice is written down.
 | 1.45 | Mumble account and role sync | unit; simulation with Mumble down |
 | 1.46 | XMPP account and role sync | unit; simulation with XMPP down |
 
+### Deployment
+
+Deployment comes with the core: the first slice that serves a page runs on AlmaLinux 10
+with SELinux enforcing, as a rootless Podman Quadlet behind Cloudflare. The requirements
+are in [architecture.md](architecture.md#deployment).
+
+| # | Slice | Tests |
+| --- | --- | --- |
+| 1.47 | **Decision:** where TLS from Cloudflare ends on the origin (the Zig server, a pass-through, or a TLS proxy that then applies the Cloudflare rules itself) | - |
+| 1.48 | CIDR matcher: parse IPv4 and IPv6 ranges from the config into a fixed table sized by `cloudflare_ranges_max`, and test whether an address is inside; the ranges themselves come from the config file (1.8) | table-driven unit at the edges of every prefix length; fuzz the parser |
+| 1.49 | Real client IP: trust `CF-Connecting-IP` only from a peer inside the ranges; otherwise use the peer address and log it (needs 1.5, 1.47, 1.48) | unit; simulation with spoofed headers from outside the ranges |
+| 1.50 | Accept web traffic only from Cloudflare: close outside peers at accept, before reading a byte, and count them (needs 1.1, 1.3, 1.47, 1.48) | full-table simulation with mixed peers |
+| 1.51 | Rootless Podman Quadlet units in `deploy/`: unprivileged, read-only root, `:Z` volumes, never privileged or unlabeled (needs a server binary from 1.2 and 1.3) | CI builds the image and runs Quadlet's dry-run generator on each unit |
+| 1.52 | **Decision:** where the SELinux test runs (a VM or a self-hosted runner) | - |
+| 1.53 | SELinux enforcing smoke test: start the units on AlmaLinux 10, send a smoke request, fail on any AVC denial or a lost client address (needs 1.51, 1.52) | the script itself |
+
+### After the core works
+
+| # | Slice | Tests |
+| --- | --- | --- |
+| 1.54 | Installer: one command that asks for the EVE app's client ID and secret, the callback URL, the domain, the database and the first admin character, then writes the config and Quadlet units, loads the Cloudflare ranges into firewalld and starts the services; checks that SELinux is enforcing and never changes its mode | run on the SELinux test machine from 1.53 |
+
 ## Milestone 2: taxes
 
 | # | Slice | Tests |
