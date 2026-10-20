@@ -163,16 +163,21 @@ web port is published.
 | `valkey.container` | Valkey, listening on `localhost` only | The app only |
 
 **The client's source address must survive the trip.** The Cloudflare checks below rely
-on the app seeing Cloudflare's address as its TCP peer. A rootless container on a Podman
+on whatever enforces them (the app, or a TLS proxy if roadmap 1.47 picks one) seeing
+Cloudflare's address as its TCP peer. A rootless container on a Podman
 bridge network gets its published ports from `rootlessport`, which replaces the source
 address, so the pod does not use a bridge network. It uses `pasta`, the default rootless
 network mode in Podman 5, whose port forwarding keeps the original source address. The
-SELinux smoke test (roadmap 1.54) fails if the app sees anything other than the real peer.
+SELinux smoke test (roadmap 1.54) fails if the component that enforces the Cloudflare
+rules sees anything other than the real peer.
 
 Rules for every unit:
 
 - Runs as the unprivileged service user, rootless, with a read-only root file system.
-- Volumes carry SELinux labels (`:Z`, private to that container). Never `--privileged`,
+- Volumes carry SELinux labels (`:Z`). The containers in a pod share one SELinux label, so
+  `:Z` makes a volume private to the pod, not to one container: the SELinux boundary is
+  around the pod as a whole, and the app, Postgres and Valkey are not isolated from each
+  other by it. Each container mounts only the volumes it needs. Never `--privileged`,
   never `SecurityLabelDisable=true` (`--security-opt label=disable`), never a host
   directory shared without a label.
 - No extra Linux capabilities. Rootless containers can't bind ports below 1024 by default,
@@ -225,7 +230,7 @@ enforcing and stops with a clear message if it isn't; it never changes the SELin
 | Real client IP | Unit tests; simulation with spoofed `CF-Connecting-IP` from outside the ranges |
 | Cloudflare-only accept | Full-table simulation with a mix of Cloudflare and outside peers |
 | Quadlet units | CI builds the image and runs Quadlet's dry-run generator on each unit |
-| SELinux | On an AlmaLinux 10 machine with SELinux enforcing: start the units, send a smoke request, and fail on any AVC denial or a lost client address |
+| SELinux | On an AlmaLinux 10 machine with SELinux enforcing: start the units, send a smoke request, and fail on any AVC denial or if the component enforcing the Cloudflare rules sees a peer other than the real one |
 
 GitHub's hosted runners are Ubuntu and can't enforce SELinux, so the SELinux test runs
 on a separate AlmaLinux machine; where it runs is an open decision (roadmap 1.53).

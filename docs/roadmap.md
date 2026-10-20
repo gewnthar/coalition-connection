@@ -120,9 +120,9 @@ built before 1.36, the first pages, even though it is listed here. The requireme
 | 1.49 | CIDR matcher: parse IPv4 and IPv6 ranges into a fixed table sized by `cloudflare_ranges_max`, and test whether an address is inside; the ranges themselves come from the config file (1.8) | table-driven unit at the edges of every prefix length; fuzz the parser |
 | 1.50 | Real client IP: trust `CF-Connecting-IP` only from a peer inside the ranges; otherwise use the peer address and log it (needs 1.5, 1.47, 1.49) | unit; simulation with spoofed headers from outside the ranges |
 | 1.51 | Accept web traffic only from Cloudflare: close outside peers at accept, before reading a byte, and count them (needs 1.1, 1.3, 1.47, 1.49) | full-table simulation with mixed peers |
-| 1.52 | Rootless Podman Quadlet units in `deploy/`: one pod on `pasta` networking, unprivileged, read-only root, `:Z` volumes, never privileged or unlabeled (needs a server binary from 1.2 and 1.3) | CI builds the image and runs Quadlet's dry-run generator on each unit |
+| 1.52 | Rootless Podman Quadlet units in `deploy/`: one pod on `pasta` networking, unprivileged, read-only root, `:Z` volumes (private to the pod) mounted only where needed, never privileged or unlabeled (needs a server binary from 1.2 and 1.3) | CI builds the image and runs Quadlet's dry-run generator on each unit |
 | 1.53 | **Decision:** where the SELinux test runs (a VM or a self-hosted runner) | - |
-| 1.54 | SELinux enforcing smoke test: start the units on AlmaLinux 10, send a smoke request through Cloudflare's ranges, fail on any AVC denial or if the app sees a peer other than the real one (needs 1.48, 1.52, 1.53) | the script itself |
+| 1.54 | SELinux enforcing smoke test: start the units on AlmaLinux 10, send a smoke request through Cloudflare's ranges, fail on any AVC denial or if the component that enforces the Cloudflare rules (the app, or the proxy chosen in 1.47) sees a peer other than the real one (needs 1.48, 1.52, 1.53) | the script itself |
 
 ### After the core works
 
