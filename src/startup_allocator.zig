@@ -157,3 +157,109 @@ test "startup allocator: phases move forward only" {
     try testing.expectEqual(StartupAllocator.Phase.shutdown, startup.phase);
     try testing.expect(!startup.allocationAllowed());
 }
+
+// The tests below use a FixedBufferAllocator as the child, because its resize and remap
+// results are deterministic: growing works only for the last allocation, and shrinking
+// always works. The backing buffer is larger than the budget, so a refusal in the
+// past-the-budget tests can only come from the budget check.
+
+test "startup allocator: resize grows and shrinks within the budget" {
+    var backing: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&backing);
+    var startup = StartupAllocator.init(fixed.allocator(), 64);
+    const gpa = startup.allocator();
+
+    var memory = try gpa.alloc(u8, 16);
+    try testing.expect(gpa.resize(memory, 48));
+    memory = memory.ptr[0..48];
+    try testing.expectEqual(@as(u64, 48), startup.bytes_live);
+
+    // Growing to exactly the budget is allowed.
+    try testing.expect(gpa.resize(memory, 64));
+    memory = memory.ptr[0..64];
+    try testing.expectEqual(@as(u64, 64), startup.bytes_live);
+
+    try testing.expect(gpa.resize(memory, 8));
+    memory = memory.ptr[0..8];
+    try testing.expectEqual(@as(u64, 8), startup.bytes_live);
+
+    gpa.free(memory);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "startup allocator: resize past the budget fails and leaves bytes_live unchanged" {
+    var backing: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&backing);
+    var startup = StartupAllocator.init(fixed.allocator(), 64);
+    const gpa = startup.allocator();
+
+    const memory = try gpa.alloc(u8, 32);
+    try testing.expect(!gpa.resize(memory, 65));
+    try testing.expectEqual(@as(u64, 32), startup.bytes_live);
+
+    // One byte past the budget, counting a second live allocation.
+    const other = try gpa.alloc(u8, 32);
+    try testing.expectEqual(@as(u64, 64), startup.bytes_live);
+    try testing.expect(!gpa.resize(memory, 33));
+    try testing.expectEqual(@as(u64, 64), startup.bytes_live);
+
+    gpa.free(other);
+    gpa.free(memory);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "startup allocator: resize the child refuses leaves bytes_live unchanged" {
+    var backing: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&backing);
+    var startup = StartupAllocator.init(fixed.allocator(), 64);
+    const gpa = startup.allocator();
+
+    // The budget allows this growth, but the child can't grow a block that isn't its last.
+    const first = try gpa.alloc(u8, 16);
+    const second = try gpa.alloc(u8, 16);
+    try testing.expect(!gpa.resize(first, 32));
+    try testing.expectEqual(@as(u64, 32), startup.bytes_live);
+
+    gpa.free(second);
+    gpa.free(first);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "startup allocator: remap grows and shrinks within the budget" {
+    var backing: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&backing);
+    var startup = StartupAllocator.init(fixed.allocator(), 64);
+    const gpa = startup.allocator();
+
+    var memory = try gpa.alloc(u8, 16);
+    memory = gpa.remap(memory, 64) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 64), memory.len);
+    try testing.expectEqual(@as(u64, 64), startup.bytes_live);
+
+    memory = gpa.remap(memory, 8) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 8), memory.len);
+    try testing.expectEqual(@as(u64, 8), startup.bytes_live);
+
+    gpa.free(memory);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "startup allocator: remap past the budget fails and leaves bytes_live unchanged" {
+    var backing: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&backing);
+    var startup = StartupAllocator.init(fixed.allocator(), 64);
+    const gpa = startup.allocator();
+
+    const memory = try gpa.alloc(u8, 32);
+    try testing.expect(gpa.remap(memory, 65) == null);
+    try testing.expectEqual(@as(u64, 32), startup.bytes_live);
+
+    // The child refuses too: a block that isn't its last can't grow.
+    const other = try gpa.alloc(u8, 16);
+    try testing.expect(gpa.remap(memory, 48) == null);
+    try testing.expectEqual(@as(u64, 48), startup.bytes_live);
+
+    gpa.free(other);
+    gpa.free(memory);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
