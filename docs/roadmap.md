@@ -7,7 +7,8 @@ skill history. There is one cutover, once everything matches.
 
 Each slice is one pull request small enough to review in about 15 minutes, and ships with
 the tests named beside it. **Decision** marks a slice that waits on a choice from the
-maintainer; it is not started until that choice is written down.
+maintainer; it is not started until that choice is written down. **Decided** marks one
+whose choice is written down, with the date it was made.
 
 ## Milestone 0: framework (this pull request)
 
@@ -24,7 +25,7 @@ maintainer; it is not started until that choice is written down.
 
 | # | Slice | Tests |
 | --- | --- | --- |
-| 1.1 | **Decision:** event loop on Zig's `std.Io` or a hand-written io_uring loop | - |
+| 1.1 | **Decided (2026-10-22):** the event loop is a hand-written io_uring loop of our own, not Zig's `std.Io`, so the core doesn't depend on the standard library's I/O interface while it keeps changing | - |
 | 1.2 | Real I/O implementation: monotonic clock | unit; contract check |
 | 1.3 | Real I/O: TCP accept, read and write with fixed buffers | unit; simulation |
 | 1.4 | Connection table sized from `http_connections_max` | unit; full-table simulation |
@@ -115,20 +116,20 @@ built before 1.36, the first pages, even though it is listed here. The requireme
 
 | # | Slice | Tests |
 | --- | --- | --- |
-| 1.47 | **Decision:** where TLS from Cloudflare ends on the origin (the Zig server, a pass-through, or a TLS proxy that then applies the Cloudflare rules itself) | - |
-| 1.48 | Origin TLS as chosen in 1.47: a TLS listener in the Zig server, or a proxy Quadlet unit in the pod that applies the Cloudflare rules (needs 1.47; its other dependencies follow from the choice) | unit or config check, as the choice allows; the smoke test in 1.54 |
-| 1.49 | CIDR matcher: parse IPv4 and IPv6 ranges into a fixed table sized by `cloudflare_ranges_max`, and test whether an address is inside; the ranges themselves come from the config file (1.8) | table-driven unit at the edges of every prefix length; fuzz the parser |
-| 1.50 | Real client IP: trust `CF-Connecting-IP` only from a peer inside the ranges; otherwise use the peer address and log it (needs 1.5, 1.47, 1.49) | unit; simulation with spoofed headers from outside the ranges |
-| 1.51 | Accept web traffic only from Cloudflare: close outside peers at accept, before reading a byte, and count them (needs 1.1, 1.3, 1.47, 1.49) | full-table simulation with mixed peers |
-| 1.52 | Rootless Podman Quadlet units in `deploy/`: one pod on `pasta` networking, unprivileged, read-only root, `:Z` volumes (private to the pod) mounted only where needed, never privileged or unlabeled (needs a server binary from 1.2 and 1.3) | CI builds the image and runs Quadlet's dry-run generator on each unit |
+| 1.47 | **Decided (2026-10-22):** TLS from Cloudflare ends at nginx, in the pod. nginx and firewalld enforce the Cloudflare rules, and the app listens only locally | - |
+| 1.48 | nginx Quadlet unit in the pod: TLS with a Cloudflare origin certificate (Full strict), websocket proxying with timeouts longer than the ping interval (1.32), SELinux-labeled volumes, proxying to the app's local socket (needs 1.3) | CI runs `nginx -t` on the config and Quadlet's dry-run generator on the unit; the smoke test in 1.54 |
+| 1.49 | Cloudflare rules at nginx and firewalld: from one list of Cloudflare's published ranges, nginx gets `set_real_ip_from` for each range with `real_ip_header CF-Connecting-IP`, and passes the client address to the app in `X-Real-IP`. nginx also refuses any connection whose original peer, `$realip_remote_addr`, is outside the ranges (a `geo` map on that variable). Plain `allow`/`deny` can't do this check, because they run after the real-IP module has replaced the peer address with the client's. firewalld's ipset opens the web port only to the same ranges. No CIDR matching in the app (needs 1.48) | CI runs `nginx -t` on the generated config; the smoke test in 1.54 |
+| 1.50 | Real client IP in the app: use `X-Real-IP` only on requests from nginx on the local socket; otherwise ignore the header, use the peer address and log it (needs 1.5, 1.51) | unit tests for the header rule; simulation with spoofed headers |
+| 1.51 | The app listens only on a local socket inside the pod that only nginx reaches, never on a published port (needs 1.1, 1.3) | unit; simulation with a non-local peer refused |
+| 1.52 | Rootless Podman Quadlet units in `deploy/`: one pod on `pasta` networking that publishes only nginx's port, unprivileged, read-only root, `:Z` volumes (private to the pod) mounted only where needed, never privileged or unlabeled (needs a server binary from 1.2 and 1.3) | CI builds the image and runs Quadlet's dry-run generator on each unit |
 | 1.53 | **Decision:** where the SELinux test runs (a VM or a self-hosted runner) | - |
-| 1.54 | SELinux enforcing smoke test: start the units on AlmaLinux 10, send a smoke request through Cloudflare's ranges, fail on any AVC denial or if the component that enforces the Cloudflare rules (the app, or the proxy chosen in 1.47) sees a peer other than the real one (needs 1.48, 1.52, 1.53) | the script itself |
+| 1.54 | SELinux enforcing smoke test: start the units on AlmaLinux 10, send a smoke request through Cloudflare's ranges and one from outside them, fail on any AVC denial, if nginx sees a peer other than the real one, or if the request from outside the ranges isn't refused (needs 1.48, 1.49, 1.52, 1.53) | the script itself |
 
 ### After the core works
 
 | # | Slice | Tests |
 | --- | --- | --- |
-| 1.55 | Installer: one command that asks for the EVE app's client ID and secret, the callback URL, the domain, the database and the first admin character, then writes the config and Quadlet units, loads the Cloudflare ranges into firewalld and starts the services; checks that SELinux is enforcing and never changes its mode | run on the SELinux test machine from 1.54 |
+| 1.55 | Installer: one command that asks for the EVE app's client ID and secret, the callback URL, the domain, the database and the first admin character, then writes the config and Quadlet units, loads the Cloudflare ranges into firewalld and nginx and starts the services; checks that SELinux is enforcing and never changes its mode | run on the SELinux test machine from 1.54 |
 
 ## Milestone 2: taxes
 

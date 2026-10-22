@@ -6,8 +6,8 @@ Stability comes before features: a coalition's auth has to just work. The headli
 upgrade is live updates: pages change the moment the data does, without reloads.
 
 It runs as one Zig binary beside Postgres and Valkey, as rootless Podman containers on
-AlmaLinux 10 with SELinux enforcing, behind Cloudflare. [Deployment](#deployment) has the
-details.
+AlmaLinux 10 with SELinux enforcing, behind nginx and Cloudflare.
+[Deployment](#deployment) has the details.
 
 ## Rules every component follows
 
@@ -68,7 +68,10 @@ explicit inputs and outputs. The rules that keep it that way:
 ## Data flow
 
 ```
-browser --> Cloudflare ----> live  <--------------.
+browser --> Cloudflare ---> nginx
+                              |  TLS ends here; client IP in X-Real-IP
+                              v  over a local socket
+                             live  <--------------.
                               |                    |  change events
                               v                    |  (Valkey pub/sub)
                              sso --> access -------+--> services --> Mumble, XMPP
@@ -151,33 +154,33 @@ that serves a page already runs this way.
 
 Each process is a Quadlet unit under the service user's `~/.config/containers/systemd/`,
 which systemd turns into ordinary services. The units live in the repository under
-`deploy/`. All three containers join one pod (a Quadlet `.pod` unit), so they share a
-network namespace: the app reaches Postgres and Valkey on `localhost`, and only the app's
-web port is published.
+`deploy/`. All four containers join one pod (a Quadlet `.pod` unit), so they share a
+network namespace: nginx reaches the app on a local socket, the app reaches Postgres and
+Valkey on `localhost`, and only nginx's web port is published.
 
 | Unit | Runs | Reachable from |
 | --- | --- | --- |
-| `coalition-connection.pod` | The shared network namespace; publishes the web port | - |
-| `coalition-connection.container` | The Zig binary | Cloudflare, through the web port |
+| `coalition-connection.pod` | The shared network namespace; publishes nginx's web port only | - |
+| `nginx.container` | nginx: ends TLS, applies the Cloudflare rules, proxies to the app | Cloudflare, through the web port |
+| `coalition-connection.container` | The Zig binary, listening only on a local socket | nginx only |
 | `postgres.container` | Postgres, listening on `localhost` only | The app only |
 | `valkey.container` | Valkey, listening on `localhost` only | The app only |
 
 **The client's source address must survive the trip.** The Cloudflare checks below rely
-on whatever enforces them (the app, or a TLS proxy if roadmap 1.47 picks one) seeing
-Cloudflare's address as its TCP peer. A rootless container on a Podman
+on nginx seeing Cloudflare's address as its TCP peer. A rootless container on a Podman
 bridge network gets its published ports from `rootlessport`, which replaces the source
 address, so the pod does not use a bridge network. It uses `pasta`, the default rootless
 network mode in Podman 5, whose port forwarding keeps the original source address. The
-SELinux smoke test (roadmap 1.54) fails if the component that enforces the Cloudflare
-rules sees anything other than the real peer.
+SELinux smoke test (roadmap 1.54) fails if nginx sees anything other than the real
+peer.
 
 Rules for every unit:
 
 - Runs as the unprivileged service user, rootless, with a read-only root file system.
 - Volumes carry SELinux labels (`:Z`). The containers in a pod share one SELinux label, so
   `:Z` makes a volume private to the pod, not to one container: the SELinux boundary is
-  around the pod as a whole, and the app, Postgres and Valkey are not isolated from each
-  other by it. Each container mounts only the volumes it needs. Never `--privileged`,
+  around the pod as a whole, and nginx, the app, Postgres and Valkey are not isolated from
+  each other by it. Each container mounts only the volumes it needs. Never `--privileged`,
   never `SecurityLabelDisable=true` (`--security-opt label=disable`), never a host
   directory shared without a label.
 - No extra Linux capabilities. Rootless containers can't bind ports below 1024 by default,
@@ -193,44 +196,47 @@ Cloudflare proxies every web request. Three rules follow from that:
    connections that sit idle, so the live-update socket sends pings well inside
    Cloudflare's idle timeout (roadmap 1.32), and a dropped socket reconnects and catches
    up from its last event id as it would after any other drop.
-2. **Real client IPs only from Cloudflare.** The client's address comes from the
+2. **Real client IPs only from Cloudflare.** nginx takes the client's address from the
    `CF-Connecting-IP` header only when the TCP peer is inside Cloudflare's published
-   ranges. Otherwise the header is ignored, the peer address is used, and the event is
-   logged. Without this, anyone could fake their address by sending the header.
-3. **Web traffic only from Cloudflare.** The server closes connections from outside the
-   ranges at accept, before reading a byte, and counts them. firewalld does the same at
-   the host, so the two back each other up.
+   ranges (`set_real_ip_from` for each range, `real_ip_header CF-Connecting-IP`), and
+   passes it to the app in `X-Real-IP`. The app uses `X-Real-IP` only on requests from
+   nginx on its local socket; otherwise it ignores the header, uses the peer address, and
+   logs the event. Without this, anyone could fake their address by sending the header.
+3. **Web traffic only from Cloudflare.** firewalld opens the web port only to Cloudflare's
+   ranges. nginx refuses any connection whose original peer (`$realip_remote_addr`) is
+   outside them. The check must use that variable, not `allow`/`deny`, because those run
+   after the real-IP module has replaced the peer with the client's address. The app
+   listens only on a local socket inside the pod that only nginx reaches. The layers back
+   each other up.
 
 Cloudflare publishes its ranges at <https://www.cloudflare.com/ips/>, and they can change,
-so they live in the config file (roadmap 1.8), not in code. `src/cidr.zig` (roadmap 1.49)
-parses IPv4 and IPv6 CIDR ranges into a fixed table, sized by a new limit, `cloudflare_ranges_max`, in
-`src/constants.zig`, and answers whether an address is inside. Both the server and the
-installer's firewall rules read the same list.
+so they are kept as data, not in code. One list feeds nginx's real-IP rules, its peer check
+and firewalld's ipset (roadmap 1.49), so they can't disagree. The app does no CIDR
+matching of its own.
 
-**Open decision (roadmap 1.47): where TLS from Cloudflare ends on the origin.** Rules 2 and
-3 assume the Zig server sees Cloudflare's address as its TCP peer. That holds if the Zig
-server, or something that passes the connection through unchanged, faces Cloudflare. If a
-TLS proxy such as nginx terminates TLS in front of the app, the app's peer is the proxy,
-and the proxy has to apply both rules instead. Roadmap 1.48 then builds whichever is
-chosen; until it is decided, the Deployment slices that depend on it wait.
+**Decided (roadmap 1.47, 2026-10-22): TLS from Cloudflare ends at nginx.** nginx runs in
+the pod, ends TLS with a Cloudflare origin certificate, applies rules 2 and 3 with
+firewalld behind it, and proxies to the app, which listens only locally (roadmap 1.48 to
+1.51).
 
 ### Installer
 
 After the core works (roadmap 1.55), one command sets up a host. It asks for the EVE
 application's client ID and secret, the callback URL, the domain, the database and the
 first admin character, then writes the config file and the Quadlet units, loads the
-Cloudflare ranges into firewalld, and starts the services. It checks that SELinux is
+Cloudflare ranges into firewalld and nginx, and starts the services. It checks that SELinux is
 enforcing and stops with a clear message if it isn't; it never changes the SELinux mode.
 
 ### How deployment is tested
 
 | What | Test |
 | --- | --- |
-| CIDR matcher | Table-driven unit tests at the edges of every prefix length; fuzz the parser |
-| Real client IP | Unit tests; simulation with spoofed `CF-Connecting-IP` from outside the ranges |
-| Cloudflare-only accept | Full-table simulation with a mix of Cloudflare and outside peers |
+| nginx | CI runs `nginx -t` on the config, including the rules generated from the Cloudflare ranges |
+| Real client IP | Unit tests for the `X-Real-IP` rule; simulation with spoofed headers |
+| Local-only listener | Unit tests; simulation with a non-local peer refused |
+| Cloudflare-only traffic | The SELinux smoke test sends a request from outside the ranges and expects it refused |
 | Quadlet units | CI builds the image and runs Quadlet's dry-run generator on each unit |
-| SELinux | On an AlmaLinux 10 machine with SELinux enforcing: start the units, send a smoke request, and fail on any AVC denial or if the component enforcing the Cloudflare rules sees a peer other than the real one |
+| SELinux | On an AlmaLinux 10 machine with SELinux enforcing: start the units, send a smoke request, and fail on any AVC denial, if nginx sees a peer other than the real one, or if a request from outside the ranges gets through |
 
 GitHub's hosted runners are Ubuntu and can't enforce SELinux, so the SELinux test runs
 on a separate AlmaLinux machine; where it runs is an open decision (roadmap 1.53).
