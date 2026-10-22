@@ -70,6 +70,10 @@ pub const http_connections_max: u32 = 4_096;
 /// rejected before parsing.
 pub const http_request_size_max: u32 = 16 * 1024;
 
+/// Header fields in one HTTP request. Reason: browsers send about 10 to 20 and Cloudflare
+/// adds a handful; 64 leaves headroom while bounding the header table and every lookup.
+pub const http_headers_max: u32 = 64;
+
 /// Largest rendered HTTP response. Reason: the biggest planned page (a full audit view)
 /// fits; bigger views paginate.
 pub const http_response_size_max: u32 = 1024 * 1024;
@@ -157,6 +161,8 @@ comptime {
     assert(characters_per_user_max <= characters_max);
     assert(groups_per_user_max <= groups_max);
     assert(websocket_connections_max <= http_connections_max);
+    // The smallest header line is "a:" plus CRLF, 4 bytes, so a full header table must fit.
+    assert(http_headers_max * 4 < http_request_size_max);
     assert(websocket_message_size_max <= http_response_size_max);
     assert(esi_error_limit_floor > 0);
     assert(esi_retries_max > 0);
