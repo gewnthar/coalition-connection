@@ -203,12 +203,15 @@ Cloudflare proxies every web request. Three rules follow from that:
    nginx on its local socket; otherwise it ignores the header, uses the peer address, and
    logs the event. Without this, anyone could fake their address by sending the header.
 3. **Web traffic only from Cloudflare.** firewalld opens the web port only to Cloudflare's
-   ranges, nginx allows only those ranges and denies the rest, and the app listens only on
-   a local socket inside the pod that only nginx reaches. The layers back each other up.
+   ranges. nginx refuses any connection whose original peer (`$realip_remote_addr`) is
+   outside them. The check must use that variable, not `allow`/`deny`, because those run
+   after the real-IP module has replaced the peer with the client's address. The app
+   listens only on a local socket inside the pod that only nginx reaches. The layers back
+   each other up.
 
 Cloudflare publishes its ranges at <https://www.cloudflare.com/ips/>, and they can change,
-so they are kept as data, not in code. One list feeds both nginx's real-IP and allow rules
-and firewalld's ipset (roadmap 1.49), so the two can't disagree. The app does no CIDR
+so they are kept as data, not in code. One list feeds nginx's real-IP rules, its peer check
+and firewalld's ipset (roadmap 1.49), so they can't disagree. The app does no CIDR
 matching of its own.
 
 **Decided (roadmap 1.47, 2026-10-22): TLS from Cloudflare ends at nginx.** nginx runs in
