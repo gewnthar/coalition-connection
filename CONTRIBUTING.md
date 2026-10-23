@@ -33,6 +33,23 @@ git rebase --signoff main
 
 Pull requests with an unsigned commit are not merged.
 
+### Commits written with AI tools
+
+Some of the maintainer's own commits are written with AI coding tools. The maintainer directs
+that work and certifies it under the DCO, so from 2026-10-23 on those commits are authored and
+signed off under the maintainer's identity and carry a `Co-Authored-By` trailer naming the
+tool, for example:
+
+```text
+Signed-off-by: gewnthar <122470689+gewnthar@users.noreply.github.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
+```
+
+A `Co-Authored-By` trailer gives credit; it is not a sign-off and certifies nothing. Earlier
+commits signed off as the tool predate this rule. It covers only the maintainer's commits:
+outside contributors sign off their own commits as described above, and the maintainer never
+signs off a commit for someone else.
+
 ## Coding standards
 
 Code follows the NASA [Power of 10](https://spinroot.com/gerard/pdf/P10.pdf) rules and
