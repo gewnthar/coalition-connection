@@ -61,7 +61,8 @@ explicit inputs and outputs. The rules that keep it that way:
   permissions as a pure function of its inputs and emits change events. `services` and
   `live` act on those events.
 - **Money moves only through the ledger.** Taxes and SRP payouts are double-entry ledger
-  entries; neither edits a balance directly.
+  transfers; neither edits a balance directly. They reach the ledger only through one Zig
+  interface, checked at compile time like the I/O contract ([Ledger](#ledger)).
 - **Sensitive reads are logged.** Every admin action and every view of a member's private
   audit data writes an audit-log entry through `storage`.
 
@@ -86,7 +87,8 @@ importer --> storage <-- every component (Postgres, Valkey, audit log)
 ```
 
 1. **Login.** A browser goes through EVE SSO. `sso` verifies the token, links the
-   character to a user as main or alt, and stores the refresh token through `storage`.
+   character to a user as main or alt, and stores the refresh token, encrypted
+   ([Tokens at rest](#tokens-at-rest)), through `storage`.
 2. **Affiliation.** `esi` polls each character's corporation and alliance. `access`
    recomputes the user's state, groups and permissions and emits change events.
 3. **Fan-out.** Change events go through Valkey pub/sub. `services` updates Mumble and XMPP
@@ -97,6 +99,66 @@ importer --> storage <-- every component (Postgres, Valkey, audit log)
 6. **Import and shadow run.** `importer` loads an Alliance Auth export. During the shadow
    run it re-imports nightly, and the results of steps 2 and 5 are compared with Alliance
    Auth's without acting on them.
+
+## Tokens at rest
+
+Decided 2026-10-23 (roadmap 1.38). Pilots' ESI refresh tokens are encrypted before they
+reach the database, with XChaCha20-Poly1305 from Zig's standard library, which is safe with
+random nonces.
+
+- **The key** is 32 bytes in its own file, mounted as a Podman secret that only the service
+  account can read. It is never in the config file, the database or a log. The
+  service reads it once at startup into a fixed array and refuses to start if the file is
+  missing or the wrong size.
+- **Each stored token** keeps a `u8` key ID, a fresh random 24-byte nonce and the 16-byte
+  tag. The character ID and token kind are bound in as associated data, so a ciphertext
+  can't be moved to another row.
+- **Key rotation:** the key file can hold the current and the previous key, and tokens move
+  to the new key on their next refresh.
+- **Fixed sizes:** token buffers are fixed and sized by `token_size_max` in
+  `src/constants.zig`; encrypt and decrypt work on one token at a time, and plaintext
+  buffers are wiped after use. The key never leaves the token module.
+- **Errors, not crashes:** a stored row is outside data, so a wrong or unknown key ID, a
+  bad length, a tampered row or the wrong key each return a named error. Assertions cover
+  only what the code itself controls, such as the key and nonce lengths.
+
+This protects a leaked database or backup, not a server someone controls. That's why
+opening a member's mail or wallet still needs a fresh EVE login.
+
+## Ledger
+
+Decided 2026-10-23 (roadmap 2.2). Taxes and SRP share one double-entry ledger, stored in
+Postgres and shaped like [TigerBeetle](https://tigerbeetle.com)'s accounts and transfers, so
+a later move to TigerBeetle is a backend swap rather than a redesign.
+
+- **Transfers are append-only,** each with a 128-bit ID the app picks, so a retried request
+  can't post twice.
+- **Accounts keep running debit and credit totals,** as TigerBeetle's do; a balance is read
+  from them, never stored separately.
+- **Amounts are whole hundredths of an ISK,** held as `u128` in Zig and stored as
+  `numeric(39,0)`, which fits every 128-bit value.
+- **Corrections are new reversing transfers.** Nothing is edited or deleted.
+- **SRP approvals are two-phase:** a pending transfer that is later posted or voided.
+- **All-or-nothing batches are linked,** so either every transfer in the batch posts or none
+  does.
+
+## Services: Mumble and XMPP
+
+Decided 2026-10-23 (roadmap 1.43 and 1.44).
+
+- **Mumble** login is written in Zig, with no bridge in another language. The service
+  speaks the part of the ZeroC Ice protocol that Mumble's authenticator interface needs and
+  registers itself as the authenticator. Before building it, the slice confirms that Ice
+  is still Mumble's server interface and lists the calls Alliance Auth's authenticator uses.
+- **XMPP** in version 1 manages accounts on the coalition's existing server, Openfire,
+  through its REST API plugin, unless a check of what most coalitions run finds something
+  else. An XMPP server written in Zig, to the same rules, follows version 1 and removes the
+  Java dependency.
+
+## SRP skill checks
+
+Decided 2026-10-23 (roadmap 4.1). When a pilot in a skill-checked ship lacks a required
+skill, the payout is the FC's call, recorded with the FC's name like a waiver.
 
 ## Live updates
 
@@ -239,7 +301,9 @@ enforcing and stops with a clear message if it isn't; it never changes the SELin
 | SELinux | On an AlmaLinux 10 machine with SELinux enforcing: start the units, send a smoke request, and fail on any AVC denial, if nginx sees a peer other than the real one, or if a request from outside the ranges gets through |
 
 GitHub's hosted runners are Ubuntu and can't enforce SELinux, so the SELinux test runs
-on a separate AlmaLinux machine; where it runs is an open decision (roadmap 1.53).
+on a separate AlmaLinux machine. **Decided (roadmap 1.53, 2026-10-23):** it runs on the
+maintainer's AlmaLinux test server, through a GitHub runner attached to a separate private
+repository, so outside pull requests can never run code on it.
 
 ## Status
 
