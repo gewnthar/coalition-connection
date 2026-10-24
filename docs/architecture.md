@@ -312,8 +312,10 @@ nginx, and starts the services. It checks that SELinux is enforcing and stops wi
 GitHub's hosted runners are Ubuntu and can't enforce SELinux, so the SELinux test runs
 on a separate AlmaLinux machine. **Decided (roadmap 1.53, 2026-10-23):** it runs on the
 maintainer's AlmaLinux test server, through a GitHub runner attached to a separate private
-repository, so outside pull requests can never run code on it. It is set up by hand once
-the server exists.
+repository. That repository's workflow builds only commits already merged to main
+here, never a ref or source taken from an open pull request, so outside pull requests can
+never run code on the server. It is set up by hand once the
+server exists.
 
 ## Status
 
