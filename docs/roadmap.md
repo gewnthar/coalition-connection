@@ -52,7 +52,7 @@ whose choice is written down, with the date it was made.
 | # | Slice | Tests |
 | --- | --- | --- |
 | 1.17 | SSO authorization redirect with state and PKCE | unit |
-| 1.18 | Token exchange and refresh | unit; simulation with SSO down |
+| 1.18 | Token exchange and refresh; tokens are stored encrypted (needs 1.38) | unit; simulation with SSO down |
 | 1.19 | JWT signature and claim checks against EVE's signing keys | unit; fuzz the JWT parser |
 | 1.20 | Users, mains and alts; owner-hash change unlinks a character | unit |
 | 1.21 | Sessions in Valkey, with logout and expiry | unit; simulation |
@@ -92,9 +92,9 @@ whose choice is written down, with the date it was made.
 
 | # | Slice | Tests |
 | --- | --- | --- |
-| 1.38 | **Decided (2026-10-23):** ESI tokens are encrypted at rest with XChaCha20-Poly1305 from Zig's standard library, under a 32-byte key kept in its own file that only the service can read. This slice builds the token module: load the key file at startup, encrypt and decrypt one token at a time into fixed buffers sized by a new limit, `token_size_max`, and wipe plaintext after use. The design is in [architecture.md](architecture.md#tokens-at-rest) | unit: wrong key, unknown key ID, wrong-sized key, tampered row, row moved to another character; fuzz decrypt with random bytes, expecting an error every time; simulation refuses a wrong key and a tampered row without stopping |
+| 1.38 | **Decided (2026-10-23):** ESI tokens are encrypted at rest with XChaCha20-Poly1305 from Zig's standard library, under a 32-byte key kept in its own file that only the service can read. This slice builds the token module: load the key file at startup, encrypt and decrypt one token at a time into fixed buffers sized by a new limit, `token_size_max`, and wipe plaintext after use. It is built before 1.18, which stores the first tokens, even though it is listed here. The design is in [architecture.md](architecture.md#tokens-at-rest) | unit: missing key file, wrong-sized key, duplicate key ID, token longer than `token_size_max`, wrong key, unknown key ID, stored nonce or ciphertext of the wrong length, tampered row, row moved to another character or token kind, row under the previous key; fuzz the key-file reader, and decrypt with random bytes expecting an error every time; simulation refuses a wrong key and a tampered row without stopping |
 | 1.39 | Streaming JSON reader for dumpdata exports, one record at a time | unit; fuzz |
-| 1.40 | Users, characters and tokens | unit with a sample export |
+| 1.40 | Users, characters and tokens; imported tokens are encrypted through 1.38 | unit with a sample export |
 | 1.41 | States, groups and memberships | unit |
 | 1.42 | Comparison report: every user's state and groups against Alliance Auth's | unit |
 
@@ -102,10 +102,10 @@ whose choice is written down, with the date it was made.
 
 | # | Slice | Tests |
 | --- | --- | --- |
-| 1.43 | **Decided (2026-10-23):** Mumble login is written in Zig, with no bridge in another language. The service speaks the part of the ZeroC Ice protocol that Mumble's authenticator interface needs and registers itself as the authenticator. Before building it, confirm that Ice is still Mumble's server interface and list the calls Alliance Auth's authenticator uses | - |
-| 1.44 | **Decided (2026-10-23):** version 1 manages accounts on the coalition's existing XMPP server, Openfire, through its REST API plugin, unless a check of what most coalitions run finds something else. An XMPP server written in Zig follows version 1 | - |
-| 1.45 | Mumble account and role sync, through the Ice authenticator from 1.43 | unit; fuzz the Ice message parser; simulation with Mumble down |
-| 1.46 | XMPP account and role sync through Openfire's REST API (1.44) | unit; simulation with XMPP down |
+| 1.43 | **Decided (2026-10-23):** Mumble login is written in Zig, with no bridge in another language. The service speaks the part of the ZeroC Ice protocol that Mumble's authenticator interface needs and registers itself as the authenticator. This slice first confirms that Ice is still Mumble's server interface and lists the calls Alliance Auth's authenticator uses, then encodes and decodes those Ice messages into fixed buffers | unit; fuzz the Ice message decoder |
+| 1.44 | **Decided (2026-10-23):** version 1 manages accounts on the coalition's existing XMPP server, Openfire, through its REST API plugin, unless a check of what most coalitions run finds something else. An XMPP server written in Zig follows version 1 and removes the Java dependency | - |
+| 1.45 | Mumble: register as the authenticator over the Ice messages from 1.43, then account and role sync | unit; simulation with Mumble down, a Mumble restart, and truncated or malformed Ice messages |
+| 1.46 | XMPP account and role sync through Openfire's REST API (1.44) | unit; fuzz the Openfire response parser; simulation with Openfire down and with error or malformed replies |
 
 ### Deployment
 
@@ -121,7 +121,7 @@ built before 1.36, the first pages, even though it is listed here. The requireme
 | 1.49 | Cloudflare rules at nginx and firewalld: from one list of Cloudflare's published ranges, nginx gets `set_real_ip_from` for each range with `real_ip_header CF-Connecting-IP`, and passes the client address to the app in `X-Real-IP`. nginx also refuses any connection whose original peer, `$realip_remote_addr`, is outside the ranges (a `geo` map on that variable). Plain `allow`/`deny` can't do this check, because they run after the real-IP module has replaced the peer address with the client's. firewalld's ipset opens the web port only to the same ranges. No CIDR matching in the app (needs 1.48) | CI runs `nginx -t` on the generated config; the smoke test in 1.54 |
 | 1.50 | Real client IP in the app: use `X-Real-IP` only on requests from nginx on the local socket; otherwise ignore the header, use the peer address and log it (needs 1.5, 1.51) | unit tests for the header rule; simulation with spoofed headers |
 | 1.51 | The app listens only on a local socket inside the pod that only nginx reaches, never on a published port (needs 1.1, 1.3) | unit; simulation with a non-local peer refused |
-| 1.52 | Rootless Podman Quadlet units in `deploy/`: one pod on `pasta` networking that publishes only nginx's port, unprivileged, read-only root, `:Z` volumes (private to the pod) mounted only where needed, never privileged or unlabeled (needs a server binary from 1.2 and 1.3) | CI builds the image and runs Quadlet's dry-run generator on each unit |
+| 1.52 | Rootless Podman Quadlet units in `deploy/`: one pod on `pasta` networking that publishes only nginx's port, unprivileged, read-only root, `:Z` volumes (private to the pod) mounted only where needed, the token key (1.38) mounted as a Podman secret readable only by the service user, never privileged or unlabeled (needs a server binary from 1.2 and 1.3) | CI builds the image and runs Quadlet's dry-run generator on each unit |
 | 1.53 | **Decided (2026-10-23):** the SELinux test runs on the maintainer's AlmaLinux test server, through a GitHub runner attached to a separate private repository, so outside pull requests can never run code on it. It is set up by hand once the server exists | - |
 | 1.54 | SELinux enforcing smoke test: start the units on AlmaLinux 10, send a smoke request through Cloudflare's ranges and one from outside them, fail on any AVC denial, if nginx sees a peer other than the real one, or if the request from outside the ranges isn't refused (needs 1.48, 1.49, 1.52, 1.53) | the script itself |
 
@@ -129,7 +129,7 @@ built before 1.36, the first pages, even though it is listed here. The requireme
 
 | # | Slice | Tests |
 | --- | --- | --- |
-| 1.55 | Installer: one command that asks for the EVE app's client ID and secret, the callback URL, the domain, the database and the first admin character, then writes the config and Quadlet units, loads the Cloudflare ranges into firewalld and nginx and starts the services; checks that SELinux is enforcing and never changes its mode | run on the SELinux test machine from 1.54 |
+| 1.55 | Installer: one command that asks for the EVE app's client ID and secret, the callback URL, the domain, the database and the first admin character, then writes the config and Quadlet units, generates the token key (1.38) and stores it as a Podman secret, loads the Cloudflare ranges into firewalld and nginx and starts the services; checks that SELinux is enforcing and never changes its mode | run on the SELinux test machine from 1.54 |
 
 ## Milestone 2: taxes
 
@@ -137,7 +137,7 @@ built before 1.36, the first pages, even though it is listed here. The requireme
 | --- | --- | --- |
 | 2.1 | **Decision:** tax rules: rate per ore type, price source (Fuzzwork or Janice), all mining or only corporation moons, interest on unpaid tax | - |
 | 2.2 | **Decided (2026-10-23):** the ledger lives in Postgres, shaped like TigerBeetle's accounts and transfers, so a later move to TigerBeetle is a backend swap. The shape is in [architecture.md](architecture.md#ledger) | - |
-| 2.3 | Double-entry ledger in the shape from 2.2: accounts with running totals, append-only transfers with app-chosen IDs, pending transfers that post or void, linked batches, behind one Zig interface | unit; fuzz invariants (debits equal credits; a retried transfer posts once); simulation with Postgres lost mid-batch |
+| 2.3 | Double-entry ledger in the shape from 2.2: accounts with running totals, append-only transfers with app-chosen IDs, pending transfers that post or void, linked batches, behind one Zig interface | unit; fuzz invariants (debits equal credits; a retried transfer posts once; a reused ID with different fields is refused; a pending transfer posts or voids once; a total that would overflow is refused); simulation with Postgres lost mid-batch |
 | 2.4 | Price feed import | unit; simulation with the feed down |
 | 2.5 | Mining ledger ingestion from ESI | unit |
 | 2.6 | Tax calculation per ore type | table-driven unit |
@@ -175,8 +175,8 @@ built before 1.36, the first pages, even though it is listed here. The requireme
 | 4.5 | Programs: alliance and corporation, each with rules, budget and approvers | unit |
 | 4.6 | Killmail ingestion from ESI | unit; fuzz the killmail parser |
 | 4.7 | Checks: doctrine fit, skills at the moment of the loss (a missing skill goes to the FC, 4.1), ship rules | table-driven unit |
-| 4.8 | Reviewer page: fit slot by slot, EFT copy, overrides with a reason | unit |
-| 4.9 | Payouts into the ledger | unit; fuzz ledger invariants |
+| 4.8 | Reviewer page: fit slot by slot, EFT copy, overrides with a reason, and the FC's call on a missing skill recorded with the FC's name (4.1) | unit |
+| 4.9 | Payouts into the ledger: a pending transfer on approval, posted on payout or voided on rejection (needs 2.3) | unit; fuzz ledger invariants |
 | 4.10 | Import SRP requests and payouts | unit with a sample export |
 
 ## Cutover
