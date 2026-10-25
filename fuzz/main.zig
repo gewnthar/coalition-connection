@@ -352,7 +352,8 @@ fn httpGenerateBody(random: std.Random, buffer: *[http_buffer_size]u8) HttpCase 
     var len: u32 = append(buffer, 0, prefix);
     len = appendFill(buffer, len, zeros, '0');
     const variant = random.uintLessThan(u32, 4);
-    const fit: u32 = http_buffer_size - (len + 5 + end.len);
+    const end_len: u32 = end.len;
+    const fit: u32 = http_buffer_size - (len + 5 + end_len);
     var model: HttpModel = .{ .method = .post, .header_count = 2, .content_length = 0, .len = 0 };
     var case: HttpCase = .{ .model = model, .expected = error.RequestTooLarge, .limit = .content_length_one_over };
     switch (variant) {
