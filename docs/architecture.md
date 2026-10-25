@@ -20,8 +20,8 @@ AlmaLinux 10 with SELinux enforcing, behind nginx and Cloudflare.
 - Functions of at most 70 lines, with at least two assertions each.
 - Every error is handled explicitly. Explicitly sized integers (`u32`, not `usize`) wherever
   an interface allows.
-- All I/O (network, clock, database) goes through one boundary, so the deterministic
-  simulator can replace it.
+- All I/O (network, clock, database, random bytes) goes through one boundary, so the
+  deterministic simulator can replace it.
 - Builds are ReleaseSafe and compile with zero warnings. Code targets the latest stable Zig.
 
 ## Version 1 components
@@ -51,7 +51,7 @@ explicit inputs and outputs. The rules that keep it that way:
 
 - **Only `io` touches the outside world.** Components take the I/O type as a
   `comptime IO: type` parameter. Production passes the real implementation; tests pass
-  `io.sim.Sim`. Nothing else opens a socket or reads the clock.
+  `io.sim.Sim`. Nothing else opens a socket, reads the clock or draws random bytes.
 - **Only `storage` speaks Postgres and Valkey.** Postgres is the source of truth. Valkey
   holds sessions, queues and pub/sub, and can be wiped without losing anything.
 - **Only `esi` calls ESI.** Other components queue requests and get back a body or an
@@ -102,27 +102,52 @@ importer --> storage <-- every component (Postgres, Valkey, audit log)
 
 ## Tokens at rest
 
-Decided 2026-10-23 (roadmap 1.38). Pilots' ESI refresh tokens are encrypted before they
-reach the database, with XChaCha20-Poly1305 from Zig's standard library, which is safe with
-random nonces.
+Decided 2026-10-23, with the details below decided 2026-10-24 (roadmap 1.38). Pilots' ESI
+refresh tokens are encrypted before they reach the database, with XChaCha20-Poly1305 from
+Zig's standard library, which is safe with random nonces.
 
 - **The key** is 32 bytes, kept in its own file, mounted as a Podman secret that only the
   service account can read. It is never in the config file, the database or a log. The
   service reads the file once at startup into fixed arrays and refuses to start if it is
   missing or a key in it is the wrong size.
-- **Each stored token** keeps a `u8` key ID, a fresh random 24-byte nonce and the 16-byte
-  tag. The character ID and token kind are bound in as associated data, so a ciphertext
-  can't be moved to another row.
-- **Key rotation:** the key file can hold the current and the previous key, each with its
-  key ID, and tokens move to the new key on their next refresh.
+- **Each stored token** keeps a `u8` associated-data version, a `u8` key ID, a fresh random
+  24-byte nonce and the 16-byte tag.
+- **Associated data** has one fixed layout of 11 bytes: the version byte (currently 1), the
+  key ID, the token kind as a `u8`, and the character ID as a little-endian `u64`. It binds
+  each ciphertext to its row, so a ciphertext can't be moved to another character or token
+  kind. A stored row with a version other than 1 is a named error.
+- **Random bytes come through the I/O boundary,** like the clock and the network: the
+  operating system's CSPRNG in production and the seeded PRNG in the simulator, so nonces
+  never break replay. The seeded source can't be compiled into a production build.
+- **Key rotation:** the key file holds at most two keys, the current and the previous one,
+  each with its key ID. New and refreshed tokens are written under the current key. A
+  bounded re-encrypt sweep moves at most a fixed number of token rows per tick from the
+  previous key to the current one. The previous key is retired, and its check value
+  deleted, only when no token row uses it; the rotation step refuses to drop a key that any
+  token row still names.
+- **Every key in use must be present.** At startup the service counts token rows per key ID
+  with one grouped query, at most 256 result rows (one per `u8` key ID), parsed as outside
+  data with named errors. It refuses to start, with a named error, when a key that token
+  rows use is missing from the key file. Without this, a second rotation before the sweep
+  finishes would strand rows.
+- **Check values:** each key has a check value stored in the database, encrypted under that
+  key with its own token kind and character ID 0 in the associated data, so a check row and
+  a token row can't be swapped. Startup requires a check value for every key in the key
+  file and every key that token rows name, decrypts each one, and refuses to start when one
+  is missing or doesn't match; it never skips the check. Only key generation creates a
+  check value: the installer's, and the rotation step's when it adds a new key.
 - **Fixed sizes:** token buffers are fixed and sized by `token_size_max` in
   `src/constants.zig`; encrypt and decrypt work on one token at a time, and plaintext
-  buffers are wiped after use. The key never leaves the token module.
-- **Errors, not crashes:** a stored row is outside data, so an unknown key ID, a stored
-  nonce or ciphertext of the wrong length, a tampered row or the wrong key each return a
-  named error, and so does a token longer than `token_size_max` on the way in. Assertions
-  cover only what the code itself controls, such as the loaded key's length and the length
-  of a nonce it just generated.
+  buffers are wiped with `std.crypto.secureZero` after use. The key never leaves the token
+  module.
+- **No key in crash dumps:** `main` clears the dumpable flag with
+  `prctl(PR_SET_DUMPABLE, 0)` before any component starts and before the key file is read,
+  and the app's Quadlet unit sets a core-dump limit of 0 ([Containers](#containers)).
+- **Errors, not crashes:** a stored row is outside data, so an unknown key ID or version, a
+  stored nonce or ciphertext of the wrong length, a tampered row or the wrong key each
+  return a named error, and so does a token longer than `token_size_max` on the way in.
+  Assertions cover only what the code itself controls, such as the loaded key's length and
+  the length of a nonce it just generated.
 
 This protects a leaked database or backup, not a server someone controls. That's why
 opening mail or wallets still needs a fresh EVE login.
@@ -161,6 +186,9 @@ Decided 2026-10-23 (roadmap 1.43 and 1.44).
   through its REST API plugin, unless a check of what most coalitions run finds something
   else. An XMPP server written in Zig, to the same rules, follows version 1 and removes the
   Java dependency.
+- **Their secrets** are Podman secrets like the token key (decided 2026-10-24): the Ice
+  secret for Mumble and the Openfire REST API key, never in the config file, the database
+  or a log. The service's Ice listener binds 127.0.0.1 inside the pod.
 
 ## SRP skill checks
 
@@ -252,8 +280,11 @@ Rules for every unit:
   each other by it. Each container mounts only the volumes it needs. Never `--privileged`,
   never `SecurityLabelDisable=true` (`--security-opt label=disable`), never a host
   directory shared without a label.
-- Secrets, starting with the token key ([Tokens at rest](#tokens-at-rest)), are mounted as
-  Podman secrets readable only by the service user, never baked into an image or a unit.
+- Secrets (the token key from [Tokens at rest](#tokens-at-rest), the Ice secret and the
+  Openfire API key) are mounted as Podman secrets readable only by the service user, never
+  baked into an image or a unit.
+- The app's unit sets `LimitCORE=0` in `[Service]` and `Ulimit=core=0` in `[Container]`, so
+  a crash doesn't write the token key to a core dump.
 - No extra Linux capabilities. Rootless containers can't bind ports below 1024 by default,
   so the pod publishes a high port and firewalld forwards the public port to it (a local
   redirect, which keeps the source address).
@@ -295,8 +326,8 @@ firewalld behind it, and proxies to the app, which listens only locally (roadmap
 After the core works (roadmap 1.55), one command sets up a host. It asks for the EVE
 application's client ID and secret, the callback URL, the domain, the database and the
 first admin character, then writes the config file and the Quadlet units, generates the
-token key and stores it as a Podman secret, loads the Cloudflare ranges into firewalld and
-nginx, and starts the services. It checks that SELinux is enforcing and stops with a clear message if it isn't; it never changes the SELinux mode.
+token key and its check value and stores the key as a Podman secret, loads the Cloudflare
+ranges into firewalld and nginx, and starts the services. It checks that SELinux is enforcing and stops with a clear message if it isn't; it never changes the SELinux mode.
 
 ### How deployment is tested
 
