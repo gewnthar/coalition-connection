@@ -188,7 +188,10 @@ Decided 2026-10-23 (roadmap 1.43 and 1.44).
   Java dependency.
 - **Their secrets** are Podman secrets like the token key (decided 2026-10-24): the Ice
   secret for Mumble and the Openfire REST API key, never in the config file, the database
-  or a log. The service's Ice listener binds 127.0.0.1 inside the pod.
+  or a log. The service's Ice listener binds 127.0.0.1 inside the pod, so only processes in
+  the pod's network namespace can reach it. That works only if Mumble runs in the same pod;
+  where Mumble runs is still an open decision, and roadmap 1.45 settles it before it binds
+  anything.
 
 ## SRP skill checks
 
