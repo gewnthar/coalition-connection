@@ -17,9 +17,11 @@
 //!   http_request_size_max
 //!   http_headers_max
 //!   http_response_size_max
+//!   http_response_buffers_max
 //!   websocket_connections_max
 //!   websocket_message_size_max
 //!   live_events_backlog_max
+//!   live_events_backlog_bytes_max
 //!
 //! Status: the HTTP/1.1 request parser (roadmap 1.5) is in `http_request.zig`; the rest is a
 //! stub. See docs/roadmap.md (core milestone, live-update slices).
@@ -40,9 +42,11 @@ test "live: stub compiles and its limits are set" {
     try std.testing.expect(constants.http_request_size_max > 0);
     try std.testing.expect(constants.http_headers_max > 0);
     try std.testing.expect(constants.http_response_size_max > 0);
+    try std.testing.expect(constants.http_response_buffers_max > 0);
     try std.testing.expect(constants.websocket_connections_max > 0);
     try std.testing.expect(constants.websocket_message_size_max > 0);
     try std.testing.expect(constants.live_events_backlog_max > 0);
+    try std.testing.expect(constants.live_events_backlog_bytes_max > 0);
 }
 
 test {

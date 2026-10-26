@@ -27,7 +27,7 @@ whose choice is written down, with the date it was made.
 | --- | --- | --- |
 | 1.1 | **Decided (2026-10-22):** the event loop is a hand-written io_uring loop of our own, not Zig's `std.Io`, so the core doesn't depend on the standard library's I/O interface while it keeps changing | - |
 | 1.2 | Real I/O implementation: monotonic clock | unit; contract check |
-| 1.3 | Real I/O: TCP accept, read and write with fixed buffers | unit; simulation |
+| 1.3 | Real I/O: TCP accept, read and write with fixed buffers; the connection table and the response-buffer wait queue add their rows to the memory table in `src/constants.zig` | unit; simulation |
 | 1.4 | Connection table sized from `http_connections_max` | unit; full-table simulation |
 | 1.5 | HTTP/1.1 request parser, bounded by `http_request_size_max` | unit; fuzz |
 | 1.6 | HTTP response writer and router | unit |
@@ -82,7 +82,7 @@ whose choice is written down, with the date it was made.
 | --- | --- | --- |
 | 1.31 | HTML rendering with escaping, into fixed buffers | unit; fuzz the escaper |
 | 1.32 | Websocket handshake and frame parser | unit; fuzz |
-| 1.33 | Event ids, the catch-up backlog and the fall-back reload | unit; simulation with dropped sockets |
+| 1.33 | Event ids, the catch-up backlog (capped in events and in bytes, its index added to the memory table) and the fall-back reload | unit; simulation with dropped sockets |
 | 1.34 | Fan-out from Valkey pub/sub to watching pages | simulation |
 | 1.35 | The small client script that swaps fragments in | browser test |
 | 1.36 | First pages: login, characters, groups (after the Deployment group below, so they run deployed from the start) | unit |
@@ -117,7 +117,7 @@ built before 1.36, the first pages, even though it is listed here. The requireme
 | # | Slice | Tests |
 | --- | --- | --- |
 | 1.47 | **Decided (2026-10-22):** TLS from Cloudflare ends at nginx, in the pod. nginx and firewalld enforce the Cloudflare rules, and the app listens only locally | - |
-| 1.48 | nginx Quadlet unit in the pod: TLS with a Cloudflare origin certificate (Full strict), websocket proxying with timeouts longer than the ping interval (1.32), SELinux-labeled volumes, proxying to the app's local socket (needs 1.3) | CI runs `nginx -t` on the config and Quadlet's dry-run generator on the unit; the smoke test in 1.54 |
+| 1.48 | nginx Quadlet unit in the pod: TLS with a Cloudflare origin certificate (Full strict), websocket proxying with timeouts longer than the ping interval (1.32), proxy buffering on with room for a full `http_response_size_max` response, since the app's shared response buffers rely on it, SELinux-labeled volumes, proxying to the app's local socket (needs 1.3) | CI runs `nginx -t` on the config and Quadlet's dry-run generator on the unit; the smoke test in 1.54 |
 | 1.49 | Cloudflare rules at nginx and firewalld: from one list of Cloudflare's published ranges, nginx gets `set_real_ip_from` for each range with `real_ip_header CF-Connecting-IP`, and passes the client address to the app in `X-Real-IP`. nginx also refuses any connection whose original peer, `$realip_remote_addr`, is outside the ranges (a `geo` map on that variable). Plain `allow`/`deny` can't do this check, because they run after the real-IP module has replaced the peer address with the client's. firewalld's ipset opens the web port only to the same ranges. No CIDR matching in the app (needs 1.48) | CI runs `nginx -t` on the generated config; the smoke test in 1.54 |
 | 1.50 | Real client IP in the app: use `X-Real-IP` only on requests from nginx on the local socket; otherwise ignore the header, use the peer address and log it (needs 1.5, 1.51) | unit tests for the header rule; simulation with spoofed headers |
 | 1.51 | The app listens only on a local socket inside the pod that only nginx reaches, never on a published port (needs 1.1, 1.3) | unit; simulation with a non-local peer refused |
