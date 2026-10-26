@@ -68,3 +68,76 @@ test "fifo order and wraparound" {
     try std.testing.expectEqual(@as(u8, 4), try q.pop());
     try std.testing.expectError(error.Empty, q.pop());
 }
+
+test "a refused push leaves a full queue unchanged" {
+    var q: BoundedQueue(u8, 3) = .{};
+    // Move head off zero first, so the full queue's tail has wrapped around before head.
+    try q.push(10);
+    try std.testing.expectEqual(@as(u8, 10), try q.pop());
+    try q.push(1);
+    try q.push(2);
+    try q.push(3);
+    try std.testing.expectEqual(@as(u32, 1), q.head);
+    // Every slot is written now, so the whole array can be compared.
+    const items_before = q.items;
+    try std.testing.expectError(error.Full, q.push(99));
+    try std.testing.expectEqual(@as(u32, 3), q.count());
+    // A second refusal changes nothing either.
+    try std.testing.expectError(error.Full, q.push(98));
+    try std.testing.expectEqual(@as(u32, 3), q.count());
+    try std.testing.expectEqual(@as(u32, 1), q.head);
+    try std.testing.expectEqualSlices(u8, &items_before, &q.items);
+    // The freed slot is reused in order after the refusals.
+    try std.testing.expectEqual(@as(u8, 1), try q.pop());
+    try q.push(4);
+    try std.testing.expectEqual(@as(u8, 2), try q.pop());
+    try std.testing.expectEqual(@as(u8, 3), try q.pop());
+    try std.testing.expectEqual(@as(u8, 4), try q.pop());
+    try std.testing.expectError(error.Empty, q.pop());
+    try std.testing.expectEqual(@as(u32, 0), q.count());
+}
+
+test "a refused pop leaves an empty queue usable" {
+    var q: BoundedQueue(u8, 3) = .{};
+    try std.testing.expectError(error.Empty, q.pop());
+    try std.testing.expectEqual(@as(u32, 0), q.count());
+    try std.testing.expectError(error.Empty, q.pop());
+    try std.testing.expectEqual(@as(u32, 0), q.count());
+    // Head does not move on a refusal (not visible through push and pop alone).
+    try std.testing.expectEqual(@as(u32, 0), q.head);
+    try q.push(7);
+    try std.testing.expectEqual(@as(u32, 1), q.count());
+    try std.testing.expectEqual(@as(u8, 7), try q.pop());
+
+    // The same after head has moved to the last slot.
+    try q.push(8);
+    try std.testing.expectEqual(@as(u8, 8), try q.pop());
+    try std.testing.expectEqual(@as(u32, 2), q.head);
+    try std.testing.expectError(error.Empty, q.pop());
+    try std.testing.expectEqual(@as(u32, 0), q.count());
+    try std.testing.expectEqual(@as(u32, 2), q.head);
+    // The next two pushes wrap from the last slot to the first.
+    try q.push(9);
+    try q.push(10);
+    try std.testing.expectEqual(@as(u32, 2), q.count());
+    try std.testing.expectEqual(@as(u8, 9), try q.pop());
+    try std.testing.expectEqual(@as(u8, 10), try q.pop());
+    try std.testing.expectError(error.Empty, q.pop());
+}
+
+test "capacity 1 alternates push and pop past the wraparound" {
+    var q: BoundedQueue(u32, 1) = .{};
+    const rounds: u32 = 5;
+    var round: u32 = 0;
+    while (round < rounds) : (round += 1) {
+        assert(round < rounds);
+        try q.push(round);
+        try std.testing.expectError(error.Full, q.push(round + 100));
+        try std.testing.expectEqual(@as(u32, 1), q.count());
+        try std.testing.expectEqual(round, try q.pop());
+        try std.testing.expectError(error.Empty, q.pop());
+        try std.testing.expectEqual(@as(u32, 0), q.count());
+        try std.testing.expectEqual(@as(u32, 0), q.head);
+    }
+    try std.testing.expectEqual(rounds, round);
+}
