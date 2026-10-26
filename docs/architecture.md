@@ -16,7 +16,8 @@ AlmaLinux 10 with SELinux enforcing, behind nginx and Cloudflare.
 - No recursion. Every loop has a fixed upper bound.
 - No memory allocation after startup. All memory is sized once from the limits in
   [`src/constants.zig`](../src/constants.zig); `StartupAllocator` asserts if anything
-  allocates later.
+  allocates later. A memory table there adds up every startup buffer, and the build fails
+  if the total exceeds `memory_budget_bytes`.
 - Functions of at most 70 lines, with at least two assertions each.
 - Every error is handled explicitly. Explicitly sized integers (`u32`, not `usize`) wherever
   an interface allows.
@@ -172,8 +173,9 @@ skill, the payout is the FC's call, recorded with the FC's name like a waiver.
 Pages are rendered as HTML in Zig on the server. When data changes, the server pushes the
 changed part of the page over a websocket and a few dozen lines of JavaScript swap it in.
 Every event has an id; a page that reconnects catches up from the last event it saw, or
-reloads if it is further behind than `live_events_backlog_max`. Every page still works with
-the websocket down.
+reloads if it is further behind than the backlog holds: `live_events_backlog_max` events or
+`live_events_backlog_bytes_max` bytes, whichever is reached first. Every page still works
+with the websocket down.
 
 ## Testing
 
