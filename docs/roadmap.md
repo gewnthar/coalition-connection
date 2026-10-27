@@ -2,7 +2,7 @@
 
 Versions work like Zig's. Releases stay below 1.0 and come in little steps, so bugs show
 up early, and each release is something that runs on the test server. Between releases,
-`main` is the next version with `-dev`, as Zig's master is (for example `0.2.0-dev`).
+`main` is the next version with `-dev`, as Zig's master is (for example `0.1.0-dev`).
 
 Slices are labelled by their milestone's name and number, such as core 38, taxes 3 or
 SRP 8, so a slice label can't be mistaken for a version.
@@ -118,7 +118,7 @@ Releases 0.1 to 0.6; the release plan above says which slices go in each.
 | core 34 | Fan-out from Valkey pub/sub to watching pages | simulation |
 | core 35 | The small client script that swaps fragments in | browser test |
 | core 36 | First member-space pages: login, characters, groups (after the Deployment group below, so they run deployed from the start) | unit |
-| core 56 | Admin frame for the admin space at `/admin/`: its routes, its menu (links a user can't use are left out), and the per-page permission check the router runs before a page, deny by default; member pages take the user from the session, never from the request ([architecture.md](architecture.md#member-and-admin-spaces)) (needs core 16, core 29) | unit: every admin route names a permission, and a route without one fails the check; a request without the permission is refused before the page runs; the menu leaves out links the user can't use; removing the last person who holds every admin permission is refused |
+| core 56 | Admin frame for the admin space at `/admin/`: its routes, its menu (links a user can't use are left out), and the per-page permission check the router runs before a page, deny by default; member pages take the user from the session, never from the request ([architecture.md](architecture.md#member-and-admin-spaces)) (needs core 16, core 29) | unit: every admin route names a permission, and a route without one fails the check; a request without the permission is refused before the page runs; the menu leaves out links the user can't use; removing the last person who holds every admin permission from a group, dropping such a permission from that person's last group, or deleting that group is refused |
 | core 57 | First admin pages: users, states, groups, permissions and join requests (needs core 56) | unit: each page requires its permission; each action writes an audit-log entry |
 | core 37 | Leave alerts | unit; simulation |
 
@@ -138,7 +138,7 @@ Releases 0.1 to 0.6; the release plan above says which slices go in each.
 | --- | --- | --- |
 | core 43 | **Decided (2026-10-23):** Mumble login is written in Zig, with no bridge in another language. The service speaks the part of the ZeroC Ice protocol that Mumble's authenticator interface needs and registers itself as the authenticator. This slice first confirms that Ice is still Mumble's server interface and lists the calls Alliance Auth's authenticator uses, then encodes and decodes those Ice messages into fixed buffers | unit; fuzz the Ice message decoder |
 | core 44 | **Decided (2026-10-23):** the service manages accounts on the coalition's existing XMPP server, Openfire, through its REST API plugin, unless a check of what most coalitions run finds something else. An XMPP server written in Zig follows 1.0 and removes the Java dependency | - |
-| core 45 | Mumble: register as the authenticator over the Ice messages from core 43, then account and role sync. Mumble runs on its own voice server (decided 2026-10-26); Ice travels only inside the WireGuard tunnel across the private network, listens only on the tunnel's address, and carries the Ice secret on every call ([architecture.md](architecture.md#voice-server)) | unit; simulation with Mumble down, a Mumble restart, truncated or malformed Ice messages, and an Ice call without the right secret refused |
+| core 45 | Mumble: register as the authenticator over the Ice messages from core 43, then account and role sync. Mumble runs on its own voice server (decided 2026-10-26); Ice travels only inside the WireGuard tunnel across the private network, is reachable only on the tunnel's address, and every call into Mumble carries the Ice secret; the app's callback listener accepts only the voice server's tunnel address, and core 43 confirms whether Mumble's callbacks carry the secret too ([architecture.md](architecture.md#voice-server)) | unit; simulation with Mumble down, a Mumble restart, truncated or malformed Ice messages, an Ice call into Mumble without the right secret refused, and an Ice connection to the app from any address but the voice server's tunnel address refused |
 | core 46 | XMPP account and role sync through Openfire's REST API (core 44) | unit; fuzz the Openfire response parser; simulation with Openfire down and with error or malformed replies |
 
 ### Deployment
@@ -155,7 +155,7 @@ built before core 36, the first pages, even though it is listed here. The requir
 | core 49 | Cloudflare rules at nginx and firewalld: from one list of Cloudflare's published ranges, nginx gets `set_real_ip_from` for each range with `real_ip_header CF-Connecting-IP`, and passes the client address to the app in `X-Real-IP`. nginx also refuses any connection whose original peer, `$realip_remote_addr`, is outside the ranges (a `geo` map on that variable). Plain `allow`/`deny` can't do this check, because they run after the real-IP module has replaced the peer address with the client's. firewalld's ipset opens the web port only to the same ranges. No CIDR matching in the app (needs core 48) | CI runs `nginx -t` on the generated config; the smoke test in core 54 |
 | core 50 | Real client IP in the app: use `X-Real-IP` only on requests from nginx on the local socket; otherwise ignore the header, use the peer address and log it (needs core 5, core 51) | unit tests for the header rule; simulation with spoofed headers |
 | core 51 | The app listens only on a local socket inside the pod that only nginx reaches, never on a published port (needs core 1, core 3) | unit; simulation with a non-local peer refused |
-| core 52 | Rootless Podman Quadlet units in `deploy/`: one pod on `pasta` networking that publishes only nginx's port, unprivileged, read-only root, `:Z` volumes (private to the pod) mounted only where needed, the token key (core 38), the origin certificate's key, the Ice secret and the Openfire API key mounted as Podman secrets readable only by the service user, `LimitCORE=0` and `Ulimit=core=0` in the app's unit, the service's Ice listener only on the WireGuard tunnel's private address and never published, never privileged or unlabeled (needs a server binary from core 2 and core 3) | CI builds the image and runs Quadlet's dry-run generator on each unit; the app unit's dry-run output contains `LimitCORE=0` and `--ulimit core=0` |
+| core 52 | Rootless Podman Quadlet units in `deploy/`: one pod on `pasta` networking that publishes only nginx's port, unprivileged, read-only root, `:Z` volumes (private to the pod) mounted only where needed, the token key (core 38), the origin certificate's key, the Ice secret and the Openfire API key mounted as Podman secrets readable only by the service user, `LimitCORE=0` and `Ulimit=core=0` in the app's unit, the service's Ice listener published only on the WireGuard tunnel's private address, never on a public one, never privileged or unlabeled (needs a server binary from core 2 and core 3) | CI builds the image and runs Quadlet's dry-run generator on each unit; the app unit's dry-run output contains `LimitCORE=0` and `--ulimit core=0`, publishes no port to a public address except nginx's, and mounts the origin key as a secret |
 | core 53 | **Decided (2026-10-23):** the SELinux test runs on the maintainer's AlmaLinux test server, through a GitHub runner attached to a separate private repository whose workflow builds only commits already merged to main, never a ref or source from an open pull request, so outside pull requests can never run code on it. It is set up by hand once the server exists | - |
 | core 54 | SELinux enforcing smoke test: start the units on AlmaLinux 10, send a smoke request through Cloudflare's ranges and one from outside them, fail on any AVC denial, if nginx sees a peer other than the real one, or if the request from outside the ranges isn't refused (needs core 48, core 49, core 52, core 53) | the script itself |
 
@@ -233,8 +233,9 @@ Release 0.11.
 | cutover 2 | Benchmark in CI: requests per second, p99 latency, memory | benchmark |
 | cutover 3 | Cutover runbook on the same EVE application, and the way back | dry run |
 
-The coalition moves over at 0.11, once the shadow run shows matching access and a full
-month of taxes matching to the ISK, followed by a clean cutover.
+The coalition moves over at 0.11: once the shadow run shows matching access and a full
+month of taxes matching to the ISK, the runbook (cutover 3) moves it, with the way back
+kept ready.
 
 ## Fleet schedule, calendar and timers
 

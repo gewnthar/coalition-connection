@@ -77,7 +77,7 @@ browser --> Cloudflare ---> nginx
                               |                    |  change events
                               v                    |  (Valkey pub/sub)
                              sso --> access -------+--> services --> Mumble (voice server,
-                              |        ^                  |           over WireGuard)
+                              |        ^                  |          over WireGuard)
                               |        |                  '---------> XMPP (Openfire)
                               v        | affiliations
 EVE SSO and ESI <---------- esi -------'
@@ -195,13 +195,18 @@ Decided 2026-10-23 (roadmap core 43 and core 44).
 - **Mumble runs on a voice server of its own** (decided 2026-10-26), not on the main
   server. The two servers talk over a private network in the same data center (a VPC).
   That network isn't encrypted, so Ice runs inside a WireGuard tunnel across it, and pilots'
-  Mumble logins and the Ice secret never travel in the clear. Ice listens only on the
-  tunnel's private address on each side, never on a public one; each firewall lets Ice in
-  only through the tunnel, from the other server's tunnel address; and every Ice call
-  carries the Ice secret. [Voice server](#voice-server) has the deployment.
+  Mumble logins and the Ice secret never travel in the clear. Ice is reachable only on the
+  tunnel's private address on each side, never on a public one, and each firewall lets Ice
+  in only through the tunnel, from the other server's tunnel address. Every call into
+  Mumble carries the Ice secret. The app's own Ice listener, which Mumble calls back as the
+  authenticator, accepts connections only from the voice server's tunnel address; core 43
+  confirms whether those callbacks carry the secret too. [Voice server](#voice-server) has
+  the deployment.
 - **Mumble's certificate** is its own self-signed one (decided 2026-10-26), made once by the
   installer and backed up with the token key, so a rebuilt voice server never shows players
-  a new certificate.
+  a new certificate. At cutover, the current Mumble's certificate, channels and permissions
+  move over with it; if the current Mumble uses a public certificate, this is revisited
+  before cutover.
 
 ## Member and admin spaces
 
@@ -220,7 +225,10 @@ Decided 2026-10-26 (roadmap core 36, core 56 and core 57). The site has two spac
 - **Admin rights come from groups,** like every other permission, so a group leader or an
   SRP reviewer gets only their own pages.
 - **The last full admin stays.** The installer's first admin starts with every admin
-  permission, and the app refuses to remove the last person who holds them all.
+  permission, and the app refuses any admin action that would leave no one holding them
+  all: removing that person from a group, dropping a permission from a group, or deleting
+  a group. Leaving the corporation in game removes access automatically and can't be
+  refused; what happens then is still an open decision.
 - Every admin action is written to the audit log, as is every view of private data.
 
 ## Email
@@ -230,7 +238,7 @@ it only through a sending service's HTTPS API, never through a mail server of it
 large mail providers junk or reject mail from a new address with no sending reputation,
 and hosts often block mail ports on new accounts. Brevo is the first service and Amazon SES
 the fallback. Both sit behind one small mail interface, so switching is a setting and an
-adapter.
+adapter. How the service's API key is stored is settled with the email slices.
 
 ## SRP skill checks
 
@@ -291,11 +299,11 @@ Cloudflare, and an attack on voice can't take auth down with it.
   SELinux off. A denial is a bug.
 - **One unprivileged service user** owns the containers. `loginctl enable-linger` lets its
   units start at boot without a login session. Nothing runs as root except the host's own
-  services (firewalld, sshd).
+  services (firewalld, sshd, WireGuard).
 - **firewalld** opens the web port only to Cloudflare's published address ranges, held in
   an ipset. SSH is limited separately. Postgres and Valkey have no open port on the host.
-  On the main server, nginx's web port is the only published port; Ice comes in only
-  through the WireGuard tunnel from the voice server.
+  On the main server, nginx's web port is the only port published to the internet; Ice
+  comes in only through the WireGuard tunnel from the voice server.
 
 ### Containers
 
@@ -303,13 +311,15 @@ Each process is a Quadlet unit under the service user's `~/.config/containers/sy
 which systemd turns into ordinary services. The units live in the repository under
 `deploy/`. All four containers join one pod (a Quadlet `.pod` unit), so they share a
 network namespace: nginx reaches the app on a local socket, the app reaches Postgres and
-Valkey on `localhost`, and only nginx's web port is published.
+Valkey on `localhost`, and only nginx's web port is published to the internet. The app's
+Ice listener is published only on the main server's WireGuard tunnel address, never on a
+public one, so Mumble on the voice server can reach it through the tunnel.
 
 | Unit | Runs | Reachable from |
 | --- | --- | --- |
 | `coalition-connection.pod` | The shared network namespace; publishes nginx's web port only | - |
 | `nginx.container` | nginx: ends TLS, applies the Cloudflare rules, proxies to the app | Cloudflare, through the web port |
-| `coalition-connection.container` | The Zig binary, listening only on a local socket | nginx only |
+| `coalition-connection.container` | The Zig binary: web requests only on a local socket, Ice only on the tunnel address | nginx; Mumble on the voice server, through the tunnel, for Ice |
 | `postgres.container` | Postgres, listening on `localhost` only | The app only |
 | `valkey.container` | Valkey, listening on `localhost` only | The app only |
 
@@ -331,8 +341,8 @@ Rules for every unit:
   never `SecurityLabelDisable=true` (`--security-opt label=disable`), never a host
   directory shared without a label.
 - Secrets (the token key from [Tokens at rest](#tokens-at-rest), the origin certificate's
-  key, the Ice secret and the Openfire API key) are mounted as Podman secrets readable only by the service user, never
-  baked into an image or a unit.
+  key, the Ice secret and the Openfire API key) are mounted as Podman secrets readable only
+  by the service user, never baked into an image or a unit.
 - The app's unit sets `LimitCORE=0` in `[Service]` and `Ulimit=core=0` in `[Container]`, so
   a crash doesn't write the token key to a core dump.
 - No extra Linux capabilities. Rootless containers can't bind ports below 1024 by default,
@@ -342,15 +352,22 @@ Rules for every unit:
 
 ### Voice server
 
-Mumble runs on a small server of its own, with the same host and container rules as the
-main server: AlmaLinux 10 with SELinux enforcing, Mumble as a rootless Quadlet unit.
+Mumble runs on a small server of its own. Its setup has no roadmap slices yet; the plan is
+the same host rules as the main server (AlmaLinux 10 with SELinux enforcing, an
+unprivileged service user), and its setup slices will settle the rest.
 
 - **Published:** only Mumble's port (64738 by default, TCP and UDP), which firewalld opens
   to everyone. Its DNS record is DNS-only, not proxied by Cloudflare, so it shows the voice
   server's address and never the main server's.
 - **Private:** a WireGuard tunnel to the main server across the data center's private
-  network (a VPC). Ice listens only on the tunnel's address and is let in only from the main
-  server's tunnel address, with the Ice secret on every call.
+  network (a VPC). The tunnel's endpoints use private addresses, and its port is open only
+  on the private network, never on the public interface, so neither server's config holds
+  the other's public address. Ice is reachable only on the tunnel's address and is let in
+  only from the main server's tunnel address, with the Ice secret on every call into
+  Mumble. SSH is limited separately, as on the main server.
+- **Its secrets:** the WireGuard keys on both servers, Mumble's certificate key and the
+  voice server's copy of the Ice secret. Where each is made and kept is settled with the
+  voice server's setup slices.
 - **Disposable:** one command builds a replacement on a new address from the backed-up
   certificate, settings and channels, moves the DNS record and retires the old server.
   Mumble clients find it once the DNS change reaches them. The command runs from the
@@ -409,6 +426,7 @@ SELinux mode.
 | Local-only listener | Unit tests; simulation with a non-local peer refused |
 | Cloudflare-only traffic | The SELinux smoke test sends a request from outside the ranges and expects it refused |
 | Quadlet units | CI builds the image and runs Quadlet's dry-run generator on each unit |
+| Voice link | No slice yet: with the voice server's setup, a check that Ice is refused from a public address and from a private address outside the tunnel |
 | SELinux | On an AlmaLinux 10 machine with SELinux enforcing: start the units, send a smoke request, and fail on any AVC denial, if nginx sees a peer other than the real one, or if a request from outside the ranges gets through |
 
 GitHub's hosted runners are Ubuntu and can't enforce SELinux, so the SELinux test runs
