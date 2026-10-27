@@ -210,7 +210,7 @@ Decided 2026-10-23 (roadmap core 43 and core 44).
 
 ## Member and admin spaces
 
-Decided 2026-10-26 (roadmap core 36, core 56 and core 57). The site has two spaces:
+Decided 2026-10-26 (roadmap core 36 and core 56 to 58). The site has two spaces:
 
 - **The member space** at `/` is for every pilot whose state lets them in: their characters
   and token scopes, groups and requests, service logins, and later their tax balance and SRP
