@@ -76,8 +76,9 @@ browser --> Cloudflare ---> nginx
                              live  <--------------.
                               |                    |  change events
                               v                    |  (Valkey pub/sub)
-                             sso --> access -------+--> services --> Mumble, XMPP
-                              |        ^
+                             sso --> access -------+--> services --> Mumble (voice server,
+                              |        ^                  |           over WireGuard)
+                              |        |                  '---------> XMPP (Openfire)
                               v        | affiliations
 EVE SSO and ESI <---------- esi -------'
                               ^
@@ -183,16 +184,24 @@ Decided 2026-10-23 (roadmap core 43 and core 44).
   registers itself as the authenticator. Before building it, roadmap core 43 confirms that
   Ice is still Mumble's server interface and lists the calls Alliance Auth's authenticator
   uses.
-- **XMPP** in 1.0 manages accounts on the coalition's existing server, Openfire,
+- **XMPP** accounts are managed on the coalition's existing server, Openfire,
   through its REST API plugin, unless a check of what most coalitions run finds something
   else. An XMPP server written in Zig, to the same rules, follows 1.0 and removes the
   Java dependency.
 - **Their secrets** are Podman secrets like the token key (decided 2026-10-24): the Ice
   secret for Mumble and the Openfire REST API key, never in the config file, the database
-  or a log. The service's Ice listener binds 127.0.0.1 inside the pod, so only processes in
-  the pod's network namespace can reach it. That works only if Mumble runs in the same pod;
-  where Mumble runs is still an open decision, and roadmap core 45 settles it before it binds
-  anything.
+  or a log. The installer generates the Ice secret and takes the Openfire API key
+  ([Installer](#installer)).
+- **Mumble runs on a voice server of its own** (decided 2026-10-26), not on the main
+  server. The two servers talk over a private network in the same data center (a VPC).
+  That network isn't encrypted, so Ice runs inside a WireGuard tunnel across it, and pilots'
+  Mumble logins and the Ice secret never travel in the clear. Ice listens only on the
+  tunnel's private address on each side, never on a public one; each firewall lets Ice in
+  only through the tunnel, from the other server's tunnel address; and every Ice call
+  carries the Ice secret. [Voice server](#voice-server) has the deployment.
+- **Mumble's certificate** is its own self-signed one (decided 2026-10-26), made once by the
+  installer and backed up with the token key, so a rebuilt voice server never shows players
+  a new certificate.
 
 ## SRP skill checks
 
@@ -240,6 +249,11 @@ How each component is tested:
 Cloudflare. Deployment is part of the core milestone, not an afterthought: the first slice
 that serves a page already runs this way.
 
+It uses two servers in the same data center, joined by a private network: the main server
+runs the app and everything it needs, and a small [voice server](#voice-server) runs
+Mumble. The main server's address is never published: the web reaches it only through
+Cloudflare, and an attack on voice can't take auth down with it.
+
 ### Host
 
 - **AlmaLinux 10, SELinux enforcing, always.** No setup step, script, doc or installer
@@ -251,6 +265,8 @@ that serves a page already runs this way.
   services (firewalld, sshd).
 - **firewalld** opens the web port only to Cloudflare's published address ranges, held in
   an ipset. SSH is limited separately. Postgres and Valkey have no open port on the host.
+  On the main server, nginx's web port is the only published port; Ice comes in only
+  through the WireGuard tunnel from the voice server.
 
 ### Containers
 
@@ -285,8 +301,8 @@ Rules for every unit:
   each other by it. Each container mounts only the volumes it needs. Never `--privileged`,
   never `SecurityLabelDisable=true` (`--security-opt label=disable`), never a host
   directory shared without a label.
-- Secrets (the token key from [Tokens at rest](#tokens-at-rest), the Ice secret and the
-  Openfire API key) are mounted as Podman secrets readable only by the service user, never
+- Secrets (the token key from [Tokens at rest](#tokens-at-rest), the origin certificate's
+  key, the Ice secret and the Openfire API key) are mounted as Podman secrets readable only by the service user, never
   baked into an image or a unit.
 - The app's unit sets `LimitCORE=0` in `[Service]` and `Ulimit=core=0` in `[Container]`, so
   a crash doesn't write the token key to a core dump.
@@ -294,6 +310,23 @@ Rules for every unit:
   so the pod publishes a high port and firewalld forwards the public port to it (a local
   redirect, which keeps the source address).
 - The image is built from the ReleaseSafe binary and holds nothing else it doesn't need.
+
+### Voice server
+
+Mumble runs on a small server of its own, with the same host and container rules as the
+main server: AlmaLinux 10 with SELinux enforcing, Mumble as a rootless Quadlet unit.
+
+- **Published:** only Mumble's port (64738 by default, TCP and UDP), which firewalld opens
+  to everyone. Its DNS record is DNS-only, not proxied by Cloudflare, so it shows the voice
+  server's address and never the main server's.
+- **Private:** a WireGuard tunnel to the main server across the data center's private
+  network (a VPC). Ice listens only on the tunnel's address and is let in only from the main
+  server's tunnel address, with the Ice secret on every call.
+- **Disposable:** one command builds a replacement on a new address from the backed-up
+  certificate, settings and channels, moves the DNS record and retires the old server.
+  Mumble clients find it once the DNS change reaches them. The command runs from the
+  administrator's own computer, which holds the hosting and Cloudflare API tokens, so no
+  server keeps keys that could create servers or change DNS.
 
 ### Cloudflare
 
@@ -329,10 +362,14 @@ core 51).
 ### Installer
 
 After the core works (roadmap core 55), one command sets up a host. It asks for the EVE
-application's client ID and secret, the callback URL, the domain, the database and the
-first admin character, then writes the config file and the Quadlet units, generates the
-token key and its check value and stores the key as a Podman secret, loads the Cloudflare
-ranges into firewalld and nginx, and starts the services. It checks that SELinux is enforcing and stops with a clear message if it isn't; it never changes the SELinux mode.
+application's client ID and secret, the callback URL, the domain, the database, the first
+admin character, the Cloudflare origin certificate and its key, and Openfire's address and
+REST API key. It writes the config file and the Quadlet units, generates the token key and
+its check value, the Ice secret and Mumble's self-signed certificate, and stores the token
+key, the origin key, the Ice secret and the Openfire API key as Podman secrets. Then it loads
+the Cloudflare ranges into firewalld and nginx and starts the services. It checks that
+SELinux is enforcing and stops with a clear message if it isn't; it never changes the
+SELinux mode.
 
 ### How deployment is tested
 
