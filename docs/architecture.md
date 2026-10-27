@@ -223,6 +223,15 @@ Decided 2026-10-26 (roadmap core 36, core 56 and core 57). The site has two spac
   permission, and the app refuses to remove the last person who holds them all.
 - Every admin action is written to the audit log, as is every view of private data.
 
+## Email
+
+Decided 2026-10-26. Confirmed emails (release 0.4) mean the app has to send mail. It sends
+it only through a sending service's HTTPS API, never through a mail server of its own:
+large mail providers junk or reject mail from a new address with no sending reputation,
+and hosts often block mail ports on new accounts. Brevo is the first service and Amazon SES
+the fallback. Both sit behind one small mail interface, so switching is a setting and an
+adapter.
+
 ## SRP skill checks
 
 Decided 2026-10-23 (roadmap SRP 1). When a pilot in a skill-checked ship lacks a required
