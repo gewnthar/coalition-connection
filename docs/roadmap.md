@@ -13,7 +13,7 @@ SRP 8, so a slice label can't be mistaken for a version.
 | --- | --- | --- |
 | 0.1 | A page served through Cloudflare and nginx under SELinux | core 1 to 6, core 8, core 47 to 54 |
 | 0.2 | EVE login and characters | core 7, core 9 to 21, core 31, core 36 (its login and characters pages), core 38 |
-| 0.3 | States, groups, the member and admin spaces, in-game corporation roles, and revocation on leaving | core 22 to 30, core 36 (its groups page), the two admin slices; roles and revocation have no slices yet |
+| 0.3 | States, groups, the member and admin spaces, in-game corporation roles, and revocation on leaving | core 22 to 30, core 36 (its groups page), core 56, core 57; roles and revocation have no slices yet |
 | 0.4 | Live pages, leave alerts, confirmed emails, account recovery and the record kept after a member leaves | core 32 to 35, core 37; emails, recovery and that record have no slices yet |
 | 0.5 | Mumble on its own voice server, XMPP and Discord | core 43 to 46; the voice server's setup and Discord have no slices yet |
 | 0.6 | The installer and the Alliance Auth import | core 39 to 42, core 55 |
@@ -117,7 +117,9 @@ Releases 0.1 to 0.6; the release plan above says which slices go in each.
 | core 33 | Event ids, the catch-up backlog (capped in events and in bytes, its index added to the memory table) and the fall-back reload | unit; simulation with dropped sockets |
 | core 34 | Fan-out from Valkey pub/sub to watching pages | simulation |
 | core 35 | The small client script that swaps fragments in | browser test |
-| core 36 | First pages: login, characters, groups (after the Deployment group below, so they run deployed from the start) | unit |
+| core 36 | First member-space pages: login, characters, groups (after the Deployment group below, so they run deployed from the start) | unit |
+| core 56 | Admin frame for the admin space at `/admin/`: its routes, its menu (links a user can't use are left out), and the per-page permission check the router runs before a page, deny by default; member pages take the user from the session, never from the request ([architecture.md](architecture.md#member-and-admin-spaces)) (needs core 16, core 29) | unit: every admin route names a permission, and a route without one fails the check; a request without the permission is refused before the page runs; the menu leaves out links the user can't use; removing the last person who holds every admin permission is refused |
+| core 57 | First admin pages: users, states, groups, permissions and join requests (needs core 56) | unit: each page requires its permission; each action writes an audit-log entry |
 | core 37 | Leave alerts | unit; simulation |
 
 ### Importer

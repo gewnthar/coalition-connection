@@ -203,6 +203,26 @@ Decided 2026-10-23 (roadmap core 43 and core 44).
   installer and backed up with the token key, so a rebuilt voice server never shows players
   a new certificate.
 
+## Member and admin spaces
+
+Decided 2026-10-26 (roadmap core 36, core 56 and core 57). The site has two spaces:
+
+- **The member space** at `/` is for every pilot whose state lets them in: their characters
+  and token scopes, groups and requests, service logins, and later their tax balance and SRP
+  requests. Its pages take the user from the session, never from the request, so no address
+  or form field can point a page at someone else's data.
+- **The admin space** at `/admin/` is for leaders: users, states, groups and requests,
+  permissions, service sync, leave alerts, the importer, the audit log and settings.
+  Audits (audits 11), taxes and SRP review (SRP 8) add their pages to it as they are built.
+- **Deny by default.** Each admin page names the permission it needs, and the router checks
+  it before the page runs; a page that names none is refused. Links a user can't use are
+  left out of the menu.
+- **Admin rights come from groups,** like every other permission, so a group leader or an
+  SRP reviewer gets only their own pages.
+- **The last full admin stays.** The installer's first admin starts with every admin
+  permission, and the app refuses to remove the last person who holds them all.
+- Every admin action is written to the audit log, as is every view of private data.
+
 ## SRP skill checks
 
 Decided 2026-10-23 (roadmap SRP 1). When a pilot in a skill-checked ship lacks a required
