@@ -1,9 +1,39 @@
-# Roadmap: 1.0
+# Roadmap
 
-1.0 is drop-in parity with Alliance Auth, built in this order: the core, then taxes,
-then audits, then SRP. Taxes come early because their rules are exact and easy to check
-against the old app; audits come before SRP because SRP's skill checks need the audits'
-skill history. There is one cutover, once everything matches.
+Versions work like Zig's. Releases stay below 1.0 and come in little steps, so bugs show
+up early, and each release is something that runs on the test server. Between releases,
+`main` is the next version with `-dev`, as Zig's master is (for example `0.2.0-dev`).
+
+Slices are labelled by their milestone's name and number, such as core 38, taxes 3 or
+SRP 8, so a slice label can't be mistaken for a version.
+
+## Release plan
+
+| Release | What it adds | Slices |
+| --- | --- | --- |
+| 0.1 | A page served through Cloudflare and nginx under SELinux | core 1 to 6, core 8, core 47 to 54 |
+| 0.2 | EVE login and characters | core 7, core 9 to 21, core 31, core 36 (its login and characters pages), core 38 |
+| 0.3 | States, groups, the member and admin spaces, in-game corporation roles, and revocation on leaving | core 22 to 30, core 36 (its groups page), the two admin slices; roles and revocation have no slices yet |
+| 0.4 | Live pages, leave alerts, confirmed emails, account recovery and the record kept after a member leaves | core 32 to 35, core 37; emails, recovery and that record have no slices yet |
+| 0.5 | Mumble, XMPP and Discord | core 43 to 46; Discord has no slices yet |
+| 0.6 | The installer and the Alliance Auth import | core 39 to 42, core 55 |
+| 0.7 | Taxes | the taxes milestone |
+| 0.8 | Audits | the audits milestone |
+| 0.9 | SRP | the SRP milestone |
+| 0.10 | Fleet activity tracking | the fleet activity tracking milestone (no slices yet) |
+| 0.11 | The shadow run and the coalition's cutover | the cutover milestone |
+| 0.12 | Fleet schedule, calendar and timers | no slices yet |
+| 0.13 | Structures and moons | no slices yet |
+| 0.14 | Pings and announcements | no slices yet |
+| 0.15 | Standings | no slices yet |
+| 0.16 | Forum | no slices yet |
+| 0.17 | Wiki | no slices yet |
+| 1.0 | All of the above built and working | - |
+
+Taxes come before audits because their rules are exact and easy to check against the old
+app; audits come before SRP because SRP's skill checks need the audits' skill history.
+Fleet activity tracking comes before the cutover because coalitions track fleet
+participation. Any release can be split further if it grows.
 
 Each slice is one pull request small enough to review in about 15 minutes, and ships with
 the tests named beside it. **Decision** marks a slice that waits on a choice from the
@@ -20,6 +50,8 @@ whose choice is written down, with the date it was made.
 | `zig build test`, `fuzz` and `sim` steps; CI on every pull request | CI itself |
 
 ## Core
+
+Releases 0.1 to 0.6; the release plan above says which slices go in each.
 
 ### Foundations
 
@@ -133,6 +165,8 @@ built before core 36, the first pages, even though it is listed here. The requir
 
 ## Taxes
 
+Release 0.7.
+
 | # | Slice | Tests |
 | --- | --- | --- |
 | taxes 1 | **Decision:** tax rules: rate per ore type, price source (Fuzzwork or Janice), all mining or only corporation moons, interest on unpaid tax | - |
@@ -148,6 +182,8 @@ built before core 36, the first pages, even though it is listed here. The requir
 | taxes 11 | Parity: a month of taxes matches the old app to the ISK | parity run |
 
 ## Audits
+
+Release 0.8.
 
 | # | Slice | Tests |
 | --- | --- | --- |
@@ -166,6 +202,8 @@ built before core 36, the first pages, even though it is listed here. The requir
 
 ## SRP
 
+Release 0.9.
+
 | # | Slice | Tests |
 | --- | --- | --- |
 | SRP 1 | **Decided (2026-10-23):** when a pilot lacks a required skill in a skill-checked ship, the payout is the FC's call, recorded with the FC's name like a waiver | - |
@@ -179,7 +217,13 @@ built before core 36, the first pages, even though it is listed here. The requir
 | SRP 9 | Payouts into the ledger: a pending transfer on approval, posted on payout or voided on rejection (needs taxes 3) | unit; fuzz ledger invariants |
 | SRP 10 | Import SRP requests and payouts | unit with a sample export |
 
+## Fleet activity tracking
+
+Release 0.10. No slices yet.
+
 ## Cutover
+
+Release 0.11.
 
 | # | Slice | Tests |
 | --- | --- | --- |
@@ -187,5 +231,29 @@ built before core 36, the first pages, even though it is listed here. The requir
 | cutover 2 | Benchmark in CI: requests per second, p99 latency, memory | benchmark |
 | cutover 3 | Cutover runbook on the same EVE application, and the way back | dry run |
 
-1.0 is done when the shadow run shows matching access and a full month of taxes
-matching to the ISK, followed by a clean cutover.
+The coalition moves over at 0.11, once the shadow run shows matching access and a full
+month of taxes matching to the ISK, followed by a clean cutover.
+
+## Fleet schedule, calendar and timers
+
+Release 0.12. No slices yet.
+
+## Structures and moons
+
+Release 0.13. No slices yet.
+
+## Pings and announcements
+
+Release 0.14. No slices yet.
+
+## Standings
+
+Release 0.15. No slices yet.
+
+## Forum
+
+Release 0.16. No slices yet.
+
+## Wiki
+
+Release 0.17. No slices yet.
