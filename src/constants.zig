@@ -83,7 +83,7 @@ pub const http_response_size_max: u32 = 1024 * 1024;
 /// Reason: a connection holds one only while it renders a page and writes it to nginx on
 /// the local socket, and nginx buffers responses for slow clients, so a buffer is back in
 /// the pool within milliseconds. That holds only while nginx's proxy buffering stays on
-/// with room for a full response (roadmap 1.48). A connection that finds the pool empty
+/// with room for a full response (roadmap core 48). A connection that finds the pool empty
 /// waits for a buffer. One buffer per connection would take 4 GiB. Provisional.
 pub const http_response_buffers_max: u32 = 64;
 
@@ -170,9 +170,9 @@ pub const memory_table_rows_max: u32 = 64;
 
 /// Every buffer sized from the limits above. The comptime block after the limits adds it up
 /// and fails the build when the total exceeds `memory_budget_bytes`. Small per-connection
-/// state and lookup tables are not rows yet: the slice that adds one (roadmap 1.3, 1.33 and
-/// 1.38 among them) adds its row here in the same change. The table counts startup heap
-/// buffers only, not stacks or the program itself.
+/// state and lookup tables are not rows yet: the slice that adds one (roadmap core 3,
+/// core 33 and core 38 among them) adds its row here in the same change. The table counts
+/// startup heap buffers only, not stacks or the program itself.
 pub const memory_table = [_]MemoryRow{
     .{
         .name = "HTTP request buffer, one per connection",

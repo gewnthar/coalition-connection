@@ -3,9 +3,9 @@
 Thanks for looking. Coalition Connection is a hobby project, vibe coded for fun and testing,
 and it welcomes issues and pull requests.
 
-## What gets merged before version 1
+## What gets merged before 1.0
 
-Until version 1 is stable, only fixes are merged from outside contributors: bug fixes,
+Until 1.0 is stable, only fixes are merged from outside contributors: bug fixes,
 test fixes, documentation corrections and build or CI repairs. New features follow the
 [roadmap](docs/roadmap.md) in its order, one reviewed slice at a time. If you want a feature,
 open an issue so it can be placed on the roadmap; a feature pull request will be closed with a

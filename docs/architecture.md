@@ -25,7 +25,7 @@ AlmaLinux 10 with SELinux enforcing, behind nginx and Cloudflare.
   deterministic simulator can replace it.
 - Builds are ReleaseSafe and compile with zero warnings. Code targets the latest stable Zig.
 
-## Version 1 components
+## 1.0 components
 
 | Component | Folder | Job |
 | --- | --- | --- |
@@ -103,7 +103,7 @@ importer --> storage <-- every component (Postgres, Valkey, audit log)
 
 ## Tokens at rest
 
-Decided 2026-10-23, with the details below decided 2026-10-24 (roadmap 1.38). Pilots' ESI
+Decided 2026-10-23, with the details below decided 2026-10-24 (roadmap core 38). Pilots' ESI
 refresh tokens are encrypted before they reach the database, with XChaCha20-Poly1305 from
 Zig's standard library, which is safe with random nonces.
 
@@ -155,7 +155,7 @@ opening mail or wallets still needs a fresh EVE login.
 
 ## Ledger
 
-Decided 2026-10-23 (roadmap 2.2). Taxes and SRP share one double-entry ledger, stored in
+Decided 2026-10-23 (roadmap taxes 2). Taxes and SRP share one double-entry ledger, stored in
 Postgres and shaped like [TigerBeetle](https://tigerbeetle.com)'s accounts and transfers, so
 a later move to TigerBeetle is a backend swap rather than a redesign.
 
@@ -176,27 +176,27 @@ a later move to TigerBeetle is a backend swap rather than a redesign.
 
 ## Services: Mumble and XMPP
 
-Decided 2026-10-23 (roadmap 1.43 and 1.44).
+Decided 2026-10-23 (roadmap core 43 and core 44).
 
 - **Mumble** login is written in Zig, with no bridge in another language. The service
   speaks the part of the ZeroC Ice protocol that Mumble's authenticator interface needs and
-  registers itself as the authenticator. Before building it, roadmap 1.43 confirms that
+  registers itself as the authenticator. Before building it, roadmap core 43 confirms that
   Ice is still Mumble's server interface and lists the calls Alliance Auth's authenticator
   uses.
-- **XMPP** in version 1 manages accounts on the coalition's existing server, Openfire,
+- **XMPP** in 1.0 manages accounts on the coalition's existing server, Openfire,
   through its REST API plugin, unless a check of what most coalitions run finds something
-  else. An XMPP server written in Zig, to the same rules, follows version 1 and removes the
+  else. An XMPP server written in Zig, to the same rules, follows 1.0 and removes the
   Java dependency.
 - **Their secrets** are Podman secrets like the token key (decided 2026-10-24): the Ice
   secret for Mumble and the Openfire REST API key, never in the config file, the database
   or a log. The service's Ice listener binds 127.0.0.1 inside the pod, so only processes in
   the pod's network namespace can reach it. That works only if Mumble runs in the same pod;
-  where Mumble runs is still an open decision, and roadmap 1.45 settles it before it binds
+  where Mumble runs is still an open decision, and roadmap core 45 settles it before it binds
   anything.
 
 ## SRP skill checks
 
-Decided 2026-10-23 (roadmap 4.1). When a pilot in a skill-checked ship lacks a required
+Decided 2026-10-23 (roadmap SRP 1). When a pilot in a skill-checked ship lacks a required
 skill, the payout is the FC's call, recorded with the FC's name like a waiver.
 
 ## Live updates
@@ -236,7 +236,7 @@ How each component is tested:
 
 ## Deployment
 
-Version 1 runs on AlmaLinux 10 with SELinux enforcing, as rootless Podman Quadlets, behind
+1.0 runs on AlmaLinux 10 with SELinux enforcing, as rootless Podman Quadlets, behind
 Cloudflare. Deployment is part of the core milestone, not an afterthought: the first slice
 that serves a page already runs this way.
 
@@ -273,7 +273,7 @@ on nginx seeing Cloudflare's address as its TCP peer. A rootless container on a 
 bridge network gets its published ports from `rootlessport`, which replaces the source
 address, so the pod does not use a bridge network. It uses `pasta`, the default rootless
 network mode in Podman 5, whose port forwarding keeps the original source address. The
-SELinux smoke test (roadmap 1.54) fails if nginx sees anything other than the real
+SELinux smoke test (roadmap core 54) fails if nginx sees anything other than the real
 peer.
 
 Rules for every unit:
@@ -301,7 +301,7 @@ Cloudflare proxies every web request. Three rules follow from that:
 
 1. **Websockets pass through.** Cloudflare proxies websocket upgrades. It also closes
    connections that sit idle, so the live-update socket sends pings well inside
-   Cloudflare's idle timeout (roadmap 1.32), and a dropped socket reconnects and catches
+   Cloudflare's idle timeout (roadmap core 32), and a dropped socket reconnects and catches
    up from its last event id as it would after any other drop.
 2. **Real client IPs only from Cloudflare.** nginx takes the client's address from the
    `CF-Connecting-IP` header only when the TCP peer is inside Cloudflare's published
@@ -318,17 +318,17 @@ Cloudflare proxies every web request. Three rules follow from that:
 
 Cloudflare publishes its ranges at <https://www.cloudflare.com/ips/>, and they can change,
 so they are kept as data, not in code. One list feeds nginx's real-IP rules, its peer check
-and firewalld's ipset (roadmap 1.49), so they can't disagree. The app does no CIDR
+and firewalld's ipset (roadmap core 49), so they can't disagree. The app does no CIDR
 matching of its own.
 
-**Decided (roadmap 1.47, 2026-10-22): TLS from Cloudflare ends at nginx.** nginx runs in
+**Decided (roadmap core 47, 2026-10-22): TLS from Cloudflare ends at nginx.** nginx runs in
 the pod, ends TLS with a Cloudflare origin certificate, applies rules 2 and 3 with
-firewalld behind it, and proxies to the app, which listens only locally (roadmap 1.48 to
-1.51).
+firewalld behind it, and proxies to the app, which listens only locally (roadmap core 48 to
+core 51).
 
 ### Installer
 
-After the core works (roadmap 1.55), one command sets up a host. It asks for the EVE
+After the core works (roadmap core 55), one command sets up a host. It asks for the EVE
 application's client ID and secret, the callback URL, the domain, the database and the
 first admin character, then writes the config file and the Quadlet units, generates the
 token key and its check value and stores the key as a Podman secret, loads the Cloudflare
@@ -346,7 +346,7 @@ ranges into firewalld and nginx, and starts the services. It checks that SELinux
 | SELinux | On an AlmaLinux 10 machine with SELinux enforcing: start the units, send a smoke request, and fail on any AVC denial, if nginx sees a peer other than the real one, or if a request from outside the ranges gets through |
 
 GitHub's hosted runners are Ubuntu and can't enforce SELinux, so the SELinux test runs
-on a separate AlmaLinux machine. **Decided (roadmap 1.53, 2026-10-23):** it runs on the
+on a separate AlmaLinux machine. **Decided (roadmap core 53, 2026-10-23):** it runs on the
 maintainer's AlmaLinux test server, through a GitHub runner attached to a separate private
 repository. That repository's workflow builds only commits already merged to main
 here, never a ref or source taken from an open pull request, so outside pull requests can

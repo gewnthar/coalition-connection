@@ -1,4 +1,4 @@
-//! HTTP/1.1 request parser (roadmap slice 1.5).
+//! HTTP/1.1 request parser (roadmap slice core 5).
 //!
 //! Job: parse the request line and header fields of one request from a caller-owned buffer.
 //! Never allocates and never copies: every slice in the returned `Request` points into the
