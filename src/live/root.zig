@@ -23,7 +23,7 @@
 //!   live_events_backlog_max
 //!   live_events_backlog_bytes_max
 //!
-//! Status: the HTTP/1.1 request parser (roadmap 1.5) is in `http_request.zig`; the rest is a
+//! Status: the HTTP/1.1 request parser (roadmap core 5) is in `http_request.zig`; the rest is a
 //! stub. See docs/roadmap.md (core milestone, live-update slices).
 
 const std = @import("std");

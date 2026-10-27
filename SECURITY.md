@@ -27,9 +27,9 @@ advisory that credits you, unless you ask not to be.
 
 ## Supported versions
 
-There is no release yet. Until version 1 ships, only the `main` branch gets security fixes;
+There is no release yet. Until 1.0 ships, only the `main` branch gets security fixes;
 older commits and branches do not. This section will say which releases get fixes once
-version 1 is out.
+1.0 is out.
 
 ## Scope
 

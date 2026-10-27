@@ -25,7 +25,7 @@ AlmaLinux 10 with SELinux enforcing, behind nginx and Cloudflare.
   deterministic simulator can replace it.
 - Builds are ReleaseSafe and compile with zero warnings. Code targets the latest stable Zig.
 
-## Version 1 components
+## 1.0 components
 
 | Component | Folder | Job |
 | --- | --- | --- |
@@ -76,8 +76,9 @@ browser --> Cloudflare ---> nginx
                              live  <--------------.
                               |                    |  change events
                               v                    |  (Valkey pub/sub)
-                             sso --> access -------+--> services --> Mumble, XMPP
-                              |        ^
+                             sso --> access -------+--> services --> Mumble (voice server,
+                              |        ^                  |          over WireGuard)
+                              |        |                  '---------> XMPP (Openfire)
                               v        | affiliations
 EVE SSO and ESI <---------- esi -------'
                               ^
@@ -103,7 +104,7 @@ importer --> storage <-- every component (Postgres, Valkey, audit log)
 
 ## Tokens at rest
 
-Decided 2026-10-23, with the details below decided 2026-10-24 (roadmap 1.38). Pilots' ESI
+Decided 2026-10-23, with the details below decided 2026-10-24 (roadmap core 38). Pilots' ESI
 refresh tokens are encrypted before they reach the database, with XChaCha20-Poly1305 from
 Zig's standard library, which is safe with random nonces.
 
@@ -155,7 +156,7 @@ opening mail or wallets still needs a fresh EVE login.
 
 ## Ledger
 
-Decided 2026-10-23 (roadmap 2.2). Taxes and SRP share one double-entry ledger, stored in
+Decided 2026-10-23 (roadmap taxes 2). Taxes and SRP share one double-entry ledger, stored in
 Postgres and shaped like [TigerBeetle](https://tigerbeetle.com)'s accounts and transfers, so
 a later move to TigerBeetle is a backend swap rather than a redesign.
 
@@ -176,27 +177,72 @@ a later move to TigerBeetle is a backend swap rather than a redesign.
 
 ## Services: Mumble and XMPP
 
-Decided 2026-10-23 (roadmap 1.43 and 1.44).
+Decided 2026-10-23 (roadmap core 43 and core 44).
 
 - **Mumble** login is written in Zig, with no bridge in another language. The service
   speaks the part of the ZeroC Ice protocol that Mumble's authenticator interface needs and
-  registers itself as the authenticator. Before building it, roadmap 1.43 confirms that
+  registers itself as the authenticator. Before building it, roadmap core 43 confirms that
   Ice is still Mumble's server interface and lists the calls Alliance Auth's authenticator
   uses.
-- **XMPP** in version 1 manages accounts on the coalition's existing server, Openfire,
+- **XMPP** accounts are managed on the coalition's existing server, Openfire,
   through its REST API plugin, unless a check of what most coalitions run finds something
-  else. An XMPP server written in Zig, to the same rules, follows version 1 and removes the
+  else. An XMPP server written in Zig, to the same rules, follows 1.0 and removes the
   Java dependency.
 - **Their secrets** are Podman secrets like the token key (decided 2026-10-24): the Ice
   secret for Mumble and the Openfire REST API key, never in the config file, the database
-  or a log. The service's Ice listener binds 127.0.0.1 inside the pod, so only processes in
-  the pod's network namespace can reach it. That works only if Mumble runs in the same pod;
-  where Mumble runs is still an open decision, and roadmap 1.45 settles it before it binds
-  anything.
+  or a log. The installer generates the Ice secret and takes the Openfire API key
+  ([Installer](#installer)).
+- **Mumble runs on a voice server of its own** (decided 2026-10-26), not on the main
+  server. The two servers talk over a private network in the same data center (a VPC).
+  That network isn't encrypted, so Ice runs inside a WireGuard tunnel across it, and pilots'
+  Mumble logins and the Ice secret never travel in the clear. Ice is reachable only on the
+  tunnel's private address on each side, never on a public one, and each firewall lets Ice
+  in only through the tunnel, from the other server's tunnel address. Every call into
+  Mumble carries the Ice secret. The app's own Ice listener, which Mumble calls back as the
+  authenticator, accepts connections only from the voice server's tunnel address; core 43
+  confirms whether those callbacks carry the secret too. [Voice server](#voice-server) has
+  the deployment.
+- **Mumble's certificate** is its own self-signed one (decided 2026-10-26), made once by the
+  installer and backed up with the token key, so a rebuilt voice server never shows players
+  a new certificate. At cutover, the current Mumble's certificate, channels and permissions
+  move over with it; if the current Mumble uses a public certificate, this is revisited
+  before cutover.
+
+## Member and admin spaces
+
+Decided 2026-10-26 (roadmap core 36 and core 56 to 58). The site has two spaces:
+
+- **The member space** at `/` is for every pilot whose state lets them in: their characters
+  and token scopes, groups and requests, service logins, and later their tax balance and SRP
+  requests. Its pages take the user from the session, never from the request, so no address
+  or form field can point a page at someone else's data.
+- **The admin space** at `/admin/` is for leaders: users, states, groups and requests,
+  permissions, service sync, leave alerts, the importer, the audit log and settings.
+  Audits (audits 11), taxes and SRP review (SRP 8) add their pages to it as they are built.
+- **Deny by default.** Each admin page names the permission it needs, and the router checks
+  it before the page runs; a page that names none is refused. Links a user can't use are
+  left out of the menu.
+- **Admin rights come from groups,** like every other permission, so a group leader or an
+  SRP reviewer gets only their own pages.
+- **The last full admin stays.** The installer's first admin starts with every admin
+  permission, and the app refuses any admin action that would leave no one holding them
+  all: removing that person from a group, dropping a permission from a group, or deleting
+  a group. Leaving the corporation in game removes access automatically and can't be
+  refused; what happens then is still an open decision.
+- Every admin action is written to the audit log, as is every view of private data.
+
+## Email
+
+Decided 2026-10-26. Confirmed emails (release 0.4) mean the app has to send mail. It sends
+it only through a sending service's HTTPS API, never through a mail server of its own:
+large mail providers junk or reject mail from a new address with no sending reputation,
+and hosts often block mail ports on new accounts. Brevo is the first service and Amazon SES
+the fallback. Both sit behind one small mail interface, so switching is a setting and an
+adapter. How the service's API key is stored is settled with the email slices.
 
 ## SRP skill checks
 
-Decided 2026-10-23 (roadmap 4.1). When a pilot in a skill-checked ship lacks a required
+Decided 2026-10-23 (roadmap SRP 1). When a pilot in a skill-checked ship lacks a required
 skill, the payout is the FC's call, recorded with the FC's name like a waiver.
 
 ## Live updates
@@ -236,9 +282,14 @@ How each component is tested:
 
 ## Deployment
 
-Version 1 runs on AlmaLinux 10 with SELinux enforcing, as rootless Podman Quadlets, behind
+1.0 runs on AlmaLinux 10 with SELinux enforcing, as rootless Podman Quadlets, behind
 Cloudflare. Deployment is part of the core milestone, not an afterthought: the first slice
 that serves a page already runs this way.
+
+It uses two servers in the same data center, joined by a private network: the main server
+runs the app and everything it needs, and a small [voice server](#voice-server) runs
+Mumble. The main server's address is never published: the web reaches it only through
+Cloudflare, and an attack on voice can't take auth down with it.
 
 ### Host
 
@@ -248,9 +299,11 @@ that serves a page already runs this way.
   SELinux off. A denial is a bug.
 - **One unprivileged service user** owns the containers. `loginctl enable-linger` lets its
   units start at boot without a login session. Nothing runs as root except the host's own
-  services (firewalld, sshd).
+  services (firewalld, sshd, WireGuard).
 - **firewalld** opens the web port only to Cloudflare's published address ranges, held in
   an ipset. SSH is limited separately. Postgres and Valkey have no open port on the host.
+  On the main server, nginx's web port is the only port published to the internet; Ice
+  comes in only through the WireGuard tunnel from the voice server.
 
 ### Containers
 
@@ -258,13 +311,15 @@ Each process is a Quadlet unit under the service user's `~/.config/containers/sy
 which systemd turns into ordinary services. The units live in the repository under
 `deploy/`. All four containers join one pod (a Quadlet `.pod` unit), so they share a
 network namespace: nginx reaches the app on a local socket, the app reaches Postgres and
-Valkey on `localhost`, and only nginx's web port is published.
+Valkey on `localhost`, and only nginx's web port is published to the internet. The app's
+Ice listener is published only on the main server's WireGuard tunnel address, never on a
+public one, so Mumble on the voice server can reach it through the tunnel.
 
 | Unit | Runs | Reachable from |
 | --- | --- | --- |
 | `coalition-connection.pod` | The shared network namespace; publishes nginx's web port only | - |
 | `nginx.container` | nginx: ends TLS, applies the Cloudflare rules, proxies to the app | Cloudflare, through the web port |
-| `coalition-connection.container` | The Zig binary, listening only on a local socket | nginx only |
+| `coalition-connection.container` | The Zig binary: web requests only on a local socket, Ice only on the tunnel address | nginx; Mumble on the voice server, through the tunnel, for Ice |
 | `postgres.container` | Postgres, listening on `localhost` only | The app only |
 | `valkey.container` | Valkey, listening on `localhost` only | The app only |
 
@@ -273,7 +328,7 @@ on nginx seeing Cloudflare's address as its TCP peer. A rootless container on a 
 bridge network gets its published ports from `rootlessport`, which replaces the source
 address, so the pod does not use a bridge network. It uses `pasta`, the default rootless
 network mode in Podman 5, whose port forwarding keeps the original source address. The
-SELinux smoke test (roadmap 1.54) fails if nginx sees anything other than the real
+SELinux smoke test (roadmap core 54) fails if nginx sees anything other than the real
 peer.
 
 Rules for every unit:
@@ -285,9 +340,9 @@ Rules for every unit:
   each other by it. Each container mounts only the volumes it needs. Never `--privileged`,
   never `SecurityLabelDisable=true` (`--security-opt label=disable`), never a host
   directory shared without a label.
-- Secrets (the token key from [Tokens at rest](#tokens-at-rest), the Ice secret and the
-  Openfire API key) are mounted as Podman secrets readable only by the service user, never
-  baked into an image or a unit.
+- Secrets (the token key from [Tokens at rest](#tokens-at-rest), the origin certificate's
+  key, the Ice secret and the Openfire API key) are mounted as Podman secrets readable only
+  by the service user, never baked into an image or a unit.
 - The app's unit sets `LimitCORE=0` in `[Service]` and `Ulimit=core=0` in `[Container]`, so
   a crash doesn't write the token key to a core dump.
 - No extra Linux capabilities. Rootless containers can't bind ports below 1024 by default,
@@ -295,13 +350,37 @@ Rules for every unit:
   redirect, which keeps the source address).
 - The image is built from the ReleaseSafe binary and holds nothing else it doesn't need.
 
+### Voice server
+
+Mumble runs on a small server of its own. Its setup has no roadmap slices yet; the plan is
+the same host rules as the main server (AlmaLinux 10 with SELinux enforcing, an
+unprivileged service user), and its setup slices will settle the rest.
+
+- **Published:** only Mumble's port (64738 by default, TCP and UDP), which firewalld opens
+  to everyone. Its DNS record is DNS-only, not proxied by Cloudflare, so it shows the voice
+  server's address and never the main server's.
+- **Private:** a WireGuard tunnel to the main server across the data center's private
+  network (a VPC). The tunnel's endpoints use private addresses, and its port is open only
+  on the private network, never on the public interface, so neither server's config holds
+  the other's public address. Ice is reachable only on the tunnel's address and is let in
+  only from the main server's tunnel address, with the Ice secret on every call into
+  Mumble. SSH is limited separately, as on the main server.
+- **Its secrets:** the WireGuard keys on both servers, Mumble's certificate key and the
+  voice server's copy of the Ice secret. Where each is made and kept is settled with the
+  voice server's setup slices.
+- **Disposable:** one command builds a replacement on a new address from the backed-up
+  certificate, settings and channels, moves the DNS record and retires the old server.
+  Mumble clients find it once the DNS change reaches them. The command runs from the
+  administrator's own computer, which holds the hosting and Cloudflare API tokens, so no
+  server keeps keys that could create servers or change DNS.
+
 ### Cloudflare
 
 Cloudflare proxies every web request. Three rules follow from that:
 
 1. **Websockets pass through.** Cloudflare proxies websocket upgrades. It also closes
    connections that sit idle, so the live-update socket sends pings well inside
-   Cloudflare's idle timeout (roadmap 1.32), and a dropped socket reconnects and catches
+   Cloudflare's idle timeout (roadmap core 32), and a dropped socket reconnects and catches
    up from its last event id as it would after any other drop.
 2. **Real client IPs only from Cloudflare.** nginx takes the client's address from the
    `CF-Connecting-IP` header only when the TCP peer is inside Cloudflare's published
@@ -318,21 +397,25 @@ Cloudflare proxies every web request. Three rules follow from that:
 
 Cloudflare publishes its ranges at <https://www.cloudflare.com/ips/>, and they can change,
 so they are kept as data, not in code. One list feeds nginx's real-IP rules, its peer check
-and firewalld's ipset (roadmap 1.49), so they can't disagree. The app does no CIDR
+and firewalld's ipset (roadmap core 49), so they can't disagree. The app does no CIDR
 matching of its own.
 
-**Decided (roadmap 1.47, 2026-10-22): TLS from Cloudflare ends at nginx.** nginx runs in
+**Decided (roadmap core 47, 2026-10-22): TLS from Cloudflare ends at nginx.** nginx runs in
 the pod, ends TLS with a Cloudflare origin certificate, applies rules 2 and 3 with
-firewalld behind it, and proxies to the app, which listens only locally (roadmap 1.48 to
-1.51).
+firewalld behind it, and proxies to the app, which listens only locally (roadmap core 48 to
+core 51).
 
 ### Installer
 
-After the core works (roadmap 1.55), one command sets up a host. It asks for the EVE
-application's client ID and secret, the callback URL, the domain, the database and the
-first admin character, then writes the config file and the Quadlet units, generates the
-token key and its check value and stores the key as a Podman secret, loads the Cloudflare
-ranges into firewalld and nginx, and starts the services. It checks that SELinux is enforcing and stops with a clear message if it isn't; it never changes the SELinux mode.
+After the core works (roadmap core 55), one command sets up a host. It asks for the EVE
+application's client ID and secret, the callback URL, the domain, the database, the first
+admin character, the Cloudflare origin certificate and its key, and Openfire's address and
+REST API key. It writes the config file and the Quadlet units, generates the token key and
+its check value, the Ice secret and Mumble's self-signed certificate, and stores the token
+key, the origin key, the Ice secret and the Openfire API key as Podman secrets. Then it loads
+the Cloudflare ranges into firewalld and nginx and starts the services. It checks that
+SELinux is enforcing and stops with a clear message if it isn't; it never changes the
+SELinux mode.
 
 ### How deployment is tested
 
@@ -343,10 +426,11 @@ ranges into firewalld and nginx, and starts the services. It checks that SELinux
 | Local-only listener | Unit tests; simulation with a non-local peer refused |
 | Cloudflare-only traffic | The SELinux smoke test sends a request from outside the ranges and expects it refused |
 | Quadlet units | CI builds the image and runs Quadlet's dry-run generator on each unit |
+| Voice link | No slice yet: with the voice server's setup, a check that Ice is refused from a public address and from a private address outside the tunnel |
 | SELinux | On an AlmaLinux 10 machine with SELinux enforcing: start the units, send a smoke request, and fail on any AVC denial, if nginx sees a peer other than the real one, or if a request from outside the ranges gets through |
 
 GitHub's hosted runners are Ubuntu and can't enforce SELinux, so the SELinux test runs
-on a separate AlmaLinux machine. **Decided (roadmap 1.53, 2026-10-23):** it runs on the
+on a separate AlmaLinux machine. **Decided (roadmap core 53, 2026-10-23):** it runs on the
 maintainer's AlmaLinux test server, through a GitHub runner attached to a separate private
 repository. That repository's workflow builds only commits already merged to main
 here, never a ref or source taken from an open pull request, so outside pull requests can
