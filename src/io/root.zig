@@ -112,7 +112,7 @@ pub fn assertContract(comptime IO: type) void {
 /// at some distant call site.
 pub fn contractError(comptime IO: type) ?[]const u8 {
     assert(@typeInfo(IO) == .@"struct");
-    const message = methodError(IO, "now", fn (*const IO) Instant) orelse
+    const message: ?[]const u8 = methodError(IO, "now", fn (*const IO) Instant) orelse
         methodError(IO, "submit", fn (*IO, Submission) SubmitError!void) orelse
         methodError(IO, "poll", fn (*IO, []Completion) u32) orelse
         methodError(IO, "randomBytes", fn (*IO, []u8) RandomError!void);
