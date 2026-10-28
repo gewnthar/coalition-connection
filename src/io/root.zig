@@ -14,11 +14,19 @@
 //!   now(self: *const IO) Instant                        monotonic clock, nanoseconds
 //!   submit(self: *IO, Submission) SubmitError!void      queue one operation
 //!   poll(self: *IO, []Completion) u32                   take finished operations
-//!   randomBytes(self: *IO, []u8) void                   fill a buffer with random bytes
+//!   randomBytes(self: *IO, []u8) RandomError!void       fill a buffer with random bytes
 //!
 //! Operation lifetime: the bytes an operation names belong to the caller and must stay valid
-//! and unchanged until its completion arrives, as with io_uring. Each submitted operation
-//! completes exactly once, carrying the `id` the caller gave it.
+//! and unchanged until its completion arrives, as with io_uring; the simulator checks this.
+//! Each accepted operation completes exactly once, carrying the `id` the caller gave it, and
+//! ids in flight must be distinct. A submission refused with `error.QueueFull` never
+//! completes. `poll` takes a buffer of 1 to `constants.io_operations_in_flight_max`
+//! completions. A send may complete short, reporting fewer bytes than it was given; the
+//! caller sends the rest.
+//!
+//! Placeholders: `execute` stands in for database traffic until roadmap core 11 frames
+//! Postgres over sockets, and the contract has no cancel yet; core 3 adds socket reads and
+//! cancellation. Components should not build on `execute`.
 //!
 //! Random bytes: the operating system's CSPRNG in production, the seeded PRNG in the
 //! simulator, so token nonces never break replay. The simulator refuses to compile into a
@@ -52,6 +60,10 @@ pub const OperationId = u64;
 pub const SubmitError = error{QueueFull};
 pub const SendError = error{ PeerDown, Backpressure };
 pub const DatabaseError = error{ Unavailable, Timeout };
+
+/// The operating system could not supply random bytes. Production callers refuse the
+/// operation that needed them; they never fall back to a weaker source.
+pub const RandomError = error{RandomUnavailable};
 
 pub const Kind = enum(u8) { send, execute };
 
@@ -91,7 +103,7 @@ pub const Completion = struct {
 pub fn assertContract(comptime IO: type) void {
     comptime {
         if (contractError(IO)) |message| @compileError(message);
-        assert(@hasDecl(IO, "randomBytes"));
+        assert(contractError(IO) == null);
     }
 }
 
@@ -103,7 +115,7 @@ pub fn contractError(comptime IO: type) ?[]const u8 {
     const message = methodError(IO, "now", fn (*const IO) Instant) orelse
         methodError(IO, "submit", fn (*IO, Submission) SubmitError!void) orelse
         methodError(IO, "poll", fn (*IO, []Completion) u32) orelse
-        methodError(IO, "randomBytes", fn (*IO, []u8) void);
+        methodError(IO, "randomBytes", fn (*IO, []u8) RandomError!void);
     assert(message == null or message.?.len > 0);
     return message;
 }
@@ -161,7 +173,7 @@ const WrongPoll = struct {
         _ = self;
         return completions.len;
     }
-    pub fn randomBytes(self: *WrongPoll, buffer: []u8) void {
+    pub fn randomBytes(self: *WrongPoll, buffer: []u8) RandomError!void {
         _ = self;
         @memset(buffer, 0);
     }
