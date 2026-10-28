@@ -151,6 +151,19 @@ pub const doctrines_max: u32 = 256;
 /// hundred skills.
 pub const doctrine_skills_max: u32 = 512;
 
+// ---- I/O boundary --------------------------------------------------------------------
+
+/// Operations submitted to the I/O boundary and not yet completed. Reason: bounds the
+/// in-flight table, as an io_uring queue depth does, so a submission past it fails with
+/// `error.QueueFull` instead of growing anything. Provisional: roadmap core 3 sizes it against
+/// the connection table, since each connection may keep a read in flight, and adds the
+/// production table's row to the memory table.
+pub const io_operations_in_flight_max: u32 = 256;
+
+/// Random bytes one call to the I/O boundary may draw. Reason: the largest draw is a 32-byte
+/// key; token nonces are 24 bytes.
+pub const io_random_bytes_max: u32 = 64;
+
 // ---- Memory --------------------------------------------------------------------------
 
 /// Total memory the process may take at startup. Reason: fits a small virtual server
@@ -262,6 +275,11 @@ pub const sim_ticks_max: u32 = 100_000;
 /// only the failure path.
 pub const sim_fault_percent_max: u8 = 50;
 
+/// Longest delay, in ticks, before the simulator completes an operation. Reason: 16 ticks is
+/// 160 ms, a slow peer or a slow query; delays drawn up to this reorder completions, and
+/// longer stalls are modeled as faults.
+pub const sim_completion_delay_ticks_max: u32 = 16;
+
 /// Iterations in one fuzz run. Reason: bounded so a CI run finishes in seconds.
 pub const fuzz_iterations_max: u32 = 100_000;
 
@@ -282,6 +300,10 @@ comptime {
     // The backlog holds at least one event of the largest size.
     assert(live_events_backlog_bytes_max >= websocket_message_size_max);
     assert(memory_table.len <= memory_table_rows_max);
+    assert(io_operations_in_flight_max > 0);
+    assert(io_random_bytes_max >= 32);
+    // A simulated run must leave room to drain every delayed completion.
+    assert(sim_completion_delay_ticks_max < sim_ticks_max);
 }
 
 // The memory budget: the buffers in the memory table, added up, must fit.
