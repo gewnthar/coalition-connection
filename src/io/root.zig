@@ -112,12 +112,20 @@ pub fn assertContract(comptime IO: type) void {
 /// at some distant call site.
 pub fn contractError(comptime IO: type) ?[]const u8 {
     assert(@typeInfo(IO) == .@"struct");
-    const message: ?[]const u8 = methodError(IO, "now", fn (*const IO) Instant) orelse
-        methodError(IO, "submit", fn (*IO, Submission) SubmitError!void) orelse
-        methodError(IO, "poll", fn (*IO, []Completion) u32) orelse
-        methodError(IO, "randomBytes", fn (*IO, []u8) RandomError!void);
-    assert(message == null or message.?.len > 0);
-    return message;
+    // The array's element type keeps each result optional; a chain of `orelse` evaluated at
+    // compile time would hand back the bare payload type.
+    const messages = [_]?[]const u8{
+        methodError(IO, "now", fn (*const IO) Instant),
+        methodError(IO, "submit", fn (*IO, Submission) SubmitError!void),
+        methodError(IO, "poll", fn (*IO, []Completion) u32),
+        methodError(IO, "randomBytes", fn (*IO, []u8) RandomError!void),
+    };
+    var first: ?[]const u8 = null;
+    for (messages) |message| {
+        if (first == null) first = message;
+    }
+    assert(first == null or first.?.len > 0);
+    return first;
 }
 
 /// Checks one method. `@hasDecl` comes first because naming a missing declaration is itself
