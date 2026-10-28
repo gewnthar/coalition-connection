@@ -117,7 +117,8 @@ pub const Sim = struct {
     }
 
     /// Queues one operation to complete after a seeded delay of 0 to
-    /// `sim_completion_delay_ticks_max` ticks, with its result drawn now. A full table
+    /// `sim_completion_delay_ticks_max` ticks, capped at the run's last tick, with its result
+    /// drawn now. A full table
     /// returns `error.QueueFull` and leaves the state unchanged.
     pub fn submit(self: *Sim, submission: io.Submission) io.SubmitError!void {
         comptime assertSimulationAllowed();
@@ -128,9 +129,12 @@ pub const Sim = struct {
         const index = self.freeSlot();
         const delay_max = constants.sim_completion_delay_ticks_max;
         const delay = self.outcomes.random().uintAtMost(u32, delay_max);
+        // Never due after the run's last tick, so every accepted operation can complete.
+        const due_tick = @min(self.ticks + delay, constants.sim_ticks_max);
+        assert(due_tick >= self.ticks);
         self.slots[index] = .{
             .submission = submission,
-            .due_tick = self.ticks + delay,
+            .due_tick = due_tick,
             .result = self.draw(submission.operation),
             .bytes_hash = hashOperation(submission.operation),
         };
@@ -493,6 +497,19 @@ test "sim: a full table refuses a submission and changes nothing" {
     try testing.expectEqual(@as(u32, 1), sim.poll(&completions));
     try sim.submit(testSubmission(id));
     try testing.expectEqual(slots_count, sim.in_flight);
+}
+
+test "sim: an operation submitted on the last tick still completes" {
+    var sim = Sim.init(13, 0);
+    var ticks: u32 = 0;
+    while (ticks < constants.sim_ticks_max - 1) : (ticks += 1) sim.tick();
+    try sim.submit(testSubmission(0));
+    try sim.submit(testSubmission(1));
+    sim.tick();
+    try testing.expectEqual(constants.sim_ticks_max, sim.ticks);
+    var completions: [2]io.Completion = undefined;
+    try testing.expectEqual(@as(u32, 2), sim.poll(&completions));
+    try testing.expectEqual(@as(u32, 0), sim.in_flight);
 }
 
 test "sim: same seed, same random bytes" {
