@@ -72,11 +72,22 @@ pub const StartupAllocator = struct {
         return self;
     }
 
+    /// Whether replacing `old_len` live bytes with `new_len` bytes stays within the budget.
+    /// It compares `new_len` with the room left instead of adding it to `bytes_live`, so a
+    /// huge request is refused instead of overflowing. Neither subtraction can wrap: the
+    /// assertions give old_len <= bytes_live <= bytes_budget.
     fn fits(self: *const StartupAllocator, old_len: usize, new_len: usize) bool {
         assert(self.phase == .startup);
         assert(old_len <= self.bytes_live);
-        const after = self.bytes_live - @as(u64, @intCast(old_len)) + @as(u64, @intCast(new_len));
-        return after <= self.bytes_budget;
+        assert(self.bytes_live <= self.bytes_budget);
+        const bytes_kept: u64 = self.bytes_live - @as(u64, @intCast(old_len));
+        const bytes_room: u64 = self.bytes_budget - bytes_kept;
+        assert(bytes_kept + bytes_room == self.bytes_budget);
+        const result = @as(u64, new_len) <= bytes_room;
+        // Postcondition: a request that fits keeps the total within the budget. The sum
+        // can't overflow here, because new_len <= bytes_room.
+        if (result) assert(bytes_kept + @as(u64, new_len) <= self.bytes_budget);
+        return result;
     }
 
     fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
@@ -261,5 +272,81 @@ test "startup allocator: remap past the budget fails and leaves bytes_live uncha
 
     gpa.free(other);
     gpa.free(memory);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+// The three tests below ask for std.math.maxInt(usize) bytes. While other bytes are live,
+// adding that to bytes_live overflows u64 on a 64-bit target, so each test checks that the
+// budget check refuses the request with a normal failure instead of panicking. (On a
+// 32-bit target the sum fits in u64, so there they only check the refusal.) The allocation
+// test also asks once with nothing live, the zero edge case.
+
+test "startup allocator: a huge allocation returns OutOfMemory and leaves bytes_live unchanged" {
+    var startup = StartupAllocator.init(testing.allocator, 64);
+    const gpa = startup.allocator();
+
+    const live = try gpa.alloc(u8, 16);
+    try testing.expectError(error.OutOfMemory, gpa.alloc(u8, std.math.maxInt(usize)));
+    try testing.expectEqual(@as(u64, 16), startup.bytes_live);
+
+    gpa.free(live);
+    try testing.expectError(error.OutOfMemory, gpa.alloc(u8, std.math.maxInt(usize)));
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "startup allocator: a huge resize fails and leaves bytes_live unchanged" {
+    var backing: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&backing);
+    var startup = StartupAllocator.init(fixed.allocator(), 64);
+    const gpa = startup.allocator();
+
+    // Two live blocks, so bytes_live is above the resized block's own length.
+    const memory = try gpa.alloc(u8, 16);
+    const other = try gpa.alloc(u8, 16);
+    try testing.expect(!gpa.resize(memory, std.math.maxInt(usize)));
+    try testing.expectEqual(@as(u64, 32), startup.bytes_live);
+    try testing.expect(!gpa.resize(other, std.math.maxInt(usize)));
+    try testing.expectEqual(@as(u64, 32), startup.bytes_live);
+
+    gpa.free(other);
+    gpa.free(memory);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "startup allocator: a huge remap fails and leaves bytes_live unchanged" {
+    var backing: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&backing);
+    var startup = StartupAllocator.init(fixed.allocator(), 64);
+    const gpa = startup.allocator();
+
+    const memory = try gpa.alloc(u8, 16);
+    const other = try gpa.alloc(u8, 16);
+    try testing.expect(gpa.remap(memory, std.math.maxInt(usize)) == null);
+    try testing.expectEqual(@as(u64, 32), startup.bytes_live);
+    try testing.expect(gpa.remap(other, std.math.maxInt(usize)) == null);
+    try testing.expectEqual(@as(u64, 32), startup.bytes_live);
+
+    gpa.free(other);
+    gpa.free(memory);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "startup allocator: growth to exactly the room left beside another live block" {
+    var backing: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&backing);
+    var startup = StartupAllocator.init(fixed.allocator(), 64);
+    const gpa = startup.allocator();
+
+    // 16 bytes stay live, so the last block may grow to 48 and no further.
+    const first = try gpa.alloc(u8, 16);
+    var last = try gpa.alloc(u8, 16);
+    try testing.expect(!gpa.resize(last, 49));
+    try testing.expectEqual(@as(u64, 32), startup.bytes_live);
+    try testing.expect(gpa.resize(last, 48));
+    last = last.ptr[0..48];
+    try testing.expectEqual(@as(u64, 64), startup.bytes_live);
+
+    gpa.free(last);
+    gpa.free(first);
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);
 }
