@@ -17,6 +17,10 @@
 //!   5   the call reached the child allocator before tripping: the guard came too late
 //!   6   a control case's call was refused, or left the accounting wrong
 //!
+//! A passing case prints nothing; only the failure codes say why on stderr. Zig's build
+//! runner shows any stderr from a run step, even a passing one, under a "failed command"
+//! line, so a passing case that printed would look like a failure in every test log.
+//!
 //! What a pass proves: some assertion in `StartupAllocator` stopped the call before the
 //! child allocator was reached. It can't tell which one: `fits` asserts the startup phase
 //! too, so deleting only the phase check at the top of `alloc`, `resize` or `remap` still
@@ -81,7 +85,6 @@ fn onPanic(message: []const u8, first_trace_address: ?usize) noreturn {
         std.debug.print("startup_trip: {s} reached the child allocator before tripping\n", .{case.name});
         std.process.exit(exit_child_reached);
     }
-    std.debug.print("startup_trip: {s} tripped\n", .{case.name});
     std.process.exit(trip.exit_tripped);
 }
 
@@ -178,7 +181,6 @@ pub fn main() void {
         });
         std.process.exit(exit_control_failed);
     }
-    std.debug.print("startup_trip: {s} finished\n", .{case.name});
     std.process.exit(trip.exit_finished);
 }
 
