@@ -13,19 +13,19 @@ has the full release plan.
 ## Building and testing
 
 You need exactly Zig 0.17.0, the latest stable release, which CI pins. Other versions aren't
-supported. From the repository root, these are the checks CI runs:
+supported. From the repository root:
 
 ```sh
 zig fmt --check build.zig src fuzz sim   # formatting
-zig build --release=safe                 # ReleaseSafe build, zero warnings
 zig build test                           # unit tests in Debug
 zig build test --release=safe            # unit tests in ReleaseSafe
 zig build fuzz --release=safe -Dseed=1   # seeded fuzzer
 zig build sim --release=safe -Dseed=1    # seeded deterministic simulation
 ```
 
-A fuzz or simulation failure prints its seed, and the same `-Dseed` replays it.
-[CONTRIBUTING.md](CONTRIBUTING.md#running-the-checks) has more.
+The last three compile every target in ReleaseSafe. A fuzz or simulation failure prints its
+seed, and the same `-Dseed` replays it. [CONTRIBUTING.md](CONTRIBUTING.md#running-the-checks)
+lists every check CI runs.
 
 ## Documentation
 
