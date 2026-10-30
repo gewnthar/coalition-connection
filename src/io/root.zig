@@ -200,6 +200,195 @@ test "io: a stand-in with a wrong signature is refused" {
     try testing.expect(comptime contractError(struct {}) != null);
 }
 
+/// The contract's methods, so a test can name which one a stand-in gets wrong.
+const Method = enum { now, submit, poll, random_bytes };
+
+/// Stand-in that meets the contract, except that the method named by `wrong`, when there is
+/// one, has a signature that differs from the contract's in one small way. Each `pub const`
+/// below picks one of two functions at compile time, so every stand-in has all four methods
+/// and only the signature check can tell them apart.
+fn StandIn(comptime wrong: ?Method) type {
+    return struct {
+        const Self = @This();
+        const Right = StandInMethods(Self);
+
+        pub const now = if (wrong == .now) nowMutable else Right.now;
+        pub const submit = if (wrong == .submit) submitAnyError else Right.submit;
+        pub const poll = if (wrong == .poll) pollConst else Right.poll;
+        pub const randomBytes = if (wrong == .random_bytes) randomBytesCount else Right.randomBytes;
+
+        /// Takes `*Self` where the contract takes `*const Self`.
+        fn nowMutable(self: *Self) Instant {
+            _ = self;
+            return 0;
+        }
+        /// Widens the error set to `anyerror`, so callers could no longer switch on it.
+        fn submitAnyError(self: *Self, submission: Submission) anyerror!void {
+            _ = self;
+            _ = submission;
+        }
+        /// Takes `[]const Completion`, a buffer it could never fill.
+        fn pollConst(self: *Self, completions: []const Completion) u32 {
+            _ = self;
+            _ = completions;
+            return 0;
+        }
+        /// Returns a count the contract doesn't have.
+        fn randomBytesCount(self: *Self, buffer: []u8) RandomError!u32 {
+            _ = self;
+            @memset(buffer, 0);
+            return @intCast(buffer.len);
+        }
+    };
+}
+
+/// The name each method has in the contract.
+fn methodName(comptime method: Method) []const u8 {
+    const name = switch (method) {
+        .now => "now",
+        .submit => "submit",
+        .poll => "poll",
+        .random_bytes => "randomBytes",
+    };
+    assert(name.len > 0);
+    return name;
+}
+
+/// The signature the contract asks of `IO` for `method`, written out again here rather than
+/// read from `contractError`, so a change to the contract's table shows up as a failing test.
+fn Signature(comptime IO: type, comptime method: Method) type {
+    return switch (method) {
+        .now => fn (*const IO) Instant,
+        .submit => fn (*IO, Submission) SubmitError!void,
+        .poll => fn (*IO, []Completion) u32,
+        .random_bytes => fn (*IO, []u8) RandomError!void,
+    };
+}
+
+fn messageWrong(comptime IO: type, comptime method: Method) []const u8 {
+    return "I/O contract: " ++ @typeName(IO) ++ "." ++ comptime methodName(method) ++
+        " should be " ++ @typeName(Signature(IO, method));
+}
+
+fn messageMissing(comptime IO: type, comptime method: Method) []const u8 {
+    return "I/O contract: " ++ @typeName(IO) ++ " has no pub method " ++
+        comptime methodName(method);
+}
+
+/// Stand-ins that keep one method private. In Zig 0.17 `@hasDecl` sees only `pub`
+/// declarations, so a private method counts as missing, as it would at a call site in
+/// another file.
+const PrivateNow = struct {
+    fn now(self: *const PrivateNow) Instant {
+        _ = self;
+        return 0;
+    }
+    pub const submit = StandInMethods(PrivateNow).submit;
+    pub const poll = StandInMethods(PrivateNow).poll;
+    pub const randomBytes = StandInMethods(PrivateNow).randomBytes;
+};
+
+const PrivateSubmit = struct {
+    pub const now = StandInMethods(PrivateSubmit).now;
+    fn submit(self: *PrivateSubmit, submission: Submission) SubmitError!void {
+        _ = self;
+        _ = submission;
+    }
+    pub const poll = StandInMethods(PrivateSubmit).poll;
+    pub const randomBytes = StandInMethods(PrivateSubmit).randomBytes;
+};
+
+const PrivatePoll = struct {
+    pub const now = StandInMethods(PrivatePoll).now;
+    pub const submit = StandInMethods(PrivatePoll).submit;
+    fn poll(self: *PrivatePoll, completions: []Completion) u32 {
+        _ = self;
+        _ = completions;
+        return 0;
+    }
+    pub const randomBytes = StandInMethods(PrivatePoll).randomBytes;
+};
+
+const PrivateRandom = struct {
+    pub const now = StandInMethods(PrivateRandom).now;
+    pub const submit = StandInMethods(PrivateRandom).submit;
+    pub const poll = StandInMethods(PrivateRandom).poll;
+    fn randomBytes(self: *PrivateRandom, buffer: []u8) RandomError!void {
+        _ = self;
+        @memset(buffer, 0);
+    }
+};
+
+/// Correct method bodies for any stand-in type `Self`, so the private stand-ins above only
+/// spell out the one method they hide.
+fn StandInMethods(comptime Self: type) type {
+    return struct {
+        pub fn now(self: *const Self) Instant {
+            _ = self;
+            return 0;
+        }
+        pub fn submit(self: *Self, submission: Submission) SubmitError!void {
+            _ = self;
+            _ = submission;
+        }
+        pub fn poll(self: *Self, completions: []Completion) u32 {
+            _ = self;
+            _ = completions;
+            return 0;
+        }
+        pub fn randomBytes(self: *Self, buffer: []u8) RandomError!void {
+            _ = self;
+            @memset(buffer, 0);
+        }
+    };
+}
+
+test "io: a stand-in that meets the contract passes" {
+    // The control for the tests below: without it, a contractError that refused every
+    // type would pass them all.
+    assertContract(StandIn(null));
+    try testing.expect(comptime contractError(StandIn(null)) == null);
+}
+
+test "io: each method's signature is checked" {
+    inline for (comptime std.enums.values(Method)) |method| {
+        const message = comptime contractError(StandIn(method));
+        try testing.expect(message != null);
+        try testing.expectEqualStrings(messageWrong(StandIn(method), method), message.?);
+    }
+}
+
+test "io: a private method counts as missing, for each method" {
+    const cases = .{
+        .{ PrivateNow, Method.now },
+        .{ PrivateSubmit, Method.submit },
+        .{ PrivatePoll, Method.poll },
+        .{ PrivateRandom, Method.random_bytes },
+    };
+    inline for (cases) |case| {
+        const message = comptime contractError(case[0]);
+        try testing.expect(message != null);
+        try testing.expectEqualStrings(messageMissing(case[0], case[1]), message.?);
+    }
+}
+
+test "io: a type with several problems is blamed for the first, in contract order" {
+    // `struct {}` lacks all four methods; MissingRandom lacks only the last.
+    const Empty = struct {};
+    try testing.expectEqualStrings(
+        messageMissing(Empty, .now),
+        comptime contractError(Empty).?,
+    );
+    try testing.expectEqualStrings(
+        messageMissing(MissingRandom, .random_bytes),
+        comptime contractError(MissingRandom).?,
+    );
+    try testing.expectEqualStrings(
+        messageWrong(WrongPoll, .poll),
+        comptime contractError(WrongPoll).?,
+    );
+}
+
 test {
     _ = sim;
 }
