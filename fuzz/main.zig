@@ -5,7 +5,8 @@
 //!   http_request   valid requests from a generator, sometimes mutated or truncated, checked
 //!                  against what the generator wrote; plus cases at each size and field-count
 //!                  limit with the exact error expected, and a check that the run reached
-//!                  every one of those limits.
+//!                  every one of those limits. Every input is also fed again in reads of
+//!                  random sizes, split at random points, and must get the same answer.
 //! Each component adds its own target as it lands (parsers first). A failing seed replays
 //! exactly.
 
@@ -381,12 +382,103 @@ fn httpGenerateBody(random: std.Random, buffer: *[http_buffer_size]u8) HttpCase 
     return case;
 }
 
-/// Parses a limit case, unmutated and whole, and checks the exact answer.
-fn httpCheckCase(case: HttpCase, buffer: *const [http_buffer_size]u8, counts: *HttpCounts) FuzzError!void {
+/// Parses `input` as if it arrived in one read.
+fn httpParseWhole(input: []const u8) http.Error!http.Request {
+    assert(input.len <= http_buffer_size);
+    var scan: http.HeadScan = .{};
+    const result = http.parse(input, &scan);
+    assert(scan.resume_at <= input.len);
+    return result;
+}
+
+/// Feeds `input` through one `HeadScan` in reads of random sizes, as a client's bytes
+/// arrive, and checks the answer matches `whole`, the answer for one read. Small reads of 1
+/// to 4 bytes make a CRLF CRLF straddle two reads; large ones cover the rest quickly.
+fn httpCheckSplit(random: std.Random, input: []const u8, whole: http.Error!http.Request) FuzzError!void {
+    assert(input.len <= http_buffer_size);
+    const input_len: u32 = @intCast(input.len);
+    var scan: http.HeadScan = .{};
+    var result: http.Error!http.Request = error.Incomplete;
+    var len: u32 = 0;
+    var reads: u32 = 0;
+    // Each read adds at least one byte, so input_len + 1 parses (the first of an empty
+    // buffer) always reach the end.
+    while (reads <= input_len) : (reads += 1) {
+        result = http.parse(input[0..len], &scan);
+        if (result) |_| break else |err| if (err != error.Incomplete) break;
+        // An incomplete read leaves the scan three bytes short of the end.
+        if (scan.resume_at != len -| 3) return error.Mismatch;
+        if (len == input_len) break;
+        const remaining = input_len - len;
+        const small = random.boolean();
+        const limit = if (small) @min(remaining, 4) else remaining;
+        len += 1 + random.uintLessThan(u32, limit);
+    }
+    assert(reads <= input_len);
+    assert(len <= input_len);
+    // Any final answer resets the scan for the next request.
+    const final = if (result) |_| true else |err| err != error.Incomplete;
+    if (final and scan.resume_at != 0) return error.Mismatch;
+    // A head found early decides the answer, so stopping there must agree with one read.
+    try httpSameResult(whole, result);
+    const request = whole catch return;
+    try httpCheckSplitAtEnd(input, request.head_len, whole);
+}
+
+/// Two reads, the first ending one, two or three bytes before the end of the head, so the
+/// CRLF CRLF straddles them at each place it can.
+fn httpCheckSplitAtEnd(input: []const u8, head_len: u32, whole: http.Error!http.Request) FuzzError!void {
+    assert(head_len >= 4);
+    assert(head_len <= input.len);
+    var back: u32 = 1;
+    while (back <= 3) : (back += 1) {
+        var scan: http.HeadScan = .{};
+        const first = http.parse(input[0 .. head_len - back], &scan);
+        if (first) |_| return error.Mismatch else |err| if (err != error.Incomplete) return error.Mismatch;
+        try httpSameResult(whole, http.parse(input, &scan));
+        if (scan.resume_at != 0) return error.Mismatch;
+    }
+}
+
+/// Mismatch unless `a` and `b` are the same error, or requests with the same fields
+/// pointing at the same bytes.
+fn httpSameResult(a: http.Error!http.Request, b: http.Error!http.Request) FuzzError!void {
+    const left = a catch |err_a| {
+        const err_b = if (b) |_| return error.Mismatch else |err| err;
+        if (err_a != err_b) return error.Mismatch;
+        return;
+    };
+    const right = b catch return error.Mismatch;
+    assert(left.header_count <= headers_max);
+    assert(right.header_count <= headers_max);
+    if (left.method != right.method or left.version != right.version) return error.Mismatch;
+    if (left.target.ptr != right.target.ptr or left.target.len != right.target.len) return error.Mismatch;
+    if (left.head_len != right.head_len) return error.Mismatch;
+    if (left.content_length != right.content_length) return error.Mismatch;
+    if (left.header_count != right.header_count) return error.Mismatch;
+    for (left.headers[0..left.header_count], right.headers[0..right.header_count]) |x, y| {
+        if (x.name.ptr != y.name.ptr or x.name.len != y.name.len) return error.Mismatch;
+        if (x.value.ptr != y.value.ptr or x.value.len != y.value.len) return error.Mismatch;
+    }
+}
+
+/// Parses a limit case, unmutated and whole, and checks the exact answer, then checks the
+/// same bytes split into random reads get it too.
+fn httpCheckCase(
+    random: std.Random,
+    case: HttpCase,
+    buffer: *const [http_buffer_size]u8,
+    counts: *HttpCounts,
+) FuzzError!void {
     assert(case.model.len > 0);
     assert(case.model.len <= http_buffer_size);
     const input = buffer[0..case.model.len];
-    const request = http.parse(input) catch |err| {
+    const whole = httpParseWhole(input);
+    httpCheckSplit(random, input, whole) catch |err| {
+        std.debug.print("fuzz http_request: {s} case split into reads got another answer\n", .{@tagName(case.limit)});
+        return err;
+    };
+    const request = whole catch |err| {
         const expected = case.expected orelse {
             std.debug.print("fuzz http_request: {s} case rejected with {s}\n", .{ @tagName(case.limit), @errorName(err) });
             return error.Mismatch;
@@ -445,10 +537,10 @@ fn httpStep(random: std.Random, buffer: *[http_buffer_size]u8, counts: *HttpCoun
     // One step in 16 each writes a field-count case, a long head, a head that never ends
     // or a long body.
     switch (random.uintLessThan(u32, 16)) {
-        0 => return httpCheckCase(httpGenerateFields(random, buffer), buffer, counts),
-        1 => return httpCheckCase(httpGenerateLong(random, buffer), buffer, counts),
-        2 => return httpCheckCase(httpGenerateOverflow(random, buffer), buffer, counts),
-        3 => return httpCheckCase(httpGenerateBody(random, buffer), buffer, counts),
+        0 => return httpCheckCase(random, httpGenerateFields(random, buffer), buffer, counts),
+        1 => return httpCheckCase(random, httpGenerateLong(random, buffer), buffer, counts),
+        2 => return httpCheckCase(random, httpGenerateOverflow(random, buffer), buffer, counts),
+        3 => return httpCheckCase(random, httpGenerateBody(random, buffer), buffer, counts),
         else => {},
     }
     const model = httpGenerate(random, buffer);
@@ -463,7 +555,12 @@ fn httpStep(random: std.Random, buffer: *[http_buffer_size]u8, counts: *HttpCoun
     assert(len <= model.len);
     const input = buffer[0..len];
 
-    const request = http.parse(input) catch |err| {
+    const whole = httpParseWhole(input);
+    httpCheckSplit(random, input, whole) catch |err| {
+        std.debug.print("fuzz http_request: input split into reads got another answer\n", .{});
+        return err;
+    };
+    const request = whole catch |err| {
         if (mutations > 0) return; // Bad input: any named error is a correct answer.
         // A cut-off valid request is always incomplete, because its only CRLF CRLF is at the end.
         if (truncated and err == error.Incomplete) return;
