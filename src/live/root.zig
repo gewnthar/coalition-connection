@@ -14,6 +14,7 @@
 //!
 //! Limits (src/constants.zig):
 //!   http_connections_max
+//!   http_connection_entry_size_max
 //!   http_request_size_max
 //!   http_headers_max
 //!   http_response_size_max
@@ -23,13 +24,15 @@
 //!   live_events_backlog_max
 //!   live_events_backlog_bytes_max
 //!
-//! Status: the HTTP/1.1 request parser (roadmap core 5) is in `http_request.zig`; the rest is a
+//! Status: the connection table (roadmap core 4) is in `connections.zig` and the HTTP/1.1
+//! request parser (roadmap core 5) in `http_request.zig`; the rest is a
 //! stub. See docs/roadmap.md (core milestone, live-update slices).
 
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("../constants.zig");
 
+pub const connections = @import("connections.zig");
 pub const http_request = @import("http_request.zig");
 
 comptime {
@@ -50,5 +53,6 @@ test "live: stub compiles and its limits are set" {
 }
 
 test {
+    _ = connections;
     _ = http_request;
 }
