@@ -67,6 +67,12 @@ pub const esi_retries_max: u32 = 3;
 /// the connection table sized at startup. Provisional.
 pub const http_connections_max: u32 = 4_096;
 
+/// Bytes of connection-table state per connection: its entry (socket and state) plus its
+/// slot on the free-id stack. Reason: the table is sized once at startup and counted in the
+/// memory table; `src/live/connections.zig` checks at compile time that its entry fits, so
+/// growing the entry means raising this number in review.
+pub const http_connection_entry_size_max: u32 = 16;
+
 /// Largest HTTP request head plus body. Reason: forms are small; anything larger is
 /// rejected before parsing.
 pub const http_request_size_max: u32 = 16 * 1024;
@@ -182,11 +188,16 @@ pub const MemoryRow = struct {
 pub const memory_table_rows_max: u32 = 64;
 
 /// Every buffer sized from the limits above. The comptime block after the limits adds it up
-/// and fails the build when the total exceeds `memory_budget_bytes`. Small per-connection
-/// state and lookup tables are not rows yet: the slice that adds one (roadmap core 3,
-/// core 33 and core 38 among them) adds its row here in the same change. The table counts
-/// startup heap buffers only, not stacks or the program itself.
+/// and fails the build when the total exceeds `memory_budget_bytes`. Startup buffers not yet
+/// built are not rows yet: the slice that adds one (the response-buffer wait queue in roadmap
+/// core 3; lookup tables in core 33 and core 38) adds its row here in the same change. The
+/// table counts startup heap buffers only, not stacks or the program itself.
 pub const memory_table = [_]MemoryRow{
+    .{
+        .name = "Connection table entry and free-id slot, one per connection",
+        .count = http_connections_max,
+        .size = http_connection_entry_size_max,
+    },
     .{
         .name = "HTTP request buffer, one per connection",
         .count = http_connections_max,
@@ -297,6 +308,7 @@ comptime {
     assert(tick_ns > 0);
     assert(http_response_buffers_max > 0);
     assert(http_response_buffers_max <= http_connections_max);
+    assert(http_connection_entry_size_max > 0);
     // The backlog holds at least one event of the largest size.
     assert(live_events_backlog_bytes_max >= websocket_message_size_max);
     assert(memory_table.len <= memory_table_rows_max);
