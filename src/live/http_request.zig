@@ -4,10 +4,12 @@
 //! Never allocates and never copies: every slice in the returned `Request` points into the
 //! caller's buffer, so the buffer must outlive the `Request`.
 //!
-//! Inputs: the bytes received so far on one connection, at most `http_request_size_max`.
+//! Inputs: the bytes received so far on one connection, at most `http_request_size_max`, and
+//! that connection's `HeadScan`, which remembers how far the search for the end of the head
+//! got. A client that sends one byte at a time therefore costs linear work, not quadratic.
 //! Outputs: a `Request`, `error.Incomplete` when the head has not fully arrived yet (read
-//! more and parse again), or a named error for each kind of bad input so the caller can
-//! choose the response status.
+//! more and parse again with the same `HeadScan`), or a named error for each kind of bad
+//! input so the caller can choose the response status.
 //! Limits: `http_request_size_max` (head plus body) and `http_headers_max`.
 //!
 //! Strict by design. The server sits behind a proxy, and a lenient parser that disagrees
@@ -100,14 +102,39 @@ pub const Error = error{
     TransferEncodingUnsupported,
 };
 
-/// Parses one request head from `buffer`, which holds the bytes received so far.
-pub fn parse(buffer: []const u8) Error!Request {
+/// Where the search for the end of the head resumes. Keep one per connection, starting at
+/// `.{}`, and pass it to every `parse` of that connection's buffer. Only `error.Incomplete`
+/// leaves it partway through the buffer; every other answer resets it to `.{}`, so the next
+/// request starts over. Between calls that return `error.Incomplete` the buffer may only
+/// grow: the bytes already scanned must not change. Whoever empties, compacts or reuses the
+/// buffer for another connection without a final answer (a disconnect, say) sets the scan
+/// back to `.{}` too.
+pub const HeadScan = struct {
+    /// Every CRLF CRLF that starts before this index has been ruled out.
+    resume_at: u32 = 0,
+};
+
+/// Parses one request head from `buffer`, which holds the bytes received so far, resuming
+/// the search for its end where `scan` left off. Call it after each read until it returns a
+/// `Request` or an error other than `error.Incomplete`, then not again for that request:
+/// the body is complete once the buffer holds `head_len + content_length` bytes. Calling it
+/// again would parse the whole head again on every read.
+pub fn parse(buffer: []const u8, scan: *HeadScan) Error!Request {
     assert(buffer.len <= size_max);
+    // The buffer only grows between calls, so the scan never resumes past its end.
+    assert(scan.resume_at <= buffer.len -| 3);
     const buffer_len: u32 = @intCast(buffer.len);
-    const head_len = findHeadEnd(buffer) orelse {
-        if (buffer_len == size_max) return error.RequestTooLarge;
+    const head_len = findHeadEnd(buffer, scan.resume_at) orelse {
+        if (buffer_len == size_max) {
+            // A full buffer with no end of head is a final answer, like any other error.
+            scan.* = .{};
+            return error.RequestTooLarge;
+        }
+        // Back off three bytes, so a CRLF CRLF split across reads is still found.
+        scan.resume_at = buffer_len -| 3;
         return error.Incomplete;
     };
+    scan.* = .{};
     assert(head_len >= 4);
     assert(head_len <= buffer_len);
     const head = buffer[0..head_len];
@@ -124,12 +151,14 @@ pub fn parse(buffer: []const u8) Error!Request {
     return request;
 }
 
-/// Index just past the first CRLF CRLF, or null if there is none yet.
-fn findHeadEnd(buffer: []const u8) ?u32 {
+/// Index just past the first CRLF CRLF that starts at or after `start`, or null if there is
+/// none yet. The caller has ruled out every CRLF CRLF that starts before `start`.
+fn findHeadEnd(buffer: []const u8, start: u32) ?u32 {
     assert(buffer.len <= size_max);
+    assert(start <= buffer.len -| 3);
     const len: u32 = @intCast(buffer.len);
     if (len < 4) return null;
-    var index: u32 = 0;
+    var index: u32 = start;
     while (index <= len - 4) : (index += 1) {
         const window = buffer[index..][0..4];
         if (window[0] == '\r' and window[1] == '\n' and window[2] == '\r' and window[3] == '\n') {
@@ -393,8 +422,72 @@ fn lowerAscii(byte: u8) u8 {
 
 const testing = std.testing;
 
+/// Test helper: parses `text` as if it arrived in one read. Only an incomplete head leaves
+/// the scan partway through, three bytes before the end; every other answer resets it.
+fn parseWhole(text: []const u8) !Request {
+    assert(text.len <= size_max);
+    var scan: HeadScan = .{};
+    const result = parse(text, &scan);
+    assert(scan.resume_at <= text.len);
+    const incomplete = if (result) |_| false else |err| err == error.Incomplete;
+    const expected: u32 = if (incomplete) @intCast(text.len -| 3) else 0;
+    try testing.expectEqual(expected, scan.resume_at);
+    const head_found = std.mem.find(u8, text, "\r\n\r\n") != null;
+    try testing.expect(head_found or std.meta.isError(result));
+    return result;
+}
+
+/// Test helper: fails unless `a` and `b` are the same error, or requests with the same
+/// fields pointing at the same bytes.
+fn expectSameResult(a: anyerror!Request, b: anyerror!Request) !void {
+    const left = a catch |err_a| {
+        try testing.expectError(err_a, b);
+        return;
+    };
+    const right = try b;
+    assert(left.header_count <= headers_max);
+    assert(right.header_count <= headers_max);
+    try testing.expectEqual(left.method, right.method);
+    try testing.expectEqual(left.version, right.version);
+    try testing.expectEqual(left.target.ptr, right.target.ptr);
+    try testing.expectEqual(left.target.len, right.target.len);
+    try testing.expectEqual(left.head_len, right.head_len);
+    try testing.expectEqual(left.content_length, right.content_length);
+    try testing.expectEqual(left.header_count, right.header_count);
+    for (left.headers[0..left.header_count], right.headers[0..right.header_count]) |x, y| {
+        try testing.expectEqual(x.name.ptr, y.name.ptr);
+        try testing.expectEqual(x.name.len, y.name.len);
+        try testing.expectEqual(x.value.ptr, y.value.ptr);
+        try testing.expectEqual(x.value.len, y.value.len);
+    }
+}
+
+/// Test helper: feeds `text` one byte at a time through one `HeadScan`, as a slow client
+/// would send it, and checks the answer matches parsing it in one read.
+fn expectSameWhenSplit(text: []const u8) !void {
+    assert(text.len <= size_max);
+    var scan: HeadScan = .{};
+    var len: u32 = 0;
+    var result: Error!Request = error.Incomplete;
+    // The empty buffer is one call too, so a client that sends nothing yet is covered.
+    while (len <= text.len) : (len += 1) {
+        result = parse(text[0..len], &scan);
+        if (result) |_| break else |err| if (err != error.Incomplete) break;
+        // Each incomplete read leaves the scan three bytes short of the end, never further back.
+        try testing.expectEqual(len -| 3, scan.resume_at);
+    }
+    // The loop stops at a final answer or after the read that held every byte.
+    assert(len <= text.len + 1);
+    // Any final answer resets the scan for the next request.
+    const final = if (result) |_| true else |err| err != error.Incomplete;
+    // An incomplete text ran the loop to its end, whose last read held every byte.
+    const expected: u32 = if (final) 0 else @intCast(text.len -| 3);
+    try testing.expectEqual(expected, scan.resume_at);
+    try expectSameResult(parseWhole(text), result);
+}
+
 test "http_request: a simple GET" {
-    const request = try parse("GET /index.html?tab=alts HTTP/1.1\r\nHost: example.test\r\n\r\n");
+    const request = try parseWhole("GET /index.html?tab=alts HTTP/1.1\r\nHost: example.test\r\n\r\n");
     try testing.expectEqual(Method.get, request.method);
     try testing.expectEqualStrings("/index.html?tab=alts", request.target);
     try testing.expectEqual(Version.http_1_1, request.version);
@@ -406,14 +499,14 @@ test "http_request: a simple GET" {
 
 test "http_request: head_len points at the body, and Content-Length is read" {
     const text = "POST /login HTTP/1.1\r\nHost: a\r\nContent-Length: 7\r\n\r\nname=ok";
-    const request = try parse(text);
+    const request = try parseWhole(text);
     try testing.expectEqual(Method.post, request.method);
     try testing.expectEqual(@as(u32, 7), request.content_length);
     try testing.expectEqualStrings("name=ok", text[request.head_len..]);
 }
 
 test "http_request: header lookup ignores case and values are trimmed" {
-    const request = try parse("GET / HTTP/1.1\r\nhOsT:  a  \r\nX-Empty:\r\nCookie:\tk=v\t\r\n\r\n");
+    const request = try parseWhole("GET / HTTP/1.1\r\nhOsT:  a  \r\nX-Empty:\r\nCookie:\tk=v\t\r\n\r\n");
     try testing.expectEqualStrings("a", request.header("Host").?);
     try testing.expectEqualStrings("", request.header("x-empty").?);
     try testing.expectEqualStrings("k=v", request.header("COOKIE").?);
@@ -431,7 +524,8 @@ test "http_request: every method and version" {
         .{ .text = "PATCH / HTTP/1.1\r\nHost: a\r\n\r\n", .method = .patch, .version = .http_1_1 },
     };
     for (cases) |case| {
-        const request = try parse(case.text);
+        try expectSameWhenSplit(case.text);
+        const request = try parseWhole(case.text);
         try testing.expectEqual(case.method, request.method);
         try testing.expectEqual(case.version, request.version);
         try testing.expectEqual(@as(u32, @intCast(case.text.len)), request.head_len);
@@ -450,7 +544,8 @@ test "http_request: incomplete heads ask for more bytes" {
         "GET / HTTP/1.1\nHost: a\n\n",
     };
     for (cases) |text| {
-        try testing.expectError(error.Incomplete, parse(text));
+        try testing.expectError(error.Incomplete, parseWhole(text));
+        try expectSameWhenSplit(text);
     }
 }
 
@@ -490,7 +585,11 @@ test "http_request: each bad input has its own error" {
         .{ .text = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", .err = error.TransferEncodingUnsupported },
     };
     for (cases) |case| {
-        testing.expectError(case.err, parse(case.text)) catch |err| {
+        expectSameWhenSplit(case.text) catch |err| {
+            std.debug.print("failing split case: {s}\n", .{case.text});
+            return err;
+        };
+        testing.expectError(case.err, parseWhole(case.text)) catch |err| {
             std.debug.print("failing case: {s}\n", .{case.text});
             return err;
         };
@@ -521,25 +620,93 @@ test "http_request: header count at and past http_headers_max" {
     var buffer: [size_max]u8 = undefined;
     var count: u32 = 0;
     while (count <= headers_max) : (count += 1) {
-        const request = try parse(buildHead(&buffer, count));
+        const request = try parseWhole(buildHead(&buffer, count));
         try testing.expectEqual(count, request.header_count);
     }
-    try testing.expectError(error.HeadersTooMany, parse(buildHead(&buffer, headers_max + 1)));
+    try testing.expectError(error.HeadersTooMany, parseWhole(buildHead(&buffer, headers_max + 1)));
 }
 
 test "http_request: size limits on the head and on head plus body" {
     const buffer: [size_max]u8 = @splat('a');
     // A full buffer with no end of head can never become a request.
-    try testing.expectError(error.RequestTooLarge, parse(&buffer));
-    try testing.expectError(error.Incomplete, parse(buffer[0 .. size_max - 1]));
+    try testing.expectError(error.RequestTooLarge, parseWhole(&buffer));
+    try testing.expectError(error.Incomplete, parseWhole(buffer[0 .. size_max - 1]));
 
     const head = "POST / HTTP/1.0\r\nContent-Length: ";
     var text: [64]u8 = undefined;
     @memcpy(text[0..head.len], head);
     const body_fits = size_max - (head.len + 5 + 4);
     const fits = try std.fmt.bufPrint(text[head.len..], "{d:0>5}\r\n\r\n", .{body_fits});
-    const fit_request = try parse(text[0 .. head.len + fits.len]);
+    const fit_request = try parseWhole(text[0 .. head.len + fits.len]);
     try testing.expectEqual(@as(u32, size_max), fit_request.head_len + fit_request.content_length);
     const over = try std.fmt.bufPrint(text[head.len..], "{d:0>5}\r\n\r\n", .{body_fits + 1});
-    try testing.expectError(error.RequestTooLarge, parse(text[0 .. head.len + over.len]));
+    try testing.expectError(error.RequestTooLarge, parseWhole(text[0 .. head.len + over.len]));
+}
+
+test "http_request: a head split across two reads at every point" {
+    const text = "POST /login HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nok";
+    const whole = try parseWhole(text);
+    var split: u32 = 0;
+    while (split <= text.len) : (split += 1) {
+        var scan: HeadScan = .{};
+        const first = parse(text[0..split], &scan);
+        if (split < whole.head_len) {
+            try testing.expectError(error.Incomplete, first);
+            try testing.expectEqual(split -| 3, scan.resume_at);
+        } else {
+            try expectSameResult(whole, first);
+        }
+        try expectSameResult(whole, parse(text, &scan));
+        try testing.expectEqual(@as(u32, 0), scan.resume_at);
+    }
+}
+
+test "http_request: the scan resets after a head, ready for the next request" {
+    var scan: HeadScan = .{};
+    const first = "GET /a HTTP/1.1\r\nHost: a\r\n\r\n";
+    try testing.expectError(error.Incomplete, parse(first[0 .. first.len - 1], &scan));
+    try testing.expect(scan.resume_at > 0);
+    _ = try parse(first, &scan);
+    try testing.expectEqual(@as(u32, 0), scan.resume_at);
+    // The next request starts at the front of the buffer again, with a short head.
+    const second = "GET /b HTTP/1.0\r\n\r\n";
+    const request = try parse(second, &scan);
+    try testing.expectEqualStrings("/b", request.target);
+}
+
+test "http_request: a full buffer fed in pieces is too large, as in one read" {
+    const buffer: [size_max]u8 = @splat('a');
+    const piece: u32 = 1000;
+    comptime assert(piece < size_max);
+    var scan: HeadScan = .{};
+    var len: u32 = piece;
+    while (len < size_max) : (len += piece) {
+        try testing.expectError(error.Incomplete, parse(buffer[0..len], &scan));
+        try testing.expectEqual(len - 3, scan.resume_at);
+    }
+    try testing.expectError(error.RequestTooLarge, parse(&buffer, &scan));
+    // A final answer, so the scan is reset for whatever reuses the buffer.
+    try testing.expectEqual(@as(u32, 0), scan.resume_at);
+}
+
+test "http_request: the end of the head is searched for from the resume point only" {
+    // A CRLF CRLF before `start` was ruled out by an earlier call, so it is not found again.
+    try testing.expectEqual(@as(?u32, 4), findHeadEnd("\r\n\r\nab", 0));
+    try testing.expectEqual(@as(?u32, null), findHeadEnd("\r\n\r\nab", 1));
+    try testing.expectEqual(@as(?u32, 10), findHeadEnd("a\r\n\r\nb\r\n\r\n", 2));
+    // At the boundary: a CRLF CRLF that starts at `start` is found; one before it is not.
+    try testing.expectEqual(@as(?u32, 5), findHeadEnd("x\r\n\r\n", 1));
+    try testing.expectEqual(@as(?u32, null), findHeadEnd("x\r\n\r\n", 2));
+}
+
+test "http_request: bytes after the head, fed one at a time, still stop at the first head" {
+    const pipelined = "GET / HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.0\r\n\r\n";
+    try expectSameWhenSplit(pipelined);
+    const request = try parseWhole(pipelined);
+    try testing.expectEqualStrings("/", request.target);
+    try testing.expectEqualStrings("GET /b HTTP/1.0\r\n\r\n", pipelined[request.head_len..]);
+
+    var buffer: [size_max]u8 = undefined;
+    try expectSameWhenSplit(buildHead(&buffer, headers_max));
+    try expectSameWhenSplit(buildHead(&buffer, headers_max + 1));
 }
