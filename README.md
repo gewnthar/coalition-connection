@@ -16,6 +16,7 @@ You need exactly Zig 0.17.0, the latest stable release, which CI pins. Other ver
 supported. From the repository root:
 
 ```sh
+zig build --release=safe                 # the server, in ReleaseSafe
 zig fmt --check build.zig src fuzz sim   # formatting
 zig build test                           # unit tests in Debug
 zig build test --release=safe            # unit tests in ReleaseSafe
@@ -23,9 +24,11 @@ zig build fuzz --release=safe -Dseed=1   # seeded fuzzer
 zig build sim --release=safe -Dseed=1    # seeded deterministic simulation
 ```
 
-The last three compile every target in ReleaseSafe. A fuzz or simulation failure prints its
-seed, and the same `-Dseed` replays it. [CONTRIBUTING.md](CONTRIBUTING.md#running-the-checks)
-lists every check CI runs.
+The first line installs the server as `zig-out/bin/coalition-connection`. For now it prints
+its version and exits; it serves nothing yet, and it builds only for Linux. The last three
+lines compile every target in ReleaseSafe. A fuzz or simulation failure prints its seed, and
+the same `-Dseed` replays it. [CONTRIBUTING.md](CONTRIBUTING.md#running-the-checks) lists
+every check CI runs.
 
 ## Documentation
 
