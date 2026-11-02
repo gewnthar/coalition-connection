@@ -170,6 +170,11 @@ pub const io_operations_in_flight_max: u32 = 256;
 /// key; token nonces are 24 bytes.
 pub const io_random_bytes_max: u32 = 64;
 
+/// getrandom calls one draw of random bytes may make. Reason: a draw of at most
+/// `io_random_bytes_max` bytes is normally whole in one call; a signal or a short read costs
+/// a retry, and the bound stops a signal storm from spinning the event loop.
+pub const io_random_attempts_max: u32 = 8;
+
 // ---- Memory --------------------------------------------------------------------------
 
 /// Total memory the process may take at startup. Reason: fits a small virtual server
@@ -314,6 +319,7 @@ comptime {
     assert(memory_table.len <= memory_table_rows_max);
     assert(io_operations_in_flight_max > 0);
     assert(io_random_bytes_max >= 32);
+    assert(io_random_attempts_max >= 2);
     // A simulated run must leave room to drain every delayed completion.
     assert(sim_completion_delay_ticks_max < sim_ticks_max);
 }

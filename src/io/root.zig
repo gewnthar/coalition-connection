@@ -39,14 +39,17 @@
 //! `constants.postgres_message_size_max` bytes; at most `constants.io_random_bytes_max`
 //! random bytes per call.
 //!
-//! Status: contract and simulator only. The io_uring implementation arrives with roadmap
-//! core 2 and core 3, and the contract grows (accept, receive, connect, timers) slice by
-//! slice.
+//! Status: the contract, the simulator, and the start of the real type (`real.zig`), which
+//! has the clock and random bytes but not yet `submit` and `poll`, so it doesn't meet the
+//! contract. The io_uring ring arrives next, and the contract grows (accept, receive,
+//! connect, timers) slice by slice.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 pub const sim = @import("sim.zig");
+pub const real = @import("real.zig");
 
 /// Nanoseconds on a monotonic clock. Never wall-clock time.
 pub const Instant = u64;
@@ -429,4 +432,6 @@ test "io: a type with several problems is blamed for the first, in contract orde
 
 test {
     _ = sim;
+    // The real type is Linux only; on another target its tests aren't analyzed at all.
+    if (builtin.target.os.tag == .linux) _ = real;
 }
