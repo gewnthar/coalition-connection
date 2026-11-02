@@ -378,3 +378,108 @@ test "constants: memoryTableFits refuses one byte over the budget" {
     };
     try std.testing.expect(!memoryTableFits(&overflow, std.math.maxInt(u64)));
 }
+
+/// Test helper: the real memory table with `extra` appended, the shape a slice that adds a
+/// startup buffer gives it.
+fn memoryTableWith(
+    comptime extra_len: u32,
+    extra: [extra_len]MemoryRow,
+) [memory_table.len + extra_len]MemoryRow {
+    if (memory_table.len + extra_len > memory_table_rows_max) {
+        @compileError("memoryTableWith: the table plus the extra rows exceeds memory_table_rows_max");
+    }
+    comptime assert(extra_len > 0);
+    for (extra) |row| {
+        assert(row.count > 0);
+        assert(row.size > 0);
+    }
+    var table: [memory_table.len + extra_len]MemoryRow = undefined;
+    @memcpy(table[0..memory_table.len], &memory_table);
+    @memcpy(table[memory_table.len..], &extra);
+    return table;
+}
+
+/// Test helper: the bytes left in `memory_budget_bytes` after the real memory table.
+fn memoryTableRoomLeft() error{Overflow}!u64 {
+    // The margin tests add up to a few KiB past the budget; this keeps those sums far from
+    // the top of u64.
+    comptime assert(memory_budget_bytes < std.math.maxInt(u64) / 2);
+    const total = try memoryTableBytes(&memory_table);
+    // Every row takes at least a byte, and the build refuses a table over the budget, so the
+    // subtraction can't underflow and the room is below the whole budget.
+    assert(total >= memory_table.len);
+    assert(total <= memory_budget_bytes);
+    const room = memory_budget_bytes - total;
+    assert(room < memory_budget_bytes);
+    return room;
+}
+
+test "constants: the real memory table plus a row of exactly the room left fits" {
+    const room = try memoryTableRoomLeft();
+    if (room == 0) {
+        // No row fits when the table already fills the budget; the bare table is the margin.
+        try std.testing.expect(memoryTableFits(&memory_table, memory_budget_bytes));
+        return;
+    }
+    const table = memoryTableWith(1, .{
+        .{ .name = "exactly the room left", .count = 1, .size = room },
+    });
+    try std.testing.expectEqual(memory_budget_bytes, try memoryTableBytes(&table));
+    try std.testing.expect(memoryTableFits(&table, memory_budget_bytes));
+}
+
+test "constants: the real memory table plus a row one byte over the room left does not fit" {
+    const room = try memoryTableRoomLeft();
+    const table = memoryTableWith(1, .{
+        .{ .name = "one byte more than the room left", .count = 1, .size = room + 1 },
+    });
+    try std.testing.expectEqual(memory_budget_bytes + 1, try memoryTableBytes(&table));
+    try std.testing.expect(!memoryTableFits(&table, memory_budget_bytes));
+}
+
+test "constants: the real memory table at its margin with a row of one buffer per connection" {
+    // A new row is usually count times size, so the margin is also checked through the
+    // multiply, with a per-connection row: the largest buffers that fit, then one byte more in
+    // each. The room left is 0.4 GiB today; the count drops to the room only when the room is
+    // smaller than one byte per connection.
+    const room = try memoryTableRoomLeft();
+    if (room == 0) return;
+    const count: u64 = @min(@as(u64, http_connections_max), room);
+    const size = room / count;
+    const remainder = room - count * size;
+    try std.testing.expect(remainder < count);
+    const largest = memoryTableWith(1, .{
+        .{ .name = "the largest buffer per connection that fits", .count = count, .size = size },
+    });
+    try std.testing.expectEqual(memory_budget_bytes - remainder, try memoryTableBytes(&largest));
+    try std.testing.expect(memoryTableFits(&largest, memory_budget_bytes));
+    // One byte more in each buffer adds `count` bytes, more than the remainder, so it is over.
+    const over = memoryTableWith(1, .{
+        .{ .name = "one byte more per connection", .count = count, .size = size + 1 },
+    });
+    try std.testing.expectEqual(
+        memory_budget_bytes - remainder + count,
+        try memoryTableBytes(&over),
+    );
+    try std.testing.expect(!memoryTableFits(&over, memory_budget_bytes));
+}
+
+test "constants: the real memory table counts every planned buffer" {
+    // Written out by hand from the limits, so a dropped or added row, or a row whose count or
+    // size names a limit of a different value, fails here. Limits that share a value (several
+    // are 1 MiB) can't be told apart by the total. A slice that adds a startup buffer adds its
+    // row to the table and its term to this sum in the same change.
+    const connections: u64 = http_connections_max;
+    const expected: u64 = connections * http_connection_entry_size_max +
+        connections * http_request_size_max +
+        @as(u64, http_response_buffers_max) * http_response_size_max +
+        @as(u64, websocket_connections_max) * websocket_message_size_max +
+        live_events_backlog_bytes_max +
+        @as(u64, esi_requests_in_flight_max) * esi_response_size_max +
+        @as(u64, postgres_connections_max) * postgres_message_size_max +
+        @as(u64, valkey_connections_max) * valkey_message_size_max +
+        import_record_size_max;
+    const rows: u32 = memory_table.len;
+    try std.testing.expectEqual(@as(u32, 9), rows);
+    try std.testing.expectEqual(expected, try memoryTableBytes(&memory_table));
+}
