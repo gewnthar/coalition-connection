@@ -1,0 +1,19 @@
+.{
+    .name = .coalition_connection,
+    .version = "0.1.0-dev",
+    .fingerprint = 0xca45a536f12598a0,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "fuzz",
+        "sim",
+        "LICENSE",
+        "README.md",
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        "docs",
+    },
+}
