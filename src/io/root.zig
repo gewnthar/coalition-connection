@@ -11,7 +11,8 @@
 //! arrive in any order, so components are written for the event loop from the start.
 //!
 //! Contract (every method is `pub`, so `@hasDecl` sees it; `assertContract` checks each type):
-//!   now(self: *const IO) Instant                        monotonic clock, nanoseconds
+//!   now(self: *IO) Instant                              monotonic clock, nanoseconds; each
+//!                                                       reading at or after the previous one
 //!   submit(self: *IO, Submission) SubmitError!void      queue one operation
 //!   poll(self: *IO, []Completion) u32                   take finished operations
 //!   randomBytes(self: *IO, []u8) RandomError!void       fill a buffer with random bytes
@@ -22,7 +23,8 @@
 //! ids in flight must be distinct. A submission refused with `error.QueueFull` never
 //! completes. `poll` takes a buffer of 1 to `constants.io_operations_in_flight_max`
 //! completions. A send may complete short, reporting fewer bytes than it was given; the
-//! caller sends the rest.
+//! caller sends the rest. A send's peer stays in the connection table, with its socket
+//! open, until the send's completion arrives.
 //!
 //! Placeholders: `execute` stands in for database traffic until roadmap core 11 frames
 //! Postgres over sockets, and the contract has no cancel yet; core 3 adds socket reads and
@@ -39,9 +41,11 @@
 //! `constants.postgres_message_size_max` bytes; at most `constants.io_random_bytes_max`
 //! random bytes per call.
 //!
-//! Status: the contract, the simulator, and the start of the real type (`real.zig`), which
-//! has the clock and random bytes but not yet `submit` and `poll`, so it doesn't meet the
-//! contract. The io_uring ring arrives next, and the contract grows (accept, receive,
+//! `now` takes `*IO`, not `*const IO`, so an I/O type can keep its last reading and check
+//! every new one against it.
+//!
+//! Status: the contract, the simulator, and the real type for Linux (`real.zig`), which
+//! meets the contract with an io_uring ring for sends. The contract grows (accept, receive,
 //! connect, timers) slice by slice.
 
 const std = @import("std");
@@ -118,7 +122,7 @@ pub fn contractError(comptime IO: type) ?[]const u8 {
     // The array's element type keeps each result optional; a chain of `orelse` evaluated at
     // compile time would hand back the bare payload type.
     const messages = [_]?[]const u8{
-        methodError(IO, "now", fn (*const IO) Instant),
+        methodError(IO, "now", fn (*IO) Instant),
         methodError(IO, "submit", fn (*IO, Submission) SubmitError!void),
         methodError(IO, "poll", fn (*IO, []Completion) u32),
         methodError(IO, "randomBytes", fn (*IO, []u8) RandomError!void),
@@ -155,7 +159,7 @@ test "io: the simulator meets the contract" {
 
 /// Stand-in with every method but `randomBytes`.
 const MissingRandom = struct {
-    pub fn now(self: *const MissingRandom) Instant {
+    pub fn now(self: *MissingRandom) Instant {
         _ = self;
         return 0;
     }
@@ -172,7 +176,7 @@ const MissingRandom = struct {
 
 /// Stand-in whose `poll` returns `usize` instead of `u32`.
 const WrongPoll = struct {
-    pub fn now(self: *const WrongPoll) Instant {
+    pub fn now(self: *WrongPoll) Instant {
         _ = self;
         return 0;
     }
@@ -224,7 +228,7 @@ fn methodName(comptime method: Method) []const u8 {
 /// read from `contractError`, so a change to the contract's table shows up as a failing test.
 fn Signature(comptime IO: type, comptime method: Method) type {
     const result = switch (method) {
-        .now => fn (*const IO) Instant,
+        .now => fn (*IO) Instant,
         .submit => fn (*IO, Submission) SubmitError!void,
         .poll => fn (*IO, []Completion) u32,
         .random_bytes => fn (*IO, []u8) RandomError!void,
@@ -260,7 +264,7 @@ fn StandInMethods(comptime Self: type) type {
     assert(@typeInfo(Self) == .@"struct");
     assert(@sizeOf(Self) == 0);
     return struct {
-        pub fn now(self: *const Self) Instant {
+        pub fn now(self: *Self) Instant {
             _ = self;
             return 0;
         }
@@ -298,9 +302,10 @@ const Correct = struct {
     pub const randomBytes = StandInMethods(Correct).randomBytes;
 };
 
-/// `now` takes `*Self` where the contract takes `*const Self`.
+/// `now` takes `*const Self` where the contract takes `*Self`, so it couldn't keep its last
+/// reading.
 const WrongNow = struct {
-    pub fn now(self: *WrongNow) Instant {
+    pub fn now(self: *const WrongNow) Instant {
         _ = self;
         return 0;
     }
@@ -350,7 +355,7 @@ test "io: a private method counts as missing, for each method" {
     // as it would be at a call site in another file.
     const PrivateNow = struct {
         const Self = @This();
-        fn now(self: *const Self) Instant {
+        fn now(self: *Self) Instant {
             _ = self;
             return 0;
         }
@@ -400,7 +405,7 @@ test "io: a type with several problems is blamed for the first, in contract orde
     // to the table's order swaps some adjacent pair, and so does checking every method for
     // presence before any signature, so one of these then blames the later method.
     const NowWrongRestMissing = struct {
-        pub fn now(self: *@This()) Instant {
+        pub fn now(self: *const @This()) Instant {
             _ = self;
             return 0;
         }

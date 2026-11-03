@@ -8,6 +8,10 @@
 //! Limits: no allocation after startup (the startup allocator enforces it); at most
 //! `write_attempts_max` write calls for the version line.
 //!
+//! The server's I/O type is `io.real.Real`, the io_uring ring, checked against the I/O
+//! contract at compile time. It isn't started yet: the listener and the event loop arrive
+//! with roadmap core 3.
+//!
 //! This root file must never declare `io_simulation`: the simulator (src/io/sim.zig)
 //! compiles into any program whose root declares it, and its seeded random bytes would make
 //! every token predictable. The comptime block below refuses such a build.
@@ -22,6 +26,11 @@ const cc = @import("coalition_connection");
 const build_options = @import("build_options");
 
 const version_line = "coalition-connection " ++ build_options.version ++ "\n";
+
+/// The I/O type every component in the server is built with: the real one. The comptime
+/// block below checks it meets the I/O contract. Once components take `IO` (roadmap core
+/// 3), this is the one place that picks it.
+pub const IO = cc.io.real.Real;
 
 /// Longest version line. Reason: a semantic version with a short pre-release tag fits in
 /// well under 64 bytes, and one bounded line keeps the write to a single call in practice.
@@ -42,6 +51,7 @@ comptime {
     if (builtin.target.os.tag != .linux) {
         @compileError("the server runs on Linux only (io_uring, CLOCK_MONOTONIC, getrandom)");
     }
+    cc.io.assertContract(IO);
     assert(version_line.len > "coalition-connection \n".len);
     assert(version_line.len <= version_line_max);
 }

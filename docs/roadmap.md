@@ -58,7 +58,7 @@ Releases 0.1 to 0.6; the release plan above says which slices go in each.
 | # | Slice | Tests |
 | --- | --- | --- |
 | core 1 | **Decided (2026-10-22):** the event loop is a hand-written io_uring loop of our own, not Zig's `std.Io`, so the core doesn't depend on the standard library's I/O interface while it keeps changing | - |
-| core 2 | Real I/O implementation: monotonic clock | unit; contract check |
+| core 2 | Real I/O implementation: monotonic clock, random bytes, and an io_uring ring that submits and polls sends | unit; contract check |
 | core 3 | Real I/O: TCP accept, read and write with fixed buffers; the response-buffer wait queue adds its row to the memory table in `src/constants.zig` | unit; simulation |
 | core 4 | Connection table sized from `http_connections_max`, with its row in the memory table | unit; seeded random accepts and closes against a model, up to a full table |
 | core 5 | HTTP/1.1 request parser, bounded by `http_request_size_max` | unit; fuzz |

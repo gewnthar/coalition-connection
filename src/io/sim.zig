@@ -110,7 +110,7 @@ pub const Sim = struct {
         assert(self.now_ns == @as(u64, self.ticks) * constants.tick_ns);
     }
 
-    pub fn now(self: *const Sim) io.Instant {
+    pub fn now(self: *Sim) io.Instant {
         assert(self.ticks <= constants.sim_ticks_max);
         assert(self.now_ns == @as(u64, self.ticks) * constants.tick_ns);
         return self.now_ns;
