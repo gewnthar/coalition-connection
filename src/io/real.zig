@@ -1,15 +1,28 @@
-//! The real I/O type, for Linux: the monotonic clock and the kernel's random source.
+//! The real I/O type, for Linux: an io_uring ring, the monotonic clock and the kernel's
+//! random source.
 //!
-//! Job: give production code a clock and random bytes from the operating system, with the
-//! same method signatures the I/O contract (`root.zig`) asks for. It does not meet the whole
-//! contract yet: `submit` and `poll` arrive with the io_uring ring, and until then
-//! `assertContract` refuses this type (a test below checks that), so no component can take
-//! it as its `IO`.
+//! Job: give production code the I/O contract (`root.zig`) on the real system. `submit`
+//! queues an operation on the ring without a system call; `poll` hands every queued
+//! operation to the kernel in one `io_uring_enter` and copies out the finished ones, so a
+//! burst of sends costs one system call, not one each. Neither ever waits.
+//!
+//! Ring: `constants.io_operations_in_flight_max` submission entries, set up once in `init`
+//! and never resized. The kernel makes the completion queue twice that size, so it can't
+//! overflow while at most that many operations are in flight. Each operation in flight
+//! holds one slot of a fixed table; the slot's index is the ring's `user_data`, so a
+//! completion finds its operation without a search. A submission with no free slot returns
+//! `error.QueueFull` and changes nothing.
+//!
+//! Sends: `IORING_OP_SEND` on the peer's socket from the connection table, with
+//! `MSG_NOSIGNAL`, so a peer that has gone away fails the send with `EPIPE` instead of
+//! ending the process with `SIGPIPE`. Every errno maps to `PeerDown`, `Backpressure` or a
+//! stop with its reason (`sendError`).
+//!
+//! `execute` is a simulator placeholder until Postgres is framed over sockets (roadmap
+//! core 11); submitting one here stops the process with that reason.
 //!
 //! Clock: `CLOCK_MONOTONIC`, read as u64 nanoseconds. The kernel promises it never goes
-//! backwards. `now` asserts that each reading is at or after the reading taken in `init`;
-//! the contract's `now` takes `*const`, so it has nowhere to keep the previous reading, and
-//! checking each reading against the last one needs a contract change.
+//! backwards, and `now` asserts it: each reading is at or after the previous one.
 //!
 //! Random bytes: `getrandom(2)` with no flags, so it blocks only until the kernel's pool is
 //! first seeded at boot and never returns weaker bytes. An interrupted or short read is
@@ -18,9 +31,11 @@
 //! buffer, so a partly filled buffer can't be mistaken for a random one. There is no
 //! fallback source.
 //!
-//! Inputs: buffers to fill. Outputs: time readings and random bytes.
-//! Limits: 1 to `constants.io_random_bytes_max` random bytes per call; at most
-//! `constants.io_random_attempts_max` getrandom calls per `randomBytes`.
+//! Inputs: the connection table, submissions, buffers to fill.
+//! Outputs: completions, time readings and random bytes.
+//! Limits: `constants.io_operations_in_flight_max` operations in flight; sends of at most
+//! `constants.http_response_size_max` bytes; 1 to `constants.io_random_bytes_max` random
+//! bytes per call, with at most `constants.io_random_attempts_max` getrandom calls.
 //!
 //! Linux only: each method refuses to compile for another operating system.
 
@@ -29,6 +44,8 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const constants = @import("../constants.zig");
+const connections = @import("../live/connections.zig");
+const StartupAllocator = @import("../startup_allocator.zig").StartupAllocator;
 const io = @import("root.zig");
 
 const ns_per_s: u64 = std.time.ns_per_s;
@@ -37,37 +54,195 @@ const ns_per_s: u64 = std.time.ns_per_s;
 /// seconds * ns_per_s + (ns_per_s - 1) <= maxInt(u64). About 584 years of uptime.
 const clock_seconds_max: u64 = (std.math.maxInt(u64) - (ns_per_s - 1)) / ns_per_s;
 
+/// Operations in flight, and the ring's submission queue depth.
+const slots_count: u32 = constants.io_operations_in_flight_max;
+
+/// One operation in flight: what its completion needs to be checked and handed back.
+const Slot = struct {
+    id: io.OperationId,
+    /// Bytes the send was given; the kernel never reports more.
+    length: u32,
+    in_use: bool,
+};
+
+/// Largest page the target may use; the kernel maps the ring in whole pages.
+const page_bytes_max: u64 = std.heap.page_size_max;
+
+/// Bytes the kernel's ring header (heads, tails, masks, flags) may take before the
+/// completion entries. Reason: under 128 bytes on current kernels; a page leaves room for
+/// fields a later kernel adds.
+const ring_header_bytes_max: u64 = 4096;
+
+/// What the ring and this type may take, worst case: the ring mapping (header, completion
+/// entries at twice the queue depth, the submission index) and the submission entries, each
+/// rounded up to whole pages, plus `Real` itself with its slot table.
+pub const ring_bytes_estimate: u64 =
+    std.mem.alignForward(u64, ring_header_bytes_max +
+        2 * slots_count * @sizeOf(linux.io_uring_cqe) + slots_count * @sizeOf(u32), page_bytes_max) +
+    std.mem.alignForward(u64, slots_count * @sizeOf(linux.io_uring_sqe), page_bytes_max) +
+    @sizeOf(Real);
+
 comptime {
     // Recomputed for the guard in `nanoseconds`: the largest reading fits, one more second
     // would not.
     assert(clock_seconds_max * ns_per_s + (ns_per_s - 1) <= std.math.maxInt(u64));
     assert(@as(u128, clock_seconds_max + 1) * ns_per_s + (ns_per_s - 1) > std.math.maxInt(u64));
+    // io_uring_setup takes a power of two of at most 32,768 entries, as a u16.
+    assert(std.math.isPowerOfTwo(slots_count));
+    assert(slots_count <= 32_768 and slots_count <= std.math.maxInt(u16));
+    // The memory table's row covers the worst case; `ringInit` checks the kernel's actual
+    // mapping against the same row at startup.
+    assert(ring_bytes_estimate <= constants.io_ring_size_max);
 }
+
+/// Setting up the ring failed. `RingUnavailable`: the kernel has no io_uring, or it is
+/// switched off (the `kernel.io_uring_disabled` sysctl, or a seccomp filter in a
+/// container). `RingResources`: out of file descriptors, locked memory or kernel memory.
+/// `RingTooLarge`: the kernel mapped more than the memory table allows
+/// (`constants.io_ring_size_max`).
+pub const InitError = error{ RingUnavailable, RingResources, RingTooLarge };
 
 pub const Real = struct {
     /// The clock reading taken at startup. Every later reading is at or after it.
     epoch: io.Instant,
+    /// The latest clock reading; the next is at or after it.
+    last: io.Instant,
     /// Random bytes handed out so far, for tests and metrics.
     random_bytes: u64,
+    ring: linux.IoUring,
+    /// Maps a send's `PeerId` to its socket. Owned by the caller; outlives this.
+    table: *const connections.Table,
+    slots: [slots_count]Slot,
+    /// Free slot indices, a stack: `free_slots[0..free_count]` are not in use.
+    free_slots: [slots_count]u32,
+    free_count: u32,
+    submitted: u64,
+    completed: u64,
+    /// Times the kernel refused submissions for a moment (short of memory, or a signal);
+    /// they stay queued and go in at the next `submit` or `poll`. For metrics.
+    enters_deferred: u64,
 
-    pub fn init() Real {
+    /// Sets up the ring. `startup` proves the call happens during startup; nothing is
+    /// mapped or allocated afterwards.
+    pub fn init(startup: *const StartupAllocator, table: *const connections.Table) InitError!Real {
         comptime assertLinux();
-        const result: Real = .{ .epoch = monotonicNow(), .random_bytes = 0 };
+        assert(startup.allocationAllowed());
+        assert(table.capacity() > 0);
+        const ring = try ringInit();
+        var result: Real = .{
+            .epoch = monotonicNow(),
+            .last = 0,
+            .random_bytes = 0,
+            .ring = ring,
+            .table = table,
+            .slots = @splat(.{ .id = 0, .length = 0, .in_use = false }),
+            .free_slots = undefined,
+            .free_count = slots_count,
+            .submitted = 0,
+            .completed = 0,
+            .enters_deferred = 0,
+        };
+        // Push the indices in reverse, so the first submission takes slot 0.
+        var position: u32 = 0;
+        while (position < slots_count) : (position += 1) {
+            assert(position < result.free_slots.len);
+            result.free_slots[position] = slots_count - 1 - position;
+        }
+        assert(position == slots_count);
+        result.last = result.epoch;
         // The monotonic clock counts from boot, so a running process never reads zero.
         assert(result.epoch > 0);
-        assert(result.epoch <= monotonicNow());
+        assert(result.ring.sq.sqes.len == slots_count);
         return result;
     }
 
-    /// Nanoseconds on `CLOCK_MONOTONIC`.
-    pub fn now(self: *const Real) io.Instant {
+    /// Closes the ring. Call it during shutdown only, once every operation has completed:
+    /// the kernel tears a ring down in the background, so a send still in flight could
+    /// read its bytes after this returns.
+    pub fn deinit(self: *Real) void {
+        comptime assertLinux();
+        assert(self.ring.fd >= 0);
+        assert(self.inFlight() == 0);
+        assert(self.completed == self.submitted);
+        self.ring.deinit();
+        self.* = undefined;
+    }
+
+    /// Operations submitted and not yet handed back by `poll`.
+    pub fn inFlight(self: *const Real) u32 {
+        assert(self.free_count <= slots_count);
+        const result = slots_count - self.free_count;
+        assert(result <= slots_count);
+        return result;
+    }
+
+    /// Nanoseconds on `CLOCK_MONOTONIC`, never before the previous reading.
+    pub fn now(self: *Real) io.Instant {
         comptime assertLinux();
         assert(self.epoch > 0);
+        assert(self.last >= self.epoch);
         const reading = monotonicNow();
-        // CLOCK_MONOTONIC never goes backwards; a reading before startup means the clock
-        // or this type is broken, and no timeout computed from it can be trusted.
-        assert(reading >= self.epoch);
+        // CLOCK_MONOTONIC never goes backwards; a reading before the last one means the
+        // clock or this type is broken, and no timeout computed from it can be trusted.
+        assert(reading >= self.last);
+        self.last = reading;
         return reading;
+    }
+
+    /// Puts one operation on the ring and hands it to the kernel at once, so the kernel
+    /// takes hold of the peer's socket now, not at some later poll: a connection closed and
+    /// its descriptor number reused before then could otherwise receive another peer's
+    /// bytes. With every slot in use, returns `error.QueueFull` and changes nothing.
+    pub fn submit(self: *Real, submission: io.Submission) io.SubmitError!void {
+        comptime assertLinux();
+        const send = switch (submission.operation) {
+            .send => |send| send,
+            .execute => std.debug.panic("io.real: execute is a simulator placeholder; " ++
+                "the real type has no database traffic until Postgres is framed over sockets", .{}),
+        };
+        assert(send.bytes.len > 0);
+        assert(send.bytes.len <= constants.http_response_size_max);
+        const in_flight_before = self.inFlight();
+        if (self.free_count == 0) return error.QueueFull;
+
+        // Looked up before anything changes: a peer not in the table is a caller's bug.
+        const socket = self.table.get(send.peer).socket;
+        // Each queued entry belongs to an operation in flight, and fewer than slots_count
+        // are in flight, so the submission queue has room.
+        assert(self.ring.sq_ready() < slots_count);
+        const sqe = self.ring.get_sqe() catch unreachable;
+        const index = self.free_slots[self.free_count - 1];
+        assert(!self.slots[index].in_use);
+        sqe.prep_send(socket, send.bytes, linux.MSG.NOSIGNAL);
+        sqe.user_data = index;
+        self.free_count -= 1;
+        self.slots[index] = .{ .id = submission.id, .length = @intCast(send.bytes.len), .in_use = true };
+        self.submitted += 1;
+        if (!enter(&self.ring)) self.enters_deferred += 1;
+        assert(self.inFlight() == in_flight_before + 1);
+        assert(self.completed + self.inFlight() == self.submitted);
+    }
+
+    /// Hands over any operation the kernel refused for a moment, then moves finished ones
+    /// into `completions` and returns how many. Never waits: with nothing finished it
+    /// returns 0.
+    pub fn poll(self: *Real, completions: []io.Completion) u32 {
+        comptime assertLinux();
+        assert(completions.len > 0);
+        assert(completions.len <= slots_count);
+        const in_flight_before = self.inFlight();
+        if (in_flight_before == 0) return 0;
+
+        if (self.ring.sq_ready() > 0 and !enter(&self.ring)) self.enters_deferred += 1;
+        var cqes: [slots_count]linux.io_uring_cqe = undefined;
+        const count = copyReady(&self.ring, cqes[0..completions.len]);
+        assert(count <= in_flight_before);
+        for (cqes[0..count], completions[0..count]) |cqe, *completion| {
+            completion.* = self.complete(cqe);
+        }
+        assert(self.inFlight() == in_flight_before - count);
+        assert(self.completed + self.inFlight() == self.submitted);
+        return count;
     }
 
     /// Fills `buffer` from the kernel's CSPRNG, or returns `error.RandomUnavailable` with
@@ -82,7 +257,154 @@ pub const Real = struct {
         self.random_bytes += buffer.len;
         assert(self.random_bytes == before + buffer.len);
     }
+
+    /// Frees the slot a completion names and builds its `io.Completion`.
+    fn complete(self: *Real, cqe: linux.io_uring_cqe) io.Completion {
+        // user_data is always a slot index this type wrote, and a send posts one completion.
+        assert(cqe.user_data < slots_count);
+        assert(cqe.flags & linux.IORING_CQE_F_MORE == 0);
+        const index: u32 = @intCast(cqe.user_data);
+        const slot = self.slots[index];
+        assert(slot.in_use); // A completion for a slot with nothing in flight.
+        self.slots[index].in_use = false;
+        self.free_slots[self.free_count] = index;
+        self.free_count += 1;
+        self.completed += 1;
+        assert(self.free_count <= slots_count);
+        return .{ .id = slot.id, .result = .{ .send = sendResult(cqe.res, slot.length) } };
+    }
 };
+
+/// Sets up a ring of `slots_count` entries, mapping each failure to `InitError`.
+fn ringInit() InitError!linux.IoUring {
+    assert(slots_count > 0);
+    var ring = linux.IoUring.init(slots_count, 0) catch |err| return switch (err) {
+        // io_uring is missing or switched off, or a security module refused the mapping.
+        error.PermissionDenied,
+        error.SystemOutdated,
+        error.AccessDenied,
+        error.MemoryMappingNotSupported,
+        error.Unexpected,
+        => error.RingUnavailable,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.SystemResources,
+        error.LockedMemoryLimitExceeded,
+        error.OutOfMemory,
+        => error.RingResources,
+        // The entry count is a constant power of two, the flags are 0, the parameters live
+        // on the standard library's stack and no fixed mapping is asked for, so these mean
+        // a bug, not a system state.
+        error.EntriesZero,
+        error.EntriesNotPowerOfTwo,
+        error.ArgumentsInvalid,
+        error.ParamsOutsideAccessibleAddressSpace,
+        error.MappingAlreadyExists,
+        => std.debug.panic("io_uring_setup: bad arguments ({t})", .{err}),
+    };
+    errdefer ring.deinit();
+    // The kernel sizes the queues from the entry count; anything else breaks the slot
+    // table's promise that the completion queue can't overflow.
+    if (ring.sq.sqes.len != slots_count or ring.cq.cqes.len < 2 * slots_count) {
+        return error.RingUnavailable;
+    }
+    // The mapping's size comes from the kernel, so it is checked, not assumed.
+    const mapped: u64 = @as(u64, ring.sq.mmap.len) + ring.sq.mmap_sqes.len + @sizeOf(Real);
+    if (mapped > constants.io_ring_size_max) return error.RingTooLarge;
+    assert(ring.fd >= 0);
+    return ring;
+}
+
+/// Hands every queued submission to the kernel without waiting. Returns false when the
+/// kernel refused for a moment, leaving them queued for the next call; any other failure is
+/// a bug in this file.
+fn enter(ring: *linux.IoUring) bool {
+    assert(ring.fd >= 0);
+    const queued = ring.sq_ready();
+    assert(queued > 0 and queued <= slots_count);
+    _ = ring.submit() catch |err| switch (err) {
+        // The kernel is short of memory, has too many completions pending, or a signal
+        // arrived: what wasn't taken stays queued, and the next call tries again.
+        error.SystemResources, error.CompletionQueueOvercommitted, error.SignalInterrupt => return false,
+        // A bad descriptor or entry, a ring in the wrong state, or an opcode this kernel
+        // lacks: every one is set up by this file, so the process stops with the reason.
+        error.FileDescriptorInvalid,
+        error.FileDescriptorInBadState,
+        error.SubmissionQueueEntryInvalid,
+        error.BufferInvalid,
+        error.RingShuttingDown,
+        error.OpcodeNotSupported,
+        error.InvalidThread,
+        error.Unexpected,
+        => std.debug.panic("io_uring_enter: {t}", .{err}),
+    };
+    return true;
+}
+
+/// Copies the finished completions that fit in `cqes`, without waiting.
+fn copyReady(ring: *linux.IoUring, cqes: []linux.io_uring_cqe) u32 {
+    assert(cqes.len > 0);
+    assert(cqes.len <= slots_count);
+    // With wait_nr 0, copy_cqes enters the kernel only to flush an overflowed completion
+    // queue, which the slot table rules out; its errors are handled as in `enter`.
+    const count = ring.copy_cqes(cqes, 0) catch |err| switch (err) {
+        error.SystemResources, error.CompletionQueueOvercommitted, error.SignalInterrupt => 0,
+        error.FileDescriptorInvalid,
+        error.FileDescriptorInBadState,
+        error.SubmissionQueueEntryInvalid,
+        error.BufferInvalid,
+        error.RingShuttingDown,
+        error.OpcodeNotSupported,
+        error.InvalidThread,
+        error.Unexpected,
+        => std.debug.panic("io_uring_enter (completions): {t}", .{err}),
+    };
+    assert(count <= cqes.len);
+    return count;
+}
+
+/// A send's result from its completion: the bytes sent, or the error its errno means.
+fn sendResult(res: i32, length: u32) io.SendError!u32 {
+    assert(length > 0);
+    assert(length <= constants.http_response_size_max);
+    if (res > 0) {
+        const sent: u32 = @intCast(res);
+        assert(sent <= length); // The kernel never reports more bytes than it was given.
+        return sent;
+    }
+    // A stream send of at least one byte that sent none made no progress; the caller
+    // tries again later.
+    if (res == 0) return error.Backpressure;
+    assert(res > -4096);
+    const err: linux.E = @fromBackingInt(@intCast(-res));
+    return sendError(err);
+}
+
+/// Maps a failed send's errno. Every errno has an explicit outcome.
+fn sendError(err: linux.E) io.SendError {
+    assert(err != .SUCCESS);
+    const result: io.SendError = switch (err) {
+        // The connection is gone or unusable: the caller closes it. EACCES and EPERM come
+        // from a security module or a firewall refusing this connection, which a retry
+        // won't change; EIO and EPROTO from a failed transport under the socket.
+        .PIPE, .CONNRESET, .CONNABORTED, .NOTCONN, .SHUTDOWN, .TIMEDOUT => error.PeerDown,
+        .HOSTUNREACH, .NETUNREACH, .NETDOWN, .HOSTDOWN, .NETRESET, .CONNREFUSED => error.PeerDown,
+        .ACCES, .PERM, .IO, .PROTO => error.PeerDown,
+        // The kernel is short of buffers or the call was interrupted: try again later.
+        .AGAIN, .NOBUFS, .NOMEM, .INTR => error.Backpressure,
+        // A bad descriptor (a socket closed while its send was in flight), address, flag or
+        // length, or a cancel this type never asks for: each means a bug in this file or
+        // its caller, so the process stops with the reason.
+        .BADF, .NOTSOCK, .FAULT, .INVAL, .OPNOTSUPP, .MSGSIZE, .DESTADDRREQ, .ISCONN, .CANCELED => {
+            std.debug.panic("io_uring send: {t}", .{err});
+        },
+        // An errno send(2) isn't documented to return: this file's model of the kernel is
+        // wrong, so the process stops with the value rather than guess what it means.
+        else => std.debug.panic("io_uring send: undocumented errno {t}", .{err}),
+    };
+    assert(result == error.PeerDown or result == error.Backpressure);
+    return result;
+}
 
 /// Reads `CLOCK_MONOTONIC` as nanoseconds.
 fn monotonicNow() io.Instant {
@@ -196,18 +518,101 @@ fn assertLinux() void {
 
 const testing = std.testing;
 
+/// A connection table holding one end of a socketpair, and a ring that sends on it. Set up
+/// in place, because `Real` keeps a pointer to the table.
+const Fixture = struct {
+    startup: StartupAllocator,
+    /// Taken during startup; frees the table at shutdown.
+    gpa: std.mem.Allocator,
+    table: connections.Table,
+    real: Real,
+    /// Registered in the table as `peer`.
+    local: linux.fd_t,
+    /// The far end; tests read from it or close it.
+    remote: linux.fd_t,
+    peer: io.PeerId,
+
+    fn setUp(self: *Fixture) !void {
+        var fds: [2]linux.fd_t = undefined;
+        const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &fds)));
+        self.local = fds[0];
+        self.remote = fds[1];
+        errdefer _ = linux.close(fds[0]);
+        errdefer _ = linux.close(fds[1]);
+        self.startup = .init(testing.allocator, 4 * connections.entry_bytes);
+        self.gpa = self.startup.allocator();
+        self.table = try connections.Table.init(self.gpa, 4);
+        errdefer self.table.deinit(self.gpa);
+        self.peer = try self.table.acquire(self.local);
+        self.real = try Real.init(&self.startup, &self.table);
+        self.startup.finishStartup();
+        assert(self.real.inFlight() == 0);
+        assert(self.table.count() == 1);
+    }
+
+    /// Closes the ring first, so nothing in flight still names a socket.
+    fn tearDown(self: *Fixture) void {
+        assert(self.table.count() == 1);
+        self.real.deinit();
+        assert(self.table.release(self.peer) == self.local);
+        self.startup.beginShutdown();
+        self.table.deinit(self.gpa);
+        assert(self.startup.bytes_live == 0);
+        _ = linux.close(self.local);
+        if (self.remote >= 0) _ = linux.close(self.remote);
+    }
+
+    fn send(self: *Fixture, id: io.OperationId, bytes: []const u8) io.SubmitError!void {
+        assert(bytes.len > 0);
+        assert(bytes.len <= constants.http_response_size_max);
+        return self.real.submit(.{ .id = id, .operation = .{ .send = .{ .peer = self.peer, .bytes = bytes } } });
+    }
+};
+
+/// Empty polls `pollUntil` allows, 1 ms apart. Reason: a socketpair send normally completes
+/// during the submitting system call; a second is ample even on a loaded CI machine.
+const poll_attempts_max: u32 = 1_000;
+
+/// Polls until `want` completions have arrived in `completions`, or fails the test. After
+/// each empty poll it drains whatever `remote` has received, so sends parked on a full
+/// socket buffer can finish; pass -1 to leave the far end alone.
+fn pollUntil(real: *Real, completions: []io.Completion, want: u32, remote: linux.fd_t) !void {
+    assert(want > 0);
+    assert(want <= completions.len);
+    var count: u32 = 0;
+    var attempts: u32 = 0;
+    while (count < want and attempts < poll_attempts_max) : (attempts += 1) {
+        const got = real.poll(completions[count..want]);
+        count += got;
+        if (got > 0) continue;
+        if (remote >= 0) {
+            var scratch: [4096]u8 = undefined;
+            _ = linux.recvfrom(remote, &scratch, scratch.len, linux.MSG.DONTWAIT, null, null);
+        }
+        const pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&pause, null);
+    }
+    assert(attempts <= poll_attempts_max);
+    try testing.expectEqual(want, count);
+}
+
 /// Readings taken by the clock test. Reason: enough to see many distinct readings, few
 /// enough to finish in milliseconds even in a Debug build.
 const clock_readings_max: u32 = 10_000;
 
 test "real: a later clock reading is never below an earlier one" {
-    const real = Real.init();
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    const real = &fixture.real;
     var previous = real.now();
     try testing.expect(previous >= real.epoch);
     var count: u32 = 0;
     while (count < clock_readings_max) : (count += 1) {
         const reading = real.now();
         try testing.expect(reading >= previous);
+        try testing.expectEqual(reading, real.last);
         previous = reading;
     }
     try testing.expectEqual(clock_readings_max, count);
@@ -224,7 +629,10 @@ test "real: kernel readings convert to nanoseconds" {
 }
 
 test "real: randomBytes fills 1-byte and 64-byte buffers" {
-    var real = Real.init();
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    const real = &fixture.real;
     var one: [1]u8 = undefined;
     try real.randomBytes(&one);
     try testing.expectEqual(@as(u64, 1), real.random_bytes);
@@ -237,7 +645,10 @@ test "real: randomBytes fills 1-byte and 64-byte buffers" {
 }
 
 test "real: two 32-byte draws differ" {
-    var real = Real.init();
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    const real = &fixture.real;
     var first: [32]u8 = undefined;
     var second: [32]u8 = undefined;
     try real.randomBytes(&first);
@@ -247,11 +658,140 @@ test "real: two 32-byte draws differ" {
     try testing.expectEqual(@as(u64, 64), real.random_bytes);
 }
 
-test "real: the type doesn't claim the contract before submit and poll exist" {
-    const message = comptime io.contractError(Real);
-    try testing.expect(message != null);
-    try testing.expect(std.mem.indexOf(u8, message.?, "submit") != null);
+test "real: the type meets the I/O contract" {
+    io.assertContract(Real);
+    try testing.expect(comptime io.contractError(Real) == null);
 }
+
+test "real: a send over a socketpair completes with its byte count" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    try fixture.send(41, "hello");
+    try testing.expectEqual(@as(u32, 1), fixture.real.inFlight());
+
+    var completions: [4]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(io.OperationId, 41), completions[0].id);
+    try testing.expectEqual(@as(u32, 5), try completions[0].result.send);
+    try testing.expectEqual(@as(u32, 0), fixture.real.inFlight());
+    try testing.expectEqual(@as(u64, 1), fixture.real.completed);
+
+    var received: [8]u8 = undefined;
+    const rc = linux.read(fixture.remote, &received, received.len);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try testing.expectEqualStrings("hello", received[0..rc]);
+    // Nothing in flight: a poll returns 0 at once.
+    try testing.expectEqual(@as(u32, 0), fixture.real.poll(&completions));
+}
+
+test "real: a send to a closed peer completes with PeerDown" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.close(fixture.remote)));
+    fixture.remote = -1;
+    // Without MSG_NOSIGNAL this send would end the test process with SIGPIPE.
+    try fixture.send(7, "x");
+    var completions: [1]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(io.OperationId, 7), completions[0].id);
+    try testing.expectError(error.PeerDown, completions[0].result.send);
+    try testing.expectEqual(@as(u32, 0), fixture.real.inFlight());
+}
+
+test "real: one submission past the ring's depth returns QueueFull and changes nothing" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    var id: io.OperationId = 0;
+    while (id < slots_count) : (id += 1) try fixture.send(id, "y");
+    try testing.expectEqual(slots_count, fixture.real.inFlight());
+
+    const sqe_tail_before = fixture.real.ring.sq.sqe_tail;
+    const slots_before = fixture.real.slots;
+    try testing.expectError(error.QueueFull, fixture.send(id, "z"));
+    try testing.expectEqual(slots_count, fixture.real.inFlight());
+    try testing.expectEqual(@as(u64, slots_count), fixture.real.submitted);
+    try testing.expectEqual(sqe_tail_before, fixture.real.ring.sq.sqe_tail);
+    try testing.expectEqualSlices(Slot, &slots_before, &fixture.real.slots);
+
+    // Every send completes exactly once, with its own id, and the slots come back free.
+    var completions: [slots_count]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, slots_count, fixture.remote);
+    var seen: [slots_count]bool = @splat(false);
+    for (completions) |completion| {
+        try testing.expect(completion.id < slots_count);
+        try testing.expect(!seen[@intCast(completion.id)]);
+        seen[@intCast(completion.id)] = true;
+        try testing.expectEqual(@as(u32, 1), try completion.result.send);
+    }
+    try testing.expectEqual(@as(u32, 0), fixture.real.inFlight());
+    try fixture.send(id, "z");
+    try pollUntil(&fixture.real, completions[0..1], 1, fixture.remote);
+    try testing.expectEqual(id, completions[0].id);
+}
+
+test "real: every send errno has an outcome" {
+    try testing.expectEqual(error.PeerDown, sendError(.PIPE));
+    try testing.expectEqual(error.PeerDown, sendError(.CONNRESET));
+    try testing.expectEqual(error.PeerDown, sendError(.NOTCONN));
+    try testing.expectEqual(error.PeerDown, sendError(.TIMEDOUT));
+    try testing.expectEqual(error.PeerDown, sendError(.HOSTUNREACH));
+    try testing.expectEqual(error.PeerDown, sendError(.ACCES));
+    try testing.expectEqual(error.PeerDown, sendError(.IO));
+    try testing.expectEqual(error.PeerDown, sendError(.PROTO));
+    try testing.expectEqual(error.Backpressure, sendError(.AGAIN));
+    try testing.expectEqual(error.Backpressure, sendError(.NOBUFS));
+    try testing.expectEqual(error.Backpressure, sendError(.NOMEM));
+    try testing.expectEqual(error.Backpressure, sendError(.INTR));
+}
+
+test "real: a completion's result maps bytes, no progress and errnos" {
+    try testing.expectEqual(@as(u32, 5), try sendResult(5, 5));
+    try testing.expectEqual(@as(u32, 2), try sendResult(2, 5)); // A short send.
+    try testing.expectError(error.Backpressure, sendResult(0, 5));
+    try testing.expectError(error.PeerDown, sendResult(-@as(i32, @backingInt(linux.E.PIPE)), 5));
+    try testing.expectError(error.Backpressure, sendResult(-@as(i32, @backingInt(linux.E.AGAIN)), 5));
+}
+
+test "real: a poll takes no more completions than its buffer holds; the rest wait" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    try fixture.send(1, "a");
+    try fixture.send(2, "b");
+    try fixture.send(3, "c");
+    var seen: [4]bool = @splat(false);
+    var round: u32 = 0;
+    while (round < 3) : (round += 1) {
+        var one: [1]io.Completion = undefined;
+        try pollUntil(&fixture.real, &one, 1, -1);
+        try testing.expect(one[0].id >= 1 and one[0].id <= 3);
+        try testing.expect(!seen[@intCast(one[0].id)]);
+        seen[@intCast(one[0].id)] = true;
+        try testing.expectEqual(3 - (round + 1), fixture.real.inFlight());
+    }
+    var none: [1]io.Completion = undefined;
+    try testing.expectEqual(@as(u32, 0), fixture.real.poll(&none));
+}
+
+test "real: the memory table covers the ring the kernel maps" {
+    var found: ?constants.MemoryRow = null;
+    for (constants.memory_table) |row| {
+        if (std.mem.eql(u8, row.name, ring_row_name)) found = row;
+    }
+    const row = found orelse return error.TestExpectedRow;
+    try testing.expect(row.count * row.size >= ring_bytes_estimate);
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    const ring = &fixture.real.ring;
+    const mapped = @as(u64, ring.sq.mmap.len) + ring.sq.mmap_sqes.len + @sizeOf(Real);
+    try testing.expect(mapped <= ring_bytes_estimate);
+}
+
+const ring_row_name = "io_uring ring and in-flight table of the real I/O type";
 
 /// Returns `-errno` the way a raw syscall does.
 fn syscallError(err: linux.E) usize {

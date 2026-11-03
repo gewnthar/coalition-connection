@@ -161,10 +161,17 @@ pub const doctrine_skills_max: u32 = 512;
 
 /// Operations submitted to the I/O boundary and not yet completed. Reason: bounds the
 /// in-flight table, as an io_uring queue depth does, so a submission past it fails with
-/// `error.QueueFull` instead of growing anything. Provisional: roadmap core 3 sizes it against
-/// the connection table, since each connection may keep a read in flight, and adds the
-/// production table's row to the memory table.
+/// `error.QueueFull` instead of growing anything. It is also the real ring's submission
+/// queue depth, so it must be a power of two of at most 32,768. Provisional: roadmap core 3
+/// sizes it against the connection table, since each connection may keep a read in flight.
 pub const io_operations_in_flight_max: u32 = 256;
+
+/// Bytes the real I/O type's io_uring ring and in-flight table may take: the ring mapping
+/// (header, completion entries, submission index) and the submission entries, each in whole
+/// pages, plus the type itself with its slots. Reason: about 34 KiB at 256 operations with
+/// 4 KiB pages; 256 KiB still holds the worst case with 64 KiB pages. `io.real` checks its
+/// worst-case estimate against this at compile time, and the kernel's mapping at startup.
+pub const io_ring_size_max: u64 = 256 * 1024;
 
 /// Random bytes one call to the I/O boundary may draw. Reason: the largest draw is a 32-byte
 /// key; token nonces are 24 bytes.
@@ -196,7 +203,8 @@ pub const memory_table_rows_max: u32 = 64;
 /// and fails the build when the total exceeds `memory_budget_bytes`. Startup buffers not yet
 /// built are not rows yet: the slice that adds one (the response-buffer wait queue in roadmap
 /// core 3; lookup tables in core 33 and core 38) adds its row here in the same change. The
-/// table counts startup heap buffers only, not stacks or the program itself.
+/// table counts memory sized at startup (heap buffers, and the io_uring ring the kernel maps
+/// for the real I/O type, with its in-flight slots), not stacks or the program itself.
 pub const memory_table = [_]MemoryRow{
     .{
         .name = "Connection table entry and free-id slot, one per connection",
@@ -237,6 +245,11 @@ pub const memory_table = [_]MemoryRow{
         .name = "Valkey reply buffer, one per connection",
         .count = valkey_connections_max,
         .size = valkey_message_size_max,
+    },
+    .{
+        .name = "io_uring ring and in-flight table of the real I/O type",
+        .count = 1,
+        .size = io_ring_size_max,
     },
     .{
         .name = "Importer record buffer",
@@ -318,6 +331,8 @@ comptime {
     assert(live_events_backlog_bytes_max >= websocket_message_size_max);
     assert(memory_table.len <= memory_table_rows_max);
     assert(io_operations_in_flight_max > 0);
+    assert(std.math.isPowerOfTwo(io_operations_in_flight_max));
+    assert(io_operations_in_flight_max <= 32_768);
     assert(io_random_bytes_max >= 32);
     assert(io_random_attempts_max >= 2);
     // A simulated run must leave room to drain every delayed completion.
@@ -484,8 +499,9 @@ test "constants: the real memory table counts every planned buffer" {
         @as(u64, esi_requests_in_flight_max) * esi_response_size_max +
         @as(u64, postgres_connections_max) * postgres_message_size_max +
         @as(u64, valkey_connections_max) * valkey_message_size_max +
+        io_ring_size_max +
         import_record_size_max;
     const rows: u32 = memory_table.len;
-    try std.testing.expectEqual(@as(u32, 9), rows);
+    try std.testing.expectEqual(@as(u32, 10), rows);
     try std.testing.expectEqual(expected, try memoryTableBytes(&memory_table));
 }
