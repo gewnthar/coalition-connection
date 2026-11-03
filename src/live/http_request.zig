@@ -30,6 +30,9 @@ comptime {
     assert(headers_max > 0);
     // Offsets are u32, and `head_len + content_length` must not overflow.
     assert(size_max <= std.math.maxInt(u32) / 2);
+    // parseContentLength rejects `result > size_max` before each `result * 10 + digit`,
+    // so its largest intermediate value is `size_max * 10 + 9`, which must fit a u32.
+    assert(size_max <= (std.math.maxInt(u32) - 9) / 10);
 }
 
 /// Methods the server answers. Others get `error.MethodUnsupported` (501).
@@ -326,7 +329,8 @@ fn parseContentLength(value: []const u8) Error!u32 {
     var result: u32 = 0;
     for (value) |byte| {
         if (!isDigit(byte)) return error.ContentLengthInvalid;
-        // Checked before each step, so result stays at most 10 * size_max + 9.
+        // Checked before each step, so result stays at most 10 * size_max + 9, which the
+        // comptime block at the top of this file proves fits a u32.
         if (result > size_max) return error.RequestTooLarge;
         result = result * 10 + (byte - '0');
     }
@@ -641,6 +645,22 @@ test "http_request: size limits on the head and on head plus body" {
     try testing.expectEqual(@as(u32, size_max), fit_request.head_len + fit_request.content_length);
     const over = try std.fmt.bufPrint(text[head.len..], "{d:0>5}\r\n\r\n", .{body_fits + 1});
     try testing.expectError(error.RequestTooLarge, parseWhole(text[0 .. head.len + over.len]));
+}
+
+test "http_request: Content-Length accepts size_max, refuses past it, and stops early" {
+    var text: [32]u8 = undefined;
+    const at = try std.fmt.bufPrint(&text, "{d}", .{size_max});
+    try testing.expectEqual(@as(u32, size_max), try parseContentLength(at));
+    const leading_zeros = try std.fmt.bufPrint(&text, "000{d}", .{size_max});
+    try testing.expectEqual(@as(u32, size_max), try parseContentLength(leading_zeros));
+    const past = try std.fmt.bufPrint(&text, "{d}", .{size_max + 1});
+    try testing.expectError(error.RequestTooLarge, parseContentLength(past));
+    // The widest step the loop takes: result is exactly size_max, then * 10 + 9.
+    const widest_step = try std.fmt.bufPrint(&text, "{d}9", .{size_max});
+    try testing.expectError(error.RequestTooLarge, parseContentLength(widest_step));
+    // Overflow detector: without the check inside the loop, this wraps past maxInt(u32)
+    // and panics, so it proves the loop stops before the multiply can overflow.
+    try testing.expectError(error.RequestTooLarge, parseContentLength("4294967296"));
 }
 
 test "http_request: a head split across two reads at every point" {
