@@ -35,8 +35,9 @@ pub fn build(b: *std.Build) void {
     addServer(b, root, target, optimize, test_step);
     addRunners(b, root, target, optimize, seed);
     addStartupTrip(b, target, test_step);
-    // The unit tests, the server's tests and version check, and one run per trip case.
-    assert(test_step.dependencies.items.len == 3 + trip.cases.len);
+    // The unit tests, the server's tests and version check, one run per trip case and one
+    // per bad argument list.
+    assert(test_step.dependencies.items.len == 3 + trip.cases.len + trip.bad_arguments.len);
 }
 
 /// The server program, installed by the default step. `zig build test` runs its tests, then
@@ -123,34 +124,47 @@ fn addRunners(
 }
 
 /// Startup-trip harness (sim/startup_trip.zig): a tripped assertion ends the process, so
-/// each case is its own build, run as a child process by `zig build test`, and must exit
-/// with the code its case expects. Always safe (ReleaseSafe), the production mode: the guard
-/// is an assertion, compiled out where assertions are off. Never installed.
+/// `zig build test` builds the harness once and runs it as a child process once per case,
+/// naming the case as its argument, and each run must exit with the code its case expects.
+/// Each bad argument list must exit with the bad-argument code and say why. Always safe
+/// (ReleaseSafe), the production mode: the guard is an assertion, compiled out where
+/// assertions are off. Never installed.
 fn addStartupTrip(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Build.Step) void {
     assert(trip.cases.len > 0);
     assert(trip.cases.len <= trip.cases_max);
+    const dependencies_before = test_step.dependencies.items.len;
     const trip_root = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = .safe,
     });
-    for (trip.cases, 0..) |trip_case, index| {
-        const trip_options = b.addOptions();
-        trip_options.addOption(u32, "case_index", @intCast(index));
-        const module = b.createModule(.{
-            .root_source_file = b.path("sim/startup_trip.zig"),
-            .target = target,
-            .optimize = .safe,
-            .imports = &.{
-                .{ .name = "coalition_connection", .module = trip_root },
-                .{ .name = "build_options", .module = trip_options.createModule() },
-            },
-        });
-        const exe = b.addExecutable(.{ .name = b.fmt("startup_trip_{s}", .{trip_case.name}), .root_module = module });
+    const module = b.createModule(.{
+        .root_source_file = b.path("sim/startup_trip.zig"),
+        .target = target,
+        .optimize = .safe,
+        .imports = &.{.{ .name = "coalition_connection", .module = trip_root }},
+    });
+    const exe = b.addExecutable(.{ .name = "startup_trip", .root_module = module });
+    for (trip.cases) |trip_case| {
         const run = b.addRunArtifact(exe);
+        run.setName(b.fmt("startup_trip {s}", .{trip_case.name}));
+        run.addArg(trip_case.name);
+        // A passing case prints nothing; checking that also captures stderr.
+        run.expectStdErrEqual("");
         run.expectExitCode(trip.expectedExit(trip_case));
         test_step.dependOn(&run.step);
     }
+    for (trip.bad_arguments, 0..) |bad, index| {
+        const run = b.addRunArtifact(exe);
+        run.setName(b.fmt("startup_trip bad argument list {d}", .{index}));
+        run.addArgs(bad.arguments);
+        // Checking stderr also captures it, so the expected message doesn't show in the
+        // test log as if the run had failed.
+        run.expectStdErrEqual(bad.stderr);
+        run.expectExitCode(trip.exit_bad_argument);
+        test_step.dependOn(&run.step);
+    }
+    assert(test_step.dependencies.items.len == dependencies_before + trip.cases.len + trip.bad_arguments.len);
 }
 
 const trip = @import("sim/startup_trip_cases.zig");

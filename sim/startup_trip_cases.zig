@@ -1,5 +1,6 @@
-//! The startup-trip cases: one list, read by build.zig (one build and one run per case)
-//! and by sim/startup_trip.zig (what each case does), so the two can't drift apart.
+//! The startup-trip cases: one list, read by build.zig (one run per case, naming the case
+//! as its argument) and by sim/startup_trip.zig (what each case does), so the two can't
+//! drift apart.
 //!
 //! Each case puts a `StartupAllocator` in a phase, then makes one call. A case that
 //! `trips` must stop the process on an assertion before the child allocator is touched;
@@ -39,6 +40,9 @@ pub const Case = struct {
 
 pub const exit_finished: u8 = 0;
 pub const exit_tripped: u8 = 42;
+/// The arguments named no case. A bad argument must end the run with this code, never
+/// pick a case or panic.
+pub const exit_bad_argument: u8 = 7;
 
 pub fn expectedExit(case: Case) u8 {
     assert(case.name.len > 0);
@@ -85,10 +89,66 @@ pub const cases = [_]Case{
     .{ .name = "resize_zero_shutdown", .phase = .shutdown, .call = .resize_zero, .trips = false },
 };
 
+/// The index of the case with exactly this name, or null.
+pub fn find(name: []const u8) ?u32 {
+    assert(cases.len > 0);
+    assert(cases.len <= cases_max);
+    for (cases, 0..) |case, index| {
+        if (std.mem.eql(u8, case.name, name)) return @intCast(index);
+    }
+    return null;
+}
+
+/// An argument list that names no case, and what the harness must say about it on stderr.
+pub const BadArguments = struct {
+    arguments: []const []const u8,
+    stderr: []const u8,
+};
+
+/// What the harness prints for each bad argument list; it prints from these, so the
+/// expected text and the printed text are one.
+pub const say_none = "startup_trip: expected one argument, a case name; got none\n";
+pub const say_more = "startup_trip: expected one argument, a case name; got more\n";
+pub const say_unknown_head = "startup_trip: no case is named \"";
+pub const say_unknown_tail = "\"\n";
+
+fn sayUnknown(comptime name: []const u8) []const u8 {
+    return say_unknown_head ++ name ++ say_unknown_tail;
+}
+
+/// build.zig runs the harness with each list and expects `exit_bad_argument` and the
+/// message: no argument, an unknown name, an empty name, a real name's prefix, a real name
+/// with a trailing byte, a real name in the wrong case, a real name twice, an unknown name
+/// before a real one, and a real name before an empty one.
+pub const bad_arguments = [_]BadArguments{
+    .{ .arguments = &.{}, .stderr = say_none },
+    .{ .arguments = &.{"no_such_case"}, .stderr = sayUnknown("no_such_case") },
+    .{ .arguments = &.{""}, .stderr = sayUnknown("") },
+    .{ .arguments = &.{"alloc"}, .stderr = sayUnknown("alloc") },
+    .{ .arguments = &.{"alloc_running_"}, .stderr = sayUnknown("alloc_running_") },
+    .{ .arguments = &.{"ALLOC_RUNNING"}, .stderr = sayUnknown("ALLOC_RUNNING") },
+    .{ .arguments = &.{ "alloc_running", "alloc_running" }, .stderr = say_more },
+    .{ .arguments = &.{ "no_such_case", "alloc_running" }, .stderr = say_more },
+    .{ .arguments = &.{ "alloc_running", "" }, .stderr = say_more },
+};
+
+pub const bad_arguments_max: u32 = 10;
+
+comptime {
+    assert(bad_arguments.len > 0);
+    assert(bad_arguments.len <= bad_arguments_max);
+    // Each list really names no case: one argument that matches a case would make that
+    // run pass for the wrong reason.
+    for (bad_arguments) |bad| {
+        assert(bad.arguments.len != 1 or find(bad.arguments[0]) == null);
+        assert(bad.stderr.len > 0);
+    }
+}
+
 comptime {
     assert(cases.len > 0);
     assert(cases.len <= cases_max);
-    // Names become executable names, so each must be unique.
+    // A run picks its case by name, so each name must be unique.
     @setEvalBranchQuota(100_000);
     for (cases, 0..) |a, i| {
         for (cases[i + 1 ..]) |b| {
