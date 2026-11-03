@@ -4,14 +4,16 @@
 //! I/O boundary, draws a nonce, advances time, and takes every completion that is due.
 //! Completions arrive after seeded delays and out of order, with faults of every kind and
 //! short sends injected, and the run checks its invariants every tick: each operation
-//! completes exactly once, with the kind it was submitted as. As components land, each one
-//! joins this loop as a real workload (logins, ESI polling, live updates). A failing seed
-//! replays exactly.
+//! completes exactly once, with the kind it was submitted as. Then a second workload drives
+//! the connection table past its limit and empties it again (sim/connections.zig). As
+//! components land, each one joins this loop as a real workload (logins, ESI polling, live
+//! updates). A failing seed replays exactly.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const cc = @import("coalition_connection");
 const build_options = @import("build_options");
+const connection_workload = @import("connections.zig");
 
 const io = cc.io;
 const constants = cc.constants;
@@ -173,4 +175,12 @@ pub fn main() SimError!void {
     std.debug.print("sim: short_sends={d} queue_full={d}\n", .{ sim.short_sends, run.queue_full });
     std.debug.print("sim: peer_down={d} backpressure={d}\n", .{ faults.peer_down, faults.backpressure });
     std.debug.print("sim: unavailable={d} timeout={d} ok\n", .{ faults.unavailable, faults.timeout });
+
+    const table = connection_workload.run(seed) catch |err| {
+        std.debug.print("sim: seed={d} failed in the connection-table workload\n", .{seed});
+        return err;
+    };
+    std.debug.print("sim: connections arrivals={d} accepted={d} refused={d}\n", .{ table.arrivals, table.accepted, table.refused });
+    std.debug.print("sim: connections departures={d} reused={d} peak={d}\n", .{ table.departures, table.reused, table.peak });
+    std.debug.print("sim: connections trace={x:0>16} ok\n", .{table.trace});
 }
