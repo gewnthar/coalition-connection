@@ -73,8 +73,12 @@ pub const Request = struct {
 pub const Error = error{
     /// The empty line that ends the head has not arrived yet. Not a bad request.
     Incomplete,
-    /// Head, or head plus Content-Length, is longer than `http_request_size_max` (413 or 431).
-    RequestTooLarge,
+    /// The buffer is full and the head has not ended: the head alone is longer than
+    /// `http_request_size_max` (431 Request Header Fields Too Large).
+    HeadTooLarge,
+    /// The head ended, but head plus Content-Length is longer than `http_request_size_max`,
+    /// or Content-Length alone is (413 Content Too Large).
+    ContentTooLarge,
     /// Not "method SP target SP version", or the line is empty.
     RequestLineInvalid,
     /// The method is empty or has a character that is not allowed in a token.
@@ -131,7 +135,7 @@ pub fn parse(buffer: []const u8, scan: *HeadScan) Error!Request {
         if (buffer_len == size_max) {
             // A full buffer with no end of head is a final answer, like any other error.
             scan.* = .{};
-            return error.RequestTooLarge;
+            return error.HeadTooLarge;
         }
         // Back off three bytes, so a CRLF CRLF split across reads is still found.
         scan.resume_at = buffer_len -| 3;
@@ -318,7 +322,7 @@ fn checkFraming(request: *const Request) Error!u32 {
 
     const body_len = content_length orelse 0;
     // Both terms are at most size_max, so the sum cannot overflow a u32.
-    if (request.head_len + body_len > size_max) return error.RequestTooLarge;
+    if (request.head_len + body_len > size_max) return error.ContentTooLarge;
     assert(host_count <= 1);
     return body_len;
 }
@@ -329,12 +333,14 @@ fn parseContentLength(value: []const u8) Error!u32 {
     var result: u32 = 0;
     for (value) |byte| {
         if (!isDigit(byte)) return error.ContentLengthInvalid;
+        // Once past size_max the value only grows, so stop multiplying but keep checking
+        // that every byte is a digit: "1000000x" is malformed (400), not too large (413).
         // Checked before each step, so result stays at most 10 * size_max + 9, which the
         // comptime block at the top of this file proves fits a u32.
-        if (result > size_max) return error.RequestTooLarge;
-        result = result * 10 + (byte - '0');
+        if (result <= size_max) result = result * 10 + (byte - '0');
+        assert(result <= size_max * 10 + 9);
     }
-    if (result > size_max) return error.RequestTooLarge;
+    if (result > size_max) return error.ContentTooLarge;
     assert(result <= size_max);
     return result;
 }
@@ -585,7 +591,8 @@ test "http_request: each bad input has its own error" {
         .{ .text = "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: +1\r\n\r\n", .err = error.ContentLengthInvalid },
         .{ .text = "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 1, 1\r\n\r\n", .err = error.ContentLengthInvalid },
         .{ .text = "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n", .err = error.ContentLengthDuplicate },
-        .{ .text = "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 99999999999999999999\r\n\r\n", .err = error.RequestTooLarge },
+        .{ .text = "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 99999999999999999999\r\n\r\n", .err = error.ContentTooLarge },
+        .{ .text = "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 99999999999x\r\n\r\n", .err = error.ContentLengthInvalid },
         .{ .text = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", .err = error.TransferEncodingUnsupported },
     };
     for (cases) |case| {
@@ -633,7 +640,7 @@ test "http_request: header count at and past http_headers_max" {
 test "http_request: size limits on the head and on head plus body" {
     const buffer: [size_max]u8 = @splat('a');
     // A full buffer with no end of head can never become a request.
-    try testing.expectError(error.RequestTooLarge, parseWhole(&buffer));
+    try testing.expectError(error.HeadTooLarge, parseWhole(&buffer));
     try testing.expectError(error.Incomplete, parseWhole(buffer[0 .. size_max - 1]));
 
     const head = "POST / HTTP/1.0\r\nContent-Length: ";
@@ -644,23 +651,59 @@ test "http_request: size limits on the head and on head plus body" {
     const fit_request = try parseWhole(text[0 .. head.len + fits.len]);
     try testing.expectEqual(@as(u32, size_max), fit_request.head_len + fit_request.content_length);
     const over = try std.fmt.bufPrint(text[head.len..], "{d:0>5}\r\n\r\n", .{body_fits + 1});
-    try testing.expectError(error.RequestTooLarge, parseWhole(text[0 .. head.len + over.len]));
+    try testing.expectError(error.ContentTooLarge, parseWhole(text[0 .. head.len + over.len]));
 }
 
-test "http_request: Content-Length accepts size_max, refuses past it, and stops early" {
+/// Test helper: a head of exactly `size_max` bytes, padded by one header value, whose
+/// Content-Length is the single digit `body_digit`. The buffer is full and the head ends.
+fn buildFullHead(buffer: *[size_max]u8, body_digit: u8) []const u8 {
+    assert(body_digit >= '0');
+    assert(body_digit <= '9');
+    const prefix = "POST / HTTP/1.0\r\nContent-Length: ";
+    const middle = "\r\nX-Pad: ";
+    const end = "\r\n\r\n";
+    const fixed = prefix.len + 1 + middle.len + end.len;
+    comptime assert(fixed < size_max);
+    @memcpy(buffer[0..prefix.len], prefix);
+    buffer[prefix.len] = body_digit;
+    @memcpy(buffer[prefix.len + 1 ..][0..middle.len], middle);
+    @memset(buffer[prefix.len + 1 + middle.len ..][0 .. size_max - fixed], 'a');
+    @memcpy(buffer[size_max - end.len ..], end);
+    assert(findHeadEnd(buffer, 0) == size_max);
+    return buffer;
+}
+
+test "http_request: a full buffer whose head ends is never a head too large" {
+    var buffer: [size_max]u8 = undefined;
+    // The head fills the buffer exactly and has no body: a request.
+    const exact = try parseWhole(buildFullHead(&buffer, '0'));
+    try testing.expectEqual(@as(u32, size_max), exact.head_len);
+    try testing.expectEqual(@as(u32, 0), exact.content_length);
+    // The same head with a one-byte body: the head itself fit, so 413, not 431.
+    try testing.expectError(error.ContentTooLarge, parseWhole(buildFullHead(&buffer, '1')));
+    // The same head with the last byte of its terminator replaced never ends: 431.
+    _ = buildFullHead(&buffer, '0');
+    buffer[size_max - 1] = 'a';
+    try testing.expectError(error.HeadTooLarge, parseWhole(&buffer));
+}
+
+test "http_request: Content-Length accepts size_max, refuses past it, and never overflows" {
     var text: [32]u8 = undefined;
     const at = try std.fmt.bufPrint(&text, "{d}", .{size_max});
     try testing.expectEqual(@as(u32, size_max), try parseContentLength(at));
     const leading_zeros = try std.fmt.bufPrint(&text, "000{d}", .{size_max});
     try testing.expectEqual(@as(u32, size_max), try parseContentLength(leading_zeros));
     const past = try std.fmt.bufPrint(&text, "{d}", .{size_max + 1});
-    try testing.expectError(error.RequestTooLarge, parseContentLength(past));
+    try testing.expectError(error.ContentTooLarge, parseContentLength(past));
     // The widest step the loop takes: result is exactly size_max, then * 10 + 9.
     const widest_step = try std.fmt.bufPrint(&text, "{d}9", .{size_max});
-    try testing.expectError(error.RequestTooLarge, parseContentLength(widest_step));
+    try testing.expectError(error.ContentTooLarge, parseContentLength(widest_step));
     // Overflow detector: without the check inside the loop, this wraps past maxInt(u32)
     // and panics, so it proves the loop stops before the multiply can overflow.
-    try testing.expectError(error.RequestTooLarge, parseContentLength("4294967296"));
+    try testing.expectError(error.ContentTooLarge, parseContentLength("4294967296"));
+    // A value that is already too large but then turns out malformed is malformed.
+    try testing.expectError(error.ContentLengthInvalid, parseContentLength("99999999999x"));
+    try testing.expectError(error.ContentLengthInvalid, parseContentLength("4294967296 "));
 }
 
 test "http_request: a head split across two reads at every point" {
@@ -694,7 +737,7 @@ test "http_request: the scan resets after a head, ready for the next request" {
     try testing.expectEqualStrings("/b", request.target);
 }
 
-test "http_request: a full buffer fed in pieces is too large, as in one read" {
+test "http_request: a full buffer fed in pieces is a head too large, as in one read" {
     const buffer: [size_max]u8 = @splat('a');
     const piece: u32 = 1000;
     comptime assert(piece < size_max);
@@ -704,7 +747,7 @@ test "http_request: a full buffer fed in pieces is too large, as in one read" {
         try testing.expectError(error.Incomplete, parse(buffer[0..len], &scan));
         try testing.expectEqual(len - 3, scan.resume_at);
     }
-    try testing.expectError(error.RequestTooLarge, parse(&buffer, &scan));
+    try testing.expectError(error.HeadTooLarge, parse(&buffer, &scan));
     // A final answer, so the scan is reset for whatever reuses the buffer.
     try testing.expectEqual(@as(u32, 0), scan.resume_at);
 }
