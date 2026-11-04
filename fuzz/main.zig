@@ -313,7 +313,7 @@ fn httpGenerateLong(random: std.Random, buffer: *[http_buffer_size]u8) HttpCase 
 
     const model: HttpModel = .{ .method = .post, .header_count = 3, .content_length = content_length, .len = len };
     const request_len = head_len + content_length;
-    if (request_len > http_buffer_size) return .{ .model = model, .expected = error.RequestTooLarge, .limit = .body_too_large };
+    if (request_len > http_buffer_size) return .{ .model = model, .expected = error.ContentTooLarge, .limit = .body_too_large };
     if (request_len == http_buffer_size) return .{ .model = model, .expected = null, .limit = .request_exact_fit };
     return .{ .model = model, .expected = null, .limit = .none };
 }
@@ -334,7 +334,7 @@ fn httpGenerateOverflow(random: std.Random, buffer: *[http_buffer_size]u8) HttpC
     assert(len == target);
 
     const model: HttpModel = .{ .method = .get, .header_count = 0, .content_length = 0, .len = len };
-    if (len == http_buffer_size) return .{ .model = model, .expected = error.RequestTooLarge, .limit = .buffer_full };
+    if (len == http_buffer_size) return .{ .model = model, .expected = error.HeadTooLarge, .limit = .buffer_full };
     return .{ .model = model, .expected = error.Incomplete, .limit = .buffer_one_short };
 }
 
@@ -356,7 +356,7 @@ fn httpGenerateBody(random: std.Random, buffer: *[http_buffer_size]u8) HttpCase 
     const end_len: u32 = end.len;
     const fit: u32 = http_buffer_size - (len + 5 + end_len);
     var model: HttpModel = .{ .method = .post, .header_count = 2, .content_length = 0, .len = 0 };
-    var case: HttpCase = .{ .model = model, .expected = error.RequestTooLarge, .limit = .content_length_one_over };
+    var case: HttpCase = .{ .model = model, .expected = error.ContentTooLarge, .limit = .content_length_one_over };
     switch (variant) {
         0 => {
             len = appendDecimal(buffer, len, fit);
