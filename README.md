@@ -12,7 +12,7 @@ has the full release plan.
 
 ## Building and testing
 
-You need exactly Zig 0.17.0, the latest stable release, which CI pins. Other versions aren't
+You need exactly Zig 0.17.1, the latest stable release, which CI pins. Other versions aren't
 supported. From the repository root:
 
 ```sh

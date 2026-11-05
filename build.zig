@@ -54,7 +54,7 @@ fn addServer(
         std.debug.panic("build.zig.zon: version {s} is not a semantic version: {t}", .{ package.version, err });
     };
     assert(version.major < 1000 and version.minor < 1000);
-    assert(std.mem.eql(u8, package.minimum_zig_version, "0.17.0"));
+    assert(std.mem.eql(u8, package.minimum_zig_version, "0.17.1"));
     const dependencies_before = test_step.dependencies.items.len;
     const options = b.addOptions();
     options.addOption([]const u8, "version", package.version);
