@@ -118,12 +118,13 @@ pub const Sim = struct {
 
     /// Queues one operation to complete after a seeded delay of 0 to
     /// `sim_completion_delay_ticks_max` ticks, capped at the run's last tick, with its result
-    /// drawn now. A full table
-    /// returns `error.QueueFull` and leaves the state unchanged.
+    /// drawn now. A full table returns `error.QueueFull` and leaves the state unchanged. An
+    /// id already in flight breaks the contract and crashes, full table or not.
     pub fn submit(self: *Sim, submission: io.Submission) io.SubmitError!void {
         comptime assertSimulationAllowed();
         assert(self.in_flight <= slots_count);
         assertOperation(submission.operation);
+        self.assertIdNotInFlight(submission.id);
         if (self.in_flight == slots_count) return error.QueueFull;
 
         const index = self.freeSlot();
@@ -181,6 +182,21 @@ pub const Sim = struct {
         self.random_source.random().bytes(buffer);
         self.random_bytes += drawn;
         assert(self.random_bytes == before + drawn);
+    }
+
+    /// The contract says ids in flight are distinct, so a caller that reuses one has a bug:
+    /// its two completions would be indistinguishable. Scans every slot, at most
+    /// `slots_count` steps, and crashes on a match. Changes no state.
+    fn assertIdNotInFlight(self: *const Sim, id: io.OperationId) void {
+        var occupied: u32 = 0;
+        var index: u32 = 0;
+        while (index < slots_count) : (index += 1) {
+            const slot = self.slots[index] orelse continue;
+            occupied += 1;
+            assert(slot.submission.id != id);
+        }
+        // The count of occupied slots and `in_flight` are kept separately; they must agree.
+        assert(occupied == self.in_flight);
     }
 
     /// Takes a free slot, scanning from a seeded offset.
@@ -497,6 +513,28 @@ test "sim: a full table refuses a submission and changes nothing" {
     try testing.expectEqual(@as(u32, 1), sim.poll(&completions));
     try sim.submit(testSubmission(id));
     try testing.expectEqual(slots_count, sim.in_flight);
+}
+
+test "sim: an id may be reused once its operation has completed" {
+    // Ids need be distinct only while in flight. With every other slot still full, the id
+    // that just completed is accepted again, three times over.
+    var sim = Sim.init(17, 0);
+    var id: io.OperationId = 0;
+    while (id < slots_count) : (id += 1) try sim.submit(testSubmission(id));
+    var completions: [1]io.Completion = undefined;
+    var ticks: u32 = 0;
+    while (ticks <= constants.sim_completion_delay_ticks_max) : (ticks += 1) sim.tick();
+    var round: u32 = 0;
+    while (round < 3) : (round += 1) {
+        try testing.expectEqual(@as(u32, 1), sim.poll(&completions));
+        try testing.expectEqual(slots_count - 1, sim.in_flight);
+        const reused = completions[0].id;
+        try testing.expect(reused < slots_count);
+        try sim.submit(testSubmission(reused));
+        try testing.expectEqual(slots_count, sim.in_flight);
+    }
+    try testing.expectEqual(@as(u64, 3), sim.completed);
+    try testing.expectEqual(@as(u64, slots_count + 3), sim.submitted);
 }
 
 test "sim: an operation submitted on the last tick still completes" {

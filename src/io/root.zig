@@ -20,9 +20,9 @@
 //! Operation lifetime: the bytes an operation names belong to the caller and must stay valid
 //! and unchanged until its completion arrives, as with io_uring; the simulator checks this.
 //! Each accepted operation completes exactly once, carrying the `id` the caller gave it, and
-//! ids in flight must be distinct. A submission refused with `error.QueueFull` never
-//! completes. `poll` takes a buffer of 1 to `constants.io_operations_in_flight_max`
-//! completions. A send may complete short, reporting fewer bytes than it was given; the
+//! ids in flight must be distinct; the simulator checks this too. A submission refused with
+//! `error.QueueFull` never completes. `poll` takes a buffer of 1 to
+//! `constants.io_operations_in_flight_max` completions. A send may complete short, reporting fewer bytes than it was given; the
 //! caller sends the rest. A send's peer stays in the connection table, with its socket
 //! open, until the send's completion arrives.
 //!
@@ -197,13 +197,13 @@ const WrongPoll = struct {
 test "io: a stand-in with a missing method is refused" {
     const message = comptime contractError(MissingRandom);
     try testing.expect(message != null);
-    try testing.expect(std.mem.indexOf(u8, message.?, "randomBytes") != null);
+    try testing.expect(std.mem.find(u8, message.?, "randomBytes") != null);
 }
 
 test "io: a stand-in with a wrong signature is refused" {
     const message = comptime contractError(WrongPoll);
     try testing.expect(message != null);
-    try testing.expect(std.mem.indexOf(u8, message.?, "poll") != null);
+    try testing.expect(std.mem.find(u8, message.?, "poll") != null);
     try testing.expect(comptime contractError(struct {}) != null);
 }
 
