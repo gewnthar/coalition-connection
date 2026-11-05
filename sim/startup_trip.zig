@@ -1,5 +1,6 @@
 //! Startup-trip harness: proves `StartupAllocator` stops the process when code calls it in
-//! a phase that forbids the call, before the child allocator is touched.
+//! a phase that forbids the call, before the child allocator is touched, and that the
+//! connection table stops it when code releases, reads or moves an entry not in use.
 //!
 //! The guard is an assertion, and a tripped assertion panics, which ends the process. A
 //! test block can't catch that, so `zig build test` builds this file once, in ReleaseSafe,
@@ -10,14 +11,15 @@
 //!
 //! Exit codes (42 and 0 pass for cases, 7 passes for bad argument lists; those three come
 //! from the cases file):
-//!   42  a trip case tripped: an assertion failed before the child allocator was reached
+//!   42  a trip case tripped: an assertion failed (for the allocator, before the child
+//!       allocator was reached)
 //!   0   a control case finished, and its call did what it should
 //!   1   a panic before the call was made (a setup bug, not a result)
-//!   2   a trip case's call returned without tripping: the guard is missing
+//!   2   a trip case's call returned without tripping: the check is missing
 //!   3   the call panicked, but not on an assertion
 //!   4   setup failed
 //!   5   the call reached the child allocator before tripping: the guard came too late
-//!   6   a control case's call was refused, or left the accounting wrong
+//!   6   a control case's call was refused, or left the accounting or the table wrong
 //!   7   the arguments name no case: not exactly one argument, or an unknown name
 //!
 //! A passing case prints nothing; only the failure codes say why on stderr. Zig's build
@@ -33,6 +35,11 @@
 //! child allocator was reached. It can't tell which one: `fits` asserts the startup phase
 //! too, so deleting only the phase check at the top of `alloc`, `resize` or `remap` still
 //! trips, on the one in `fits`. Deleting both is caught.
+//!
+//! For the connection table, a pass proves an assertion stopped the call, not an index out
+//! of bounds (exit 3). `release` and `get` also check the entry's socket, which a free entry
+//! holds as -1, so a stale-socket case writes a valid-looking socket into the free entry
+//! first: then only the state check can stop the call.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -65,10 +72,13 @@ comptime {
     // Every case is checked here, not just the one a run picks: the running phase forbids
     // every call, so a running case that doesn't trip is a mistake in the list, and every
     // control's call needs an expectation in `bytesExpected`.
-    for (trip.cases) |c| {
-        assert(c.trips or c.phase != .running);
-        assert(c.trips or bytesExpected(c.call) != null);
-    }
+    for (trip.cases) |c| switch (c.target) {
+        .startup_allocator => |on| {
+            assert(c.trips or on.phase != .running);
+            assert(c.trips or bytesExpected(on.call) != null);
+        },
+        .connection_table => |call| assert(c.trips != tableCallAllowed(call)),
+    };
 }
 
 /// The case this run makes, by name, for the panic handler's messages. Set once the
@@ -155,6 +165,19 @@ const Tripwire = struct {
 };
 
 const setup_len: u32 = 16;
+/// The budget `main` gives the allocator; the table and the setup bytes each fit in it.
+const budget_bytes: u64 = 128;
+/// The fixed child allocator's backing. Each allocation may be padded to its alignment, so
+/// the backing leaves room for the whole budget plus padding on each of the two
+/// allocations the table makes.
+const backing_len: u32 = 256;
+
+comptime {
+    assert(2 * setup_len <= budget_bytes);
+    assert(trip.table_size * cc.live.connections.entry_bytes <= budget_bytes);
+    assert(budget_bytes + 2 * @alignOf(cc.live.connections.Entry) <= backing_len);
+    assert(@TypeOf(trip.socket_base) == cc.live.connections.Socket);
+}
 
 pub fn main(init: std.process.Init.Minimal) void {
     // build.zig builds this file and src/root.zig in ReleaseSafe, so the guard's
@@ -168,10 +191,25 @@ pub fn main(init: std.process.Init.Minimal) void {
     assert(case.name.len > 0);
 
     // A fixed child keeps the run off the operating system's allocator.
-    var backing: [256]u8 = undefined;
+    var backing: [backing_len]u8 = undefined;
     var fixed: std.heap.FixedBufferAllocator = .init(&backing);
     var tripwire: Tripwire = .{ .child = fixed.allocator() };
-    var startup = cc.StartupAllocator.init(tripwire.allocator(), 128);
+    var startup = cc.StartupAllocator.init(tripwire.allocator(), budget_bytes);
+    switch (case.target) {
+        .startup_allocator => |on| runAllocatorCase(&startup, &fixed, on.phase, on.call, case),
+        .connection_table => |call| runTableCase(&startup, call, case),
+    }
+}
+
+fn runAllocatorCase(
+    startup: *cc.StartupAllocator,
+    fixed: *const std.heap.FixedBufferAllocator,
+    phase: trip.Phase,
+    call: trip.AllocatorCall,
+    case: trip.Case,
+) noreturn {
+    assert(startup.bytes_live == 0);
+    assert(startup.phase == .startup);
     const gpa = startup.allocator();
     const memory = gpa.alloc(u8, setup_len) catch |err| switch (err) {
         error.OutOfMemory => {
@@ -183,18 +221,18 @@ pub fn main(init: std.process.Init.Minimal) void {
     assert(startup.bytes_live == setup_len);
     assert(child_calls == 1);
 
-    enterPhase(&startup, case);
+    enterPhase(startup, phase);
 
     child_calls_armed = child_calls;
     armed = true;
-    const result = callOnce(&startup, gpa, memory, case);
+    const result = callOnce(startup, gpa, memory, call);
     armed = false;
 
     if (case.trips) {
         std.debug.print("startup_trip: {s} returned without tripping: the guard is missing\n", .{case.name});
         std.process.exit(exit_not_tripped);
     }
-    if (!controlHeld(&startup, &fixed, result, case)) {
+    if (!controlHeld(startup, fixed, result, call)) {
         std.debug.print("startup_trip: {s} control failed: granted={s} bytes_live={d} child calls={d}\n", .{
             case.name, if (result.ok) "yes" else "no", startup.bytes_live, child_calls - child_calls_armed,
         });
@@ -227,13 +265,13 @@ fn caseFromArguments(arguments: std.process.Args) ?trip.Case {
     return trip.cases[index];
 }
 
-fn enterPhase(startup: *cc.StartupAllocator, case: trip.Case) void {
+fn enterPhase(startup: *cc.StartupAllocator, phase: trip.Phase) void {
     assert(startup.phase == .startup);
     assert(!armed);
-    if (case.phase != .startup) startup.finishStartup();
-    if (case.phase == .shutdown) startup.beginShutdown();
-    assert(std.mem.eql(u8, @tagName(startup.phase), @tagName(case.phase)));
-    assert(startup.allocationAllowed() == (case.phase == .startup));
+    if (phase != .startup) startup.finishStartup();
+    if (phase == .shutdown) startup.beginShutdown();
+    assert(std.mem.eql(u8, @tagName(startup.phase), @tagName(phase)));
+    assert(startup.allocationAllowed() == (phase == .startup));
 }
 
 const CallResult = struct {
@@ -243,11 +281,11 @@ const CallResult = struct {
 
 /// Makes the case's one call; nothing else runs while `armed` is set. Every size differs
 /// from the live 16 bytes, so std.mem.Allocator passes each call to the vtable.
-fn callOnce(startup: *cc.StartupAllocator, gpa: std.mem.Allocator, memory: []u8, case: trip.Case) CallResult {
+fn callOnce(startup: *cc.StartupAllocator, gpa: std.mem.Allocator, memory: []u8, call: trip.AllocatorCall) CallResult {
     assert(armed);
     assert(child_calls == child_calls_armed);
     assert(memory.len == setup_len);
-    return switch (case.call) {
+    return switch (call) {
         .alloc => if (gpa.alloc(u8, 8)) |_| .{ .ok = true } else |err| switch (err) {
             error.OutOfMemory => .{ .ok = false },
         },
@@ -281,7 +319,7 @@ fn callOnce(startup: *cc.StartupAllocator, gpa: std.mem.Allocator, memory: []u8,
 
 /// The live bytes a control's call leaves, or null for a call no control makes. The
 /// comptime block above checks every control case has one.
-fn bytesExpected(call: trip.Call) ?u64 {
+fn bytesExpected(call: trip.AllocatorCall) ?u64 {
     comptime assert(setup_len == 16);
     const bytes: ?u64 = switch (call) {
         .alloc => setup_len + 8,
@@ -301,12 +339,11 @@ fn controlHeld(
     startup: *const cc.StartupAllocator,
     fixed: *const std.heap.FixedBufferAllocator,
     result: CallResult,
-    case: trip.Case,
+    call: trip.AllocatorCall,
 ) bool {
-    assert(!case.trips);
     assert(!armed);
     // The comptime block at the top proves every control's call has an expectation.
-    const bytes_or_null = bytesExpected(case.call);
+    const bytes_or_null = bytesExpected(call);
     assert(bytes_or_null != null);
     const bytes_expected = bytes_or_null.?;
     if (!result.ok) return false;
@@ -314,5 +351,208 @@ fn controlHeld(
     if (startup.bytes_live != bytes_expected) return false;
     // A free of the child's last allocation hands its bytes back.
     if (bytes_expected == 0 and fixed.end_index != 0) return false;
+    return true;
+}
+
+const connections = cc.live.connections;
+const Entry = connections.Entry;
+
+/// Whether the table allows `call`: the controls, on an entry in use. The cases file says
+/// the same through each case's outcome, and the comptime block at the top checks the two
+/// agree.
+fn tableCallAllowed(call: trip.TableCall) bool {
+    const allowed = switch (call) {
+        .release_reading,
+        .get_reading,
+        .set_state_to_writing,
+        .release_writing,
+        .get_writing,
+        .set_state_to_reading,
+        => true,
+        .release_free,
+        .get_free,
+        .set_state_free,
+        .release_free_stale_socket,
+        .get_free_stale_socket,
+        .set_state_to_free,
+        .release_out_of_range,
+        .get_out_of_range,
+        .set_state_out_of_range,
+        => false,
+    };
+    // Every allowed call names an entry in use; every forbidden one names the free entry,
+    // a move to free, or an id out of range.
+    assert(allowed == (tableCallId(call) != trip.free_id and call != .set_state_to_free and
+        tableCallId(call) < trip.table_size));
+    return allowed;
+}
+
+/// The id the call names.
+fn tableCallId(call: trip.TableCall) u32 {
+    const id: u32 = switch (call) {
+        .release_free, .get_free, .set_state_free => trip.free_id,
+        .release_free_stale_socket, .get_free_stale_socket => trip.free_id,
+        .release_out_of_range, .get_out_of_range, .set_state_out_of_range => trip.table_size,
+        .release_reading, .get_reading, .set_state_to_writing, .set_state_to_free => trip.reading_id,
+        .release_writing, .get_writing, .set_state_to_reading => trip.writing_id,
+    };
+    assert(id <= trip.table_size);
+    assert(id != trip.free_id or call != .set_state_to_free);
+    return id;
+}
+
+fn socketOf(id: u32) connections.Socket {
+    assert(id < trip.table_size);
+    const socket = trip.socket_base + @as(connections.Socket, @intCast(id));
+    assert(socket >= 0);
+    return socket;
+}
+
+/// Builds a table of `table_size` entries during startup, acquires every entry, moves
+/// `writing_id` to writing, releases `free_id`, ends startup, and makes the case's one call.
+fn runTableCase(startup: *cc.StartupAllocator, call: trip.TableCall, case: trip.Case) noreturn {
+    assert(startup.bytes_live == 0);
+    assert(startup.phase == .startup);
+    var table = connections.Table.init(startup.allocator(), trip.table_size) catch |err| switch (err) {
+        error.OutOfMemory => {
+            std.debug.print("startup_trip: {s} setup could not allocate the table\n", .{case.name});
+            std.process.exit(exit_setup_failed);
+        },
+    };
+    var id: u32 = 0;
+    while (id < trip.table_size) : (id += 1) {
+        const acquired = table.acquire(socketOf(id)) catch |err| switch (err) {
+            error.TableFull => {
+                std.debug.print("startup_trip: {s} setup found the table full\n", .{case.name});
+                std.process.exit(exit_setup_failed);
+            },
+        };
+        assert(acquired == id);
+    }
+    assert(id == trip.table_size);
+    table.setState(trip.writing_id, .writing);
+    assert(table.release(trip.free_id) == socketOf(trip.free_id));
+    startup.finishStartup();
+    table.assertInvariants();
+    assert(table.count() == trip.table_size - 1);
+    assert(table.entries[trip.free_id].state == .free);
+    assert(table.entries[trip.reading_id].state == .reading);
+    assert(table.entries[trip.writing_id].state == .writing);
+    if (call == .release_free_stale_socket or call == .get_free_stale_socket) {
+        // A valid-looking socket in a free entry, as a stale field would leave.
+        table.entries[trip.free_id].socket = socketOf(trip.free_id);
+    }
+    var before: [trip.table_size]Entry = undefined;
+    @memcpy(&before, table.entries);
+
+    child_calls_armed = child_calls;
+    armed = true;
+    const socket = callTable(&table, call);
+    armed = false;
+
+    if (case.trips) {
+        std.debug.print("startup_trip: {s} returned without tripping: the check is missing\n", .{case.name});
+        std.process.exit(exit_not_tripped);
+    }
+    if (!tableControlHeld(&table, &before, call, socket)) {
+        std.debug.print("startup_trip: {s} control failed: count={d} child calls={d}\n", .{
+            case.name, table.count(), child_calls - child_calls_armed,
+        });
+        std.process.exit(exit_control_failed);
+    }
+    std.process.exit(trip.exit_finished);
+}
+
+/// Makes the case's one table call on the id it names; nothing else runs while `armed` is
+/// set. Returns the socket the call handed back, or -1 for a call that returns none.
+fn callTable(table: *connections.Table, call: trip.TableCall) connections.Socket {
+    assert(armed);
+    assert(child_calls == child_calls_armed);
+    const id: connections.PeerId = tableCallId(call);
+    return switch (call) {
+        .release_free,
+        .release_free_stale_socket,
+        .release_out_of_range,
+        .release_reading,
+        .release_writing,
+        => table.release(id),
+        .get_free,
+        .get_free_stale_socket,
+        .get_out_of_range,
+        .get_reading,
+        .get_writing,
+        => table.get(id).socket,
+        .set_state_free, .set_state_out_of_range, .set_state_to_writing => state: {
+            table.setState(id, .writing);
+            break :state -1;
+        },
+        .set_state_to_free => state: {
+            table.setState(id, .free);
+            break :state -1;
+        },
+        .set_state_to_reading => state: {
+            table.setState(id, .reading);
+            break :state -1;
+        },
+    };
+}
+
+/// A control's call must touch no allocator, hand back the right socket, change only the
+/// entry it names, and leave that entry as the call implies, with the free stack and the
+/// entries agreeing.
+fn tableControlHeld(
+    table: *const connections.Table,
+    before: *const [trip.table_size]Entry,
+    call: trip.TableCall,
+    socket: connections.Socket,
+) bool {
+    assert(!armed);
+    const id = tableCallId(call);
+    assert(id < trip.table_size and id != trip.free_id);
+    if (child_calls != child_calls_armed) return false;
+    var other: u32 = 0;
+    while (other < trip.table_size) : (other += 1) {
+        if (other == id) continue;
+        if (!std.meta.eql(table.entries[other], before[other])) return false;
+    }
+    assert(other == trip.table_size);
+    const entry = table.entries[id];
+    const expected: Entry = switch (call) {
+        .release_reading, .release_writing => .{ .socket = -1, .state = .free },
+        .get_reading, .get_writing => before[id],
+        .set_state_to_writing => .{ .socket = before[id].socket, .state = .writing },
+        .set_state_to_reading => .{ .socket = before[id].socket, .state = .reading },
+        else => unreachable, // tableCallAllowed: the comptime block admits only these.
+    };
+    if (!std.meta.eql(entry, expected)) return false;
+    const released = call == .release_reading or call == .release_writing;
+    const socket_expected: connections.Socket = if (call == .get_reading or call == .get_writing or released)
+        socketOf(id)
+    else
+        -1;
+    if (socket != socket_expected) return false;
+    const count_expected: u32 = if (released) trip.table_size - 2 else trip.table_size - 1;
+    if (table.count() != count_expected) return false;
+    if (released and table.free_ids[table.free_count - 1] != id) return false;
+    return tableAgrees(table);
+}
+
+/// Whether the free stack and the entries agree: every stacked id names a free entry and is
+/// stacked once, and every free entry is stacked. The table's own `assertInvariants`
+/// checks the same, but a failed assertion here would read as a panic outside the call.
+fn tableAgrees(table: *const connections.Table) bool {
+    assert(!armed);
+    assert(table.entries.len == trip.table_size);
+    if (table.capacity() != trip.table_size) return false;
+    if (table.free_count > trip.table_size) return false;
+    var stacked: [trip.table_size]bool = @splat(false);
+    for (table.free_ids[0..table.free_count]) |id| {
+        if (id >= trip.table_size) return false;
+        if (stacked[id] or table.entries[id].state != .free) return false;
+        stacked[id] = true;
+    }
+    for (table.entries, stacked) |entry, is_stacked| {
+        if ((entry.state == .free) != is_stacked) return false;
+    }
     return true;
 }
