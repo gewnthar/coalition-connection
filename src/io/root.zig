@@ -26,8 +26,15 @@
 //! caller sends the rest. A send's peer stays in the connection table, with its socket
 //! open, until the send's completion arrives.
 //!
+//! Accepts (roadmap core 3a): an accept waits on a listening socket until a connection
+//! arrives, then completes with the new connection's `PeerId`: the I/O type itself takes
+//! an entry in the connection table for it, so the caller never holds a raw socket. When
+//! the table is full, the connection is closed at once and the accept completes with
+//! `error.TableFull`; the caller decides when to accept again. Each accept takes one
+//! connection: to keep accepting, submit another.
+//!
 //! Placeholders: `execute` stands in for database traffic until roadmap core 11 frames
-//! Postgres over sockets, and the contract has no cancel yet; core 3 adds socket reads and
+//! Postgres over sockets, and the contract has no cancel yet; core 3b adds socket reads and
 //! cancellation. Components should not build on `execute`.
 //!
 //! Random bytes: the operating system's CSPRNG in production, the seeded PRNG in the
@@ -45,8 +52,8 @@
 //! every new one against it.
 //!
 //! Status: the contract, the simulator, and the real type for Linux (`real.zig`), which
-//! meets the contract with an io_uring ring for sends. The contract grows (accept, receive,
-//! connect, timers) slice by slice.
+//! meets the contract with an io_uring ring for sends and accepts. The contract grows
+//! (receive, cancel, connect, timers) slice by slice.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -61,6 +68,11 @@ pub const Instant = u64;
 /// Index of a connection in the startup-sized connection table.
 pub const PeerId = u32;
 
+/// A Linux file descriptor. The event loop is io_uring, so the boundary is Linux-only, and
+/// the type is spelled out instead of taken from a portable layer whose size varies by
+/// target.
+pub const Socket = i32;
+
 /// Chosen by the caller and handed back with the completion, like io_uring's user_data.
 pub const OperationId = u64;
 
@@ -68,11 +80,17 @@ pub const SubmitError = error{QueueFull};
 pub const SendError = error{ PeerDown, Backpressure };
 pub const DatabaseError = error{ Unavailable, Timeout };
 
+/// Why an accept handed back no connection. `TableFull`: a connection arrived, but every
+/// entry of the connection table is in use, so it was closed. `PeerDown`: the connection
+/// failed before it could be accepted. `Backpressure`: the system is short of descriptors
+/// or memory, or the call was interrupted; try again later.
+pub const AcceptError = error{ TableFull, PeerDown, Backpressure };
+
 /// The operating system could not supply random bytes. Production callers refuse the
 /// operation that needed them; they never fall back to a weaker source.
 pub const RandomError = error{RandomUnavailable};
 
-pub const Kind = enum(u8) { send, execute };
+pub const Kind = enum(u8) { send, execute, accept };
 
 /// One outgoing message to a peer.
 pub const Send = struct {
@@ -85,9 +103,15 @@ pub const Execute = struct {
     statement: []const u8,
 };
 
+/// Take one connection from a listening socket.
+pub const Accept = struct {
+    listener: Socket,
+};
+
 pub const Operation = union(Kind) {
     send: Send,
     execute: Execute,
+    accept: Accept,
 };
 
 pub const Submission = struct {
@@ -95,10 +119,12 @@ pub const Submission = struct {
     operation: Operation,
 };
 
-/// The outcome of one operation. A send reports the bytes it sent.
+/// The outcome of one operation. A send reports the bytes it sent; an accept, the new
+/// connection's entry in the connection table.
 pub const Result = union(Kind) {
     send: SendError!u32,
     execute: DatabaseError!void,
+    accept: AcceptError!PeerId,
 };
 
 pub const Completion = struct {

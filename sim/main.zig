@@ -5,7 +5,8 @@
 //! Completions arrive after seeded delays and out of order, with faults of every kind and
 //! short sends injected, and the run checks its invariants every tick: each operation
 //! completes exactly once, with the kind it was submitted as. Then a second workload drives
-//! the connection table past its limit and empties it again (sim/connections.zig). As
+//! the connection table past its limit and empties it again (sim/connections.zig), and a
+//! third fills it through simulated accepts (sim/accepts.zig). As
 //! components land, each one joins this loop as a real workload (logins, ESI polling, live
 //! updates). A failing seed replays exactly.
 
@@ -14,6 +15,7 @@ const assert = std.debug.assert;
 const cc = @import("coalition_connection");
 const build_options = @import("build_options");
 const connection_workload = @import("connections.zig");
+const accept_workload = @import("accepts.zig");
 
 const io = cc.io;
 const constants = cc.constants;
@@ -99,6 +101,8 @@ fn checkCompletion(run: *Run, completion: io.Completion) SimError!void {
         .execute => |executed| executed catch |err| switch (err) {
             error.Unavailable, error.Timeout => {}, // Counted in sim.faults.
         },
+        // This workload submits no accepts; the kind check above already refused one.
+        .accept => return error.InvariantBroken,
     }
 }
 
@@ -183,4 +187,12 @@ pub fn main() SimError!void {
     std.debug.print("sim: connections arrivals={d} accepted={d} refused={d}\n", .{ table.arrivals, table.accepted, table.refused });
     std.debug.print("sim: connections departures={d} reused={d} peak={d}\n", .{ table.departures, table.reused, table.peak });
     std.debug.print("sim: connections trace={x:0>16} ok\n", .{table.trace});
+
+    const accepts = accept_workload.run(seed) catch |err| {
+        std.debug.print("sim: seed={d} failed in the accept workload\n", .{seed});
+        return err;
+    };
+    std.debug.print("sim: accepts submitted={d} accepted={d} refused={d}\n", .{ accepts.submitted, accepts.accepted, accepts.refused });
+    std.debug.print("sim: accepts peer_down={d} backpressure={d} departures={d}\n", .{ accepts.peer_down, accepts.backpressure, accepts.departures });
+    std.debug.print("sim: accepts trace={x:0>16} ok\n", .{accepts.trace});
 }

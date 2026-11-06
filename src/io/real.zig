@@ -18,6 +18,13 @@
 //! ending the process with `SIGPIPE`. Every errno maps to `PeerDown`, `Backpressure` or a
 //! stop with its reason (`sendError`).
 //!
+//! Accepts: `IORING_OP_ACCEPT` on the caller's listening socket, with `SOCK_CLOEXEC` on the
+//! new socket. The completion takes an entry in the connection table for the new socket and
+//! hands back its `PeerId`. When the table is full, the new socket is closed at once, so the
+//! client sees the connection end instead of waiting, and the accept completes with
+//! `error.TableFull`; `refused` counts these. Every errno maps to `PeerDown`,
+//! `Backpressure` or a stop with its reason (`acceptError`).
+//!
 //! `execute` is a simulator placeholder until Postgres is framed over sockets (roadmap
 //! core 11); submitting one here stops the process with that reason.
 //!
@@ -31,7 +38,7 @@
 //! buffer, so a partly filled buffer can't be mistaken for a random one. There is no
 //! fallback source.
 //!
-//! Inputs: the connection table, submissions, buffers to fill.
+//! Inputs: the connection table, submissions, listening sockets, buffers to fill.
 //! Outputs: completions, time readings and random bytes.
 //! Limits: `constants.io_operations_in_flight_max` operations in flight; sends of at most
 //! `constants.http_response_size_max` bytes; 1 to `constants.io_random_bytes_max` random
@@ -60,7 +67,9 @@ const slots_count: u32 = constants.io_operations_in_flight_max;
 /// One operation in flight: what its completion needs to be checked and handed back.
 const Slot = struct {
     id: io.OperationId,
-    /// Bytes the send was given; the kernel never reports more.
+    /// A send or an accept: `submit` refuses every other kind.
+    kind: io.Kind,
+    /// Bytes a send was given; the kernel never reports more. 0 for an accept.
     length: u32,
     in_use: bool,
 };
@@ -110,8 +119,9 @@ pub const Real = struct {
     /// Random bytes handed out so far, for tests and metrics.
     random_bytes: u64,
     ring: linux.IoUring,
-    /// Maps a send's `PeerId` to its socket. Owned by the caller; outlives this.
-    table: *const connections.Table,
+    /// Maps a send's `PeerId` to its socket, and takes an entry for each accepted
+    /// connection. Owned by the caller; outlives this.
+    table: *connections.Table,
     slots: [slots_count]Slot,
     /// Free slot indices, a stack: `free_slots[0..free_count]` are not in use.
     free_slots: [slots_count]u32,
@@ -121,10 +131,12 @@ pub const Real = struct {
     /// Times the kernel refused submissions for a moment (short of memory, or a signal);
     /// they stay queued and go in at the next `submit` or `poll`. For metrics.
     enters_deferred: u64,
+    /// Connections accepted and closed at once because the table was full. For metrics.
+    refused: u64,
 
     /// Sets up the ring. `startup` proves the call happens during startup; nothing is
     /// mapped or allocated afterwards.
-    pub fn init(startup: *const StartupAllocator, table: *const connections.Table) InitError!Real {
+    pub fn init(startup: *const StartupAllocator, table: *connections.Table) InitError!Real {
         comptime assertLinux();
         assert(startup.allocationAllowed());
         assert(table.capacity() > 0);
@@ -135,12 +147,13 @@ pub const Real = struct {
             .random_bytes = 0,
             .ring = ring,
             .table = table,
-            .slots = @splat(.{ .id = 0, .length = 0, .in_use = false }),
+            .slots = @splat(.{ .id = 0, .kind = .send, .length = 0, .in_use = false }),
             .free_slots = undefined,
             .free_count = slots_count,
             .submitted = 0,
             .completed = 0,
             .enters_deferred = 0,
+            .refused = 0,
         };
         // Push the indices in reverse, so the first submission takes slot 0.
         var position: u32 = 0;
@@ -195,28 +208,20 @@ pub const Real = struct {
     /// bytes. With every slot in use, returns `error.QueueFull` and changes nothing.
     pub fn submit(self: *Real, submission: io.Submission) io.SubmitError!void {
         comptime assertLinux();
-        const send = switch (submission.operation) {
-            .send => |send| send,
-            .execute => std.debug.panic("io.real: execute is a simulator placeholder; " ++
-                "the real type has no database traffic until Postgres is framed over sockets", .{}),
-        };
-        assert(send.bytes.len > 0);
-        assert(send.bytes.len <= constants.http_response_size_max);
         const in_flight_before = self.inFlight();
+        // Looked up before anything changes: a peer not in the table is a caller's bug.
+        const socket = self.socketFor(submission.operation);
         if (self.free_count == 0) return error.QueueFull;
 
-        // Looked up before anything changes: a peer not in the table is a caller's bug.
-        const socket = self.table.get(send.peer).socket;
         // Each queued entry belongs to an operation in flight, and fewer than slots_count
         // are in flight, so the submission queue has room.
         assert(self.ring.sq_ready() < slots_count);
         const sqe = self.ring.get_sqe() catch unreachable;
         const index = self.free_slots[self.free_count - 1];
         assert(!self.slots[index].in_use);
-        sqe.prep_send(socket, send.bytes, linux.MSG.NOSIGNAL);
+        self.slots[index] = prepare(sqe, submission, socket);
         sqe.user_data = index;
         self.free_count -= 1;
-        self.slots[index] = .{ .id = submission.id, .length = @intCast(send.bytes.len), .in_use = true };
         self.submitted += 1;
         if (!enter(&self.ring)) self.enters_deferred += 1;
         assert(self.inFlight() == in_flight_before + 1);
@@ -258,9 +263,29 @@ pub const Real = struct {
         assert(self.random_bytes == before + buffer.len);
     }
 
+    /// The socket an operation acts on, checked before anything changes: a send's peer from
+    /// the table (`get` asserts it is in use), an accept's listener as given. `execute`
+    /// stops the process: it is a simulator placeholder.
+    fn socketFor(self: *const Real, operation: io.Operation) io.Socket {
+        const socket: io.Socket = switch (operation) {
+            .send => |send| send: {
+                assert(send.bytes.len > 0);
+                assert(send.bytes.len <= constants.http_response_size_max);
+                break :send self.table.get(send.peer).socket;
+            },
+            .accept => |accept| accept.listener,
+            .execute => std.debug.panic("io.real: execute is a simulator placeholder; " ++
+                "the real type has no database traffic until Postgres is framed over sockets", .{}),
+        };
+        assert(socket >= 0);
+        assert(self.free_count <= slots_count);
+        return socket;
+    }
+
     /// Frees the slot a completion names and builds its `io.Completion`.
     fn complete(self: *Real, cqe: linux.io_uring_cqe) io.Completion {
-        // user_data is always a slot index this type wrote, and a send posts one completion.
+        // user_data is always a slot index this type wrote, and a send or an accept posts
+        // one completion.
         assert(cqe.user_data < slots_count);
         assert(cqe.flags & linux.IORING_CQE_F_MORE == 0);
         const index: u32 = @intCast(cqe.user_data);
@@ -271,9 +296,90 @@ pub const Real = struct {
         self.free_count += 1;
         self.completed += 1;
         assert(self.free_count <= slots_count);
-        return .{ .id = slot.id, .result = .{ .send = sendResult(cqe.res, slot.length) } };
+        const result: io.Result = switch (slot.kind) {
+            .send => .{ .send = sendResult(cqe.res, slot.length) },
+            .accept => .{ .accept = self.acceptResult(cqe.res) },
+            // `socketFor` stops the process before an execute can take a slot.
+            .execute => unreachable,
+        };
+        return .{ .id = slot.id, .result = result };
+    }
+
+    /// An accept's result from its completion: the new connection's entry, or the error its
+    /// errno means. A full table closes the new socket and counts the refusal.
+    fn acceptResult(self: *Real, res: i32) io.AcceptError!io.PeerId {
+        assert(res > -4096);
+        if (res < 0) {
+            const err: linux.E = @fromBackingInt(@intCast(-res));
+            return acceptError(err);
+        }
+        const socket: io.Socket = res;
+        const count_before = self.table.count();
+        const peer = self.table.acquire(socket) catch |err| switch (err) {
+            error.TableFull => {
+                assert(count_before == self.table.capacity());
+                // Linux releases the descriptor even when close is interrupted or reports
+                // an I/O error, so neither is retried: a retry could close a descriptor
+                // handed out since. The kernel handed this one over a moment ago and
+                // nothing else holds it, so any other errno is a bug in this file.
+                const closed = linux.errno(linux.close(socket));
+                switch (closed) {
+                    .SUCCESS, .INTR, .IO => {},
+                    else => std.debug.panic("close of a refused connection: {t}", .{closed}),
+                }
+                self.refused += 1;
+                return error.TableFull;
+            },
+        };
+        assert(self.table.count() == count_before + 1);
+        assert(self.table.get(peer).socket == socket);
+        return peer;
     }
 };
+
+/// Fills a submission entry for a send or an accept, and returns the slot that tracks it.
+fn prepare(sqe: *linux.io_uring_sqe, submission: io.Submission, socket: io.Socket) Slot {
+    assert(socket >= 0);
+    const slot: Slot = switch (submission.operation) {
+        .send => |send| send: {
+            sqe.prep_send(socket, send.bytes, linux.MSG.NOSIGNAL);
+            break :send .{ .id = submission.id, .kind = .send, .length = @intCast(send.bytes.len), .in_use = true };
+        },
+        .accept => accept: {
+            // No peer address is asked for: the app listens only where nginx reaches it.
+            sqe.prep_accept(socket, null, null, linux.SOCK.CLOEXEC);
+            break :accept .{ .id = submission.id, .kind = .accept, .length = 0, .in_use = true };
+        },
+        // `socketFor` stopped the process already.
+        .execute => unreachable,
+    };
+    assert(slot.kind == @as(io.Kind, submission.operation));
+    assert(sqe.fd == socket);
+    return slot;
+}
+
+/// Maps a failed accept's errno. Every errno has an explicit outcome.
+fn acceptError(err: linux.E) io.AcceptError {
+    assert(err != .SUCCESS);
+    const result: io.AcceptError = switch (err) {
+        // The connection failed before it was taken: it aborted, a firewall refused it, or
+        // Linux passed on a network error already pending on it (accept(2), "Error
+        // handling"). The listener is fine; the caller accepts again.
+        .CONNABORTED, .PERM, .PROTO, .NOPROTOOPT, .NONET => error.PeerDown,
+        .HOSTDOWN, .HOSTUNREACH, .NETDOWN, .NETUNREACH, .TIMEDOUT => error.PeerDown,
+        // Out of descriptors, buffers or memory, or interrupted: try again later.
+        .MFILE, .NFILE, .NOBUFS, .NOMEM, .INTR, .AGAIN => error.Backpressure,
+        // A bad or non-listening socket, a bad address or flag, or a cancel this type never
+        // asks for: each means a bug in this file or its caller.
+        .BADF, .NOTSOCK, .INVAL, .FAULT, .OPNOTSUPP, .CANCELED => {
+            std.debug.panic("io_uring accept: {t}", .{err});
+        },
+        else => std.debug.panic("io_uring accept: undocumented errno {t}", .{err}),
+    };
+    // Only a full table, never an errno, means TableFull.
+    assert(result == error.PeerDown or result == error.Backpressure);
+    return result;
+}
 
 /// Sets up a ring of `slots_count` entries, mapping each failure to `InitError`.
 fn ringInit() InitError!linux.IoUring {
@@ -792,6 +898,147 @@ test "real: the memory table covers the ring the kernel maps" {
 }
 
 const ring_row_name = "io_uring ring and in-flight table of the real I/O type";
+
+/// A TCP listener on 127.0.0.1, at a port the kernel picks, and a client socket for it.
+const Loopback = struct {
+    listener: linux.fd_t,
+    client: linux.fd_t,
+    address: linux.sockaddr.in,
+
+    fn open(self: *Loopback) !void {
+        const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+        self.listener = try socketOpen(linux.AF.INET, flags);
+        errdefer _ = linux.close(self.listener);
+        self.address = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+        var length: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(self.listener, @ptrCast(&self.address), length)));
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(self.listener, 4)));
+        // Port 0 asked the kernel to pick one; read back which.
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockname(self.listener, @ptrCast(&self.address), &length)));
+        try testing.expect(self.address.port != 0);
+        self.client = try socketOpen(linux.AF.INET, flags);
+        assert(self.listener >= 0 and self.client >= 0);
+        assert(self.address.family == linux.AF.INET);
+    }
+
+    /// Connects the client. On loopback the kernel completes the handshake from the
+    /// listener's backlog, before anything accepts it.
+    fn connect(self: *Loopback) !void {
+        assert(self.client >= 0);
+        assert(self.address.port != 0);
+        const rc = linux.connect(self.client, @ptrCast(&self.address), @sizeOf(linux.sockaddr.in));
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    }
+
+    fn close(self: *Loopback) void {
+        assert(self.listener >= 0);
+        assert(self.client >= 0);
+        _ = linux.close(self.client);
+        _ = linux.close(self.listener);
+    }
+};
+
+fn socketOpen(domain: u32, flags: u32) !linux.fd_t {
+    assert(flags & linux.SOCK.CLOEXEC != 0);
+    const rc = linux.socket(domain, flags, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const socket: linux.fd_t = @intCast(rc);
+    assert(socket >= 0);
+    return socket;
+}
+
+test "real: an accept over a loopback listener takes a table entry for the connection" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    var loopback: Loopback = undefined;
+    try loopback.open();
+    defer loopback.close();
+
+    try fixture.real.submit(.{ .id = 9, .operation = .{ .accept = .{ .listener = loopback.listener } } });
+    try testing.expectEqual(@as(u32, 1), fixture.real.inFlight());
+    try loopback.connect();
+    var completions: [2]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(io.OperationId, 9), completions[0].id);
+    const peer = try completions[0].result.accept;
+    try testing.expectEqual(@as(u32, 2), fixture.table.count());
+    try testing.expectEqual(connections.State.reading, fixture.table.get(peer).state);
+    try testing.expectEqual(@as(u64, 0), fixture.real.refused);
+
+    // The entry's socket is the accepted end: bytes from the client arrive on it.
+    const socket = fixture.table.get(peer).socket;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.write(loopback.client, "hi", 2)));
+    var received: [4]u8 = undefined;
+    const rc = linux.read(socket, &received, received.len);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try testing.expectEqualStrings("hi", received[0..rc]);
+    try testing.expectEqual(socket, fixture.table.release(peer));
+    _ = linux.close(socket);
+}
+
+test "real: an accept into a full table closes the connection and completes with TableFull" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    var loopback: Loopback = undefined;
+    try loopback.open();
+    defer loopback.close();
+    // Fill the rest of the table with descriptor numbers no test opens; the table never
+    // touches them.
+    var fillers: [3]io.PeerId = undefined;
+    for (&fillers, 0..) |*filler, index| filler.* = try fixture.table.acquire(@intCast(1_000_000 + index));
+    try testing.expectEqual(fixture.table.capacity(), fixture.table.count());
+
+    try fixture.real.submit(.{ .id = 4, .operation = .{ .accept = .{ .listener = loopback.listener } } });
+    try loopback.connect();
+    var completions: [1]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(io.OperationId, 4), completions[0].id);
+    try testing.expectError(error.TableFull, completions[0].result.accept);
+    try testing.expectEqual(@as(u64, 1), fixture.real.refused);
+    try testing.expectEqual(fixture.table.capacity(), fixture.table.count());
+
+    // The refused connection was closed before the completion was handed back, so the
+    // client reads end of stream at once. Without waiting: an open connection fails the
+    // test with EAGAIN instead of hanging it.
+    var received: [1]u8 = undefined;
+    const rc = linux.recvfrom(loopback.client, &received, received.len, linux.MSG.DONTWAIT, null, null);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try testing.expectEqual(@as(usize, 0), rc);
+    for (fillers) |filler| _ = fixture.table.release(filler);
+}
+
+test "real: every accept errno has an outcome" {
+    try testing.expectEqual(error.PeerDown, acceptError(.CONNABORTED));
+    try testing.expectEqual(error.PeerDown, acceptError(.PERM));
+    try testing.expectEqual(error.PeerDown, acceptError(.PROTO));
+    try testing.expectEqual(error.PeerDown, acceptError(.NOPROTOOPT));
+    try testing.expectEqual(error.PeerDown, acceptError(.NONET));
+    try testing.expectEqual(error.PeerDown, acceptError(.HOSTDOWN));
+    try testing.expectEqual(error.PeerDown, acceptError(.HOSTUNREACH));
+    try testing.expectEqual(error.PeerDown, acceptError(.NETDOWN));
+    try testing.expectEqual(error.PeerDown, acceptError(.NETUNREACH));
+    try testing.expectEqual(error.PeerDown, acceptError(.TIMEDOUT));
+    try testing.expectEqual(error.Backpressure, acceptError(.MFILE));
+    try testing.expectEqual(error.Backpressure, acceptError(.NFILE));
+    try testing.expectEqual(error.Backpressure, acceptError(.NOBUFS));
+    try testing.expectEqual(error.Backpressure, acceptError(.NOMEM));
+    try testing.expectEqual(error.Backpressure, acceptError(.INTR));
+    try testing.expectEqual(error.Backpressure, acceptError(.AGAIN));
+}
+
+test "real: a failed accept changes no table entry" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    const aborted = -@as(i32, @backingInt(linux.E.CONNABORTED));
+    const short = -@as(i32, @backingInt(linux.E.MFILE));
+    try testing.expectError(error.PeerDown, fixture.real.acceptResult(aborted));
+    try testing.expectError(error.Backpressure, fixture.real.acceptResult(short));
+    try testing.expectEqual(@as(u32, 1), fixture.table.count());
+    try testing.expectEqual(@as(u64, 0), fixture.real.refused);
+}
 
 /// Returns `-errno` the way a raw syscall does.
 fn syscallError(err: linux.E) usize {
