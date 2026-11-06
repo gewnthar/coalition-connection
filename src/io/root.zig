@@ -83,7 +83,8 @@ pub const DatabaseError = error{ Unavailable, Timeout };
 /// Why an accept handed back no connection. `TableFull`: a connection arrived, but every
 /// entry of the connection table is in use, so it was closed. `PeerDown`: the connection
 /// failed before it could be accepted. `Backpressure`: the system is short of descriptors
-/// or memory, or the call was interrupted; try again later.
+/// or memory, or the call was interrupted; try again later, not at once, or the retry
+/// fails the same way.
 pub const AcceptError = error{ TableFull, PeerDown, Backpressure };
 
 /// The operating system could not supply random bytes. Production callers refuse the

@@ -171,7 +171,9 @@ pub const Real = struct {
 
     /// Closes the ring. Call it during shutdown only, once every operation has completed:
     /// the kernel tears a ring down in the background, so a send still in flight could
-    /// read its bytes after this returns.
+    /// read its bytes after this returns. An accept completes only when a connection
+    /// arrives, and the contract has no cancel until core 3b, so until then a caller
+    /// stops submitting accepts and waits for the last one before shutting down.
     pub fn deinit(self: *Real) void {
         comptime assertLinux();
         assert(self.ring.fd >= 0);
@@ -296,11 +298,12 @@ pub const Real = struct {
         self.free_count += 1;
         self.completed += 1;
         assert(self.free_count <= slots_count);
+        assert(slot.kind != .execute); // `prepare` never writes one.
         const result: io.Result = switch (slot.kind) {
             .send => .{ .send = sendResult(cqe.res, slot.length) },
             .accept => .{ .accept = self.acceptResult(cqe.res) },
-            // `socketFor` stops the process before an execute can take a slot.
-            .execute => unreachable,
+            .execute => unreachable, // Asserted above.
+
         };
         return .{ .id = slot.id, .result = result };
     }
@@ -354,6 +357,7 @@ fn prepare(sqe: *linux.io_uring_sqe, submission: io.Submission, socket: io.Socke
         .execute => unreachable,
     };
     assert(slot.kind == @as(io.Kind, submission.operation));
+    assert(slot.kind != .execute);
     assert(sqe.fd == socket);
     return slot;
 }
@@ -364,13 +368,17 @@ fn acceptError(err: linux.E) io.AcceptError {
     const result: io.AcceptError = switch (err) {
         // The connection failed before it was taken: it aborted, a firewall refused it, or
         // Linux passed on a network error already pending on it (accept(2), "Error
-        // handling"). The listener is fine; the caller accepts again.
+        // handling", and the other errors its ERRORS section says some kernels return).
+        // The listener is fine; the caller accepts again.
         .CONNABORTED, .PERM, .PROTO, .NOPROTOOPT, .NONET => error.PeerDown,
         .HOSTDOWN, .HOSTUNREACH, .NETDOWN, .NETUNREACH, .TIMEDOUT => error.PeerDown,
+        .NOSR, .SOCKTNOSUPPORT, .PROTONOSUPPORT => error.PeerDown,
         // Out of descriptors, buffers or memory, or interrupted: try again later.
         .MFILE, .NFILE, .NOBUFS, .NOMEM, .INTR, .AGAIN => error.Backpressure,
         // A bad or non-listening socket, a bad address or flag, or a cancel this type never
-        // asks for: each means a bug in this file or its caller.
+        // asks for: each means a bug in this file or its caller. EOPNOTSUPP is on the
+        // pending-error list too, but it also means a listener that isn't a stream socket,
+        // and every listener here is one, so it is treated as that bug.
         .BADF, .NOTSOCK, .INVAL, .FAULT, .OPNOTSUPP, .CANCELED => {
             std.debug.panic("io_uring accept: {t}", .{err});
         },
@@ -917,7 +925,7 @@ const Loopback = struct {
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockname(self.listener, @ptrCast(&self.address), &length)));
         try testing.expect(self.address.port != 0);
         self.client = try socketOpen(linux.AF.INET, flags);
-        assert(self.listener >= 0 and self.client >= 0);
+        assert(self.listener != self.client);
         assert(self.address.family == linux.AF.INET);
     }
 
@@ -962,19 +970,24 @@ test "real: an accept over a loopback listener takes a table entry for the conne
     try pollUntil(&fixture.real, &completions, 1, -1);
     try testing.expectEqual(@as(io.OperationId, 9), completions[0].id);
     const peer = try completions[0].result.accept;
+    // Released first on any failure below, so the fixture's teardown reports nothing false.
+    const socket = fixture.table.get(peer).socket;
+    defer _ = linux.close(fixture.table.release(peer));
     try testing.expectEqual(@as(u32, 2), fixture.table.count());
     try testing.expectEqual(connections.State.reading, fixture.table.get(peer).state);
     try testing.expectEqual(@as(u64, 0), fixture.real.refused);
 
+    // The accepted socket is closed on exec, so a child process never inherits it.
+    const descriptor_flags = linux.fcntl(socket, linux.F.GETFD, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(descriptor_flags));
+    try testing.expect(descriptor_flags & linux.FD_CLOEXEC != 0);
+
     // The entry's socket is the accepted end: bytes from the client arrive on it.
-    const socket = fixture.table.get(peer).socket;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.write(loopback.client, "hi", 2)));
     var received: [4]u8 = undefined;
     const rc = linux.read(socket, &received, received.len);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
     try testing.expectEqualStrings("hi", received[0..rc]);
-    try testing.expectEqual(socket, fixture.table.release(peer));
-    _ = linux.close(socket);
 }
 
 test "real: an accept into a full table closes the connection and completes with TableFull" {
@@ -988,6 +1001,9 @@ test "real: an accept into a full table closes the connection and completes with
     // touches them.
     var fillers: [3]io.PeerId = undefined;
     for (&fillers, 0..) |*filler, index| filler.* = try fixture.table.acquire(@intCast(1_000_000 + index));
+    defer for (fillers) |filler| {
+        _ = fixture.table.release(filler);
+    };
     try testing.expectEqual(fixture.table.capacity(), fixture.table.count());
 
     try fixture.real.submit(.{ .id = 4, .operation = .{ .accept = .{ .listener = loopback.listener } } });
@@ -1000,13 +1016,20 @@ test "real: an accept into a full table closes the connection and completes with
     try testing.expectEqual(fixture.table.capacity(), fixture.table.count());
 
     // The refused connection was closed before the completion was handed back, so the
-    // client reads end of stream at once. Without waiting: an open connection fails the
-    // test with EAGAIN instead of hanging it.
+    // client reads end of stream. Reads never wait, and are retried a bounded number of
+    // times, 1 ms apart, in case the close reaches the client late: a connection left open
+    // fails the test instead of hanging it.
     var received: [1]u8 = undefined;
-    const rc = linux.recvfrom(loopback.client, &received, received.len, linux.MSG.DONTWAIT, null, null);
+    var rc: usize = 0;
+    var attempts: u32 = 0;
+    while (attempts < poll_attempts_max) : (attempts += 1) {
+        rc = linux.recvfrom(loopback.client, &received, received.len, linux.MSG.DONTWAIT, null, null);
+        if (linux.errno(rc) != .AGAIN) break;
+        const pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&pause, null);
+    }
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
     try testing.expectEqual(@as(usize, 0), rc);
-    for (fillers) |filler| _ = fixture.table.release(filler);
 }
 
 test "real: every accept errno has an outcome" {
@@ -1020,6 +1043,9 @@ test "real: every accept errno has an outcome" {
     try testing.expectEqual(error.PeerDown, acceptError(.NETDOWN));
     try testing.expectEqual(error.PeerDown, acceptError(.NETUNREACH));
     try testing.expectEqual(error.PeerDown, acceptError(.TIMEDOUT));
+    try testing.expectEqual(error.PeerDown, acceptError(.NOSR));
+    try testing.expectEqual(error.PeerDown, acceptError(.SOCKTNOSUPPORT));
+    try testing.expectEqual(error.PeerDown, acceptError(.PROTONOSUPPORT));
     try testing.expectEqual(error.Backpressure, acceptError(.MFILE));
     try testing.expectEqual(error.Backpressure, acceptError(.NFILE));
     try testing.expectEqual(error.Backpressure, acceptError(.NOBUFS));

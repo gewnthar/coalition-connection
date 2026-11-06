@@ -40,9 +40,9 @@ const io = @import("root.zig");
 
 const slots_count = constants.io_operations_in_flight_max;
 
-/// The first fake socket an arrival gets. 0 to 2 are left out, as standard input, output
-/// and error would be in a real process.
-const socket_first: io.Socket = 3;
+/// The first fake socket an arrival gets: above any descriptor a test or workload names as
+/// its listener, so an arrival never shares a number with one, as with a real kernel.
+const socket_first: io.Socket = 1 << 16;
 
 /// Arrivals a run may have: every one gets a distinct fake socket that fits `io.Socket`.
 const arrivals_max: u64 = std.math.maxInt(io.Socket) - socket_first;
@@ -67,7 +67,6 @@ pub const Faults = struct {
         const accepts = @as(u64, self.accept_peer_down) + self.accept_backpressure;
         assert(sends >= self.peer_down and sends >= self.backpressure);
         assert(executes >= self.unavailable and executes >= self.timeout);
-        assert(accepts >= self.accept_peer_down and accepts >= self.accept_backpressure);
         return sends + executes + accepts;
     }
 };
@@ -725,11 +724,12 @@ const TableFixture = struct {
 const StartupAllocator = @import("../startup_allocator.zig").StartupAllocator;
 
 fn acceptSubmission(id: io.OperationId) io.Submission {
-    const submission: io.Submission = .{ .id = id, .operation = .{ .accept = .{ .listener = 3 } } };
-    assert(submission.operation == .accept);
-    assert(submission.id == id);
-    return submission;
+    assert(id < slots_count); // The tests below keep at most a table's worth in flight.
+    comptime assert(test_listener < socket_first);
+    return .{ .id = id, .operation = .{ .accept = .{ .listener = test_listener } } };
 }
+
+const test_listener: io.Socket = 3;
 
 /// Ticks until every operation in flight has completed, collecting at most
 /// `completions.len` of them. Returns how many arrived.
@@ -760,8 +760,11 @@ test "sim: accepts take table entries under fresh sockets until the table is ful
     var sockets_seen: [6]io.Socket = @splat(-1);
     var accepted: u32 = 0;
     var refused: u32 = 0;
+    // Arrivals take entries in completion order, so a refusal may come only once all four
+    // entries were taken: a refusal with room left fails here, not only in the totals.
     for (completions) |completion| {
         if (completion.result.accept) |peer| {
+            try testing.expectEqual(@as(u32, 0), refused);
             const socket = fixture.table.get(peer).socket;
             try testing.expect(socket >= socket_first);
             try testing.expect(std.mem.findScalar(io.Socket, &sockets_seen, socket) == null);
@@ -769,6 +772,7 @@ test "sim: accepts take table entries under fresh sockets until the table is ful
             accepted += 1;
         } else |err| {
             try testing.expectEqual(error.TableFull, err);
+            try testing.expectEqual(@as(u32, 4), accepted);
             refused += 1;
         }
     }
@@ -783,8 +787,9 @@ test "sim: accepts take table entries under fresh sockets until the table is ful
     }
 }
 
-/// Runs `count` accepts at the largest fault rate into a table of `size` and returns their
-/// completions in arrival order, as (id, peer or error) pairs folded into one hash each.
+/// Runs `ids.len` accepts at the largest fault rate into a table of `size`, records each
+/// completion's id and outcome (the peer, or 1, 2 or 3 shifted past any peer for
+/// TableFull, PeerDown and Backpressure) in completion order, and returns the simulator.
 fn acceptRun(seed: u64, size: u32, ids: []io.OperationId, results: []u64) !Sim {
     assert(ids.len == results.len);
     assert(ids.len <= slots_count);

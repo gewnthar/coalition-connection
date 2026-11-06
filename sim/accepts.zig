@@ -64,7 +64,8 @@ pub const Counts = struct {
     backpressure: u32 = 0,
     departures: u32 = 0,
     peak: u32 = 0,
-    /// FNV-1a over every completion's id and result, and every departure, in order.
+    /// An FNV-style hash, one 64-bit word at a time, over every completion's id and result
+    /// and every departure, in order.
     trace: u64 = fnv_offset,
 };
 
@@ -85,17 +86,18 @@ const Workload = struct {
     socket_last: io.Socket,
 };
 
-fn windowIndex(id: io.OperationId) u32 {
-    const index: u32 = @intCast(id % outstanding_window);
-    assert(index < outstanding_window);
-    assert(index == id % outstanding_window);
-    return index;
+/// The window entry for `id`, which must be handed out now or still recent enough that no
+/// newer id shares its entry.
+fn windowIndex(w: *const Workload, id: io.OperationId) u32 {
+    assert(id <= w.next_id);
+    assert(w.next_id - id < outstanding_window);
+    return @intCast(id % outstanding_window);
 }
 
 /// Folds one value into the trace hash.
 fn trace(counts: *Counts, value: u64) void {
     assert(counts.submitted > 0); // Only completions and departures write the trace.
-    assert(value & 0xff != 0); // Every value carries what happened in its low byte.
+    assert(counts.departures <= counts.accepted); // Only an accepted connection leaves.
     counts.trace = (counts.trace ^ value) *% fnv_prime;
 }
 
@@ -103,8 +105,10 @@ fn trace(counts: *Counts, value: u64) void {
 fn topUp(w: *Workload) Error!void {
     assert(w.sim.in_flight <= accepts_in_flight);
     const submitted_before = w.counts.submitted;
-    while (w.sim.in_flight < accepts_in_flight) {
-        const entry = &w.outstanding[windowIndex(w.next_id)];
+    var submissions: u32 = 0;
+    while (w.sim.in_flight < accepts_in_flight) : (submissions += 1) {
+        assert(submissions < accepts_in_flight); // Each one adds to what is in flight.
+        const entry = &w.outstanding[windowIndex(w, w.next_id)];
         if (entry.*) return error.InvariantBroken; // The window is too small.
         const submission: io.Submission = .{ .id = w.next_id, .operation = .{ .accept = .{ .listener = listener } } };
         w.sim.submit(submission) catch |err| switch (err) {
@@ -123,7 +127,7 @@ fn topUp(w: *Workload) Error!void {
 fn check(w: *Workload, completion: io.Completion) Error!void {
     assert(w.in_use <= capacity);
     if (completion.id >= w.next_id) return error.InvariantBroken;
-    const entry = &w.outstanding[windowIndex(completion.id)];
+    const entry = &w.outstanding[windowIndex(w, completion.id)];
     if (!entry.*) return error.InvariantBroken; // Completed twice, or never submitted.
     entry.* = false;
     if (completion.result != .accept) return error.InvariantBroken;
@@ -165,7 +169,8 @@ fn drain(w: *Workload) Error!void {
     assert(w.counts.submitted >= w.sim.completed);
     assert(w.sim.in_flight <= accepts_in_flight);
     var completions: [completions_batch]io.Completion = undefined;
-    const batches_max = constants.io_operations_in_flight_max / completions_batch + 1;
+    // At most `accepts_in_flight` are in flight, so this many full batches take them all.
+    const batches_max = accepts_in_flight / completions_batch + 1;
     var batches: u32 = 0;
     while (batches < batches_max) : (batches += 1) {
         const count = w.sim.poll(&completions);
@@ -204,7 +209,8 @@ fn fill(w: *Workload) Error!void {
         w.sim.tick();
         try drain(w);
     }
-    assert(ticks <= phase_ticks_max);
+    // A refusal comes only with every entry in use, and nothing leaves while filling.
+    assert(w.table.count() == capacity);
     assert(w.in_use == capacity);
 }
 
@@ -218,7 +224,7 @@ fn empty(w: *Workload) Error!void {
         w.sim.tick();
         try drain(w);
     }
-    assert(ticks <= phase_ticks_max);
+    assert(w.sim.in_flight == 0);
     assert(w.table.count() == 0);
 }
 
@@ -237,6 +243,9 @@ fn checkEnd(w: *const Workload) Error!void {
     if (w.sim.accepted != counts.accepted or w.sim.refused != counts.refused) return error.InvariantBroken;
     if (counts.peer_down == 0 or counts.backpressure == 0) return error.InvariantBroken;
     if (w.sim.faults.accept_peer_down != counts.peer_down) return error.InvariantBroken;
+    if (w.sim.faults.accept_backpressure != counts.backpressure) return error.InvariantBroken;
+    // Only accepts were submitted, so no other fault was drawn.
+    if (w.sim.faults.total() != counts.peer_down + counts.backpressure) return error.InvariantBroken;
 }
 
 fn runOnce(seed: u64, w: *Workload) Error!Counts {
@@ -287,7 +296,7 @@ pub fn run(seed: u64) Error!Counts {
     const counts = try runOnce(seed, &static.workload);
     const again = try runOnce(seed, &static.workload);
     if (!std.meta.eql(counts, again)) return error.InvariantBroken;
-    assert(counts.peak == capacity);
-    assert(counts.refused > 0);
+    assert(counts.trace != fnv_offset); // The runs did something to compare.
+    assert(counts.submitted > capacity);
     return counts;
 }
