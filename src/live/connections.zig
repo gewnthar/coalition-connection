@@ -1,4 +1,5 @@
-//! Connection table (roadmap core 4): maps each `PeerId` to its socket and its state.
+//! Connection table (roadmap core 4): maps each `PeerId` to its socket, its state and its
+//! request head scan.
 //!
 //! Job:
 //!   Hand out a `PeerId` for every accepted connection and take it back when the connection
@@ -10,8 +11,8 @@
 //!   each accepted connection.
 //!
 //! Outputs:
-//!   `PeerId`s, the entry each one names, and each socket back again on release, for the
-//!   caller to close.
+//!   `PeerId`s, the entry each one names, each connection's `HeadScan` for the request
+//!   parser, and each socket back again on release, for the caller to close.
 //!
 //! Limits (src/constants.zig):
 //!   http_connections_max: the largest table; callers may pass a smaller size to `init`.
@@ -22,6 +23,11 @@
 //! released last is handed out first. A full table refuses the connection with
 //! `error.TableFull` and leaves every entry as it was.
 //!
+//! Each entry carries the connection's `HeadScan`, so the parser resumes its search for the
+//! end of a request head between reads. `acquire` hands out an entry with an empty scan and
+//! `release` empties it again, so a free entry never holds scan state and a reused entry
+//! never inherits the last connection's.
+//!
 //! Not yet: a released id can be handed out again at once, so an I/O completion that still
 //! names the old connection would reach the new one. The slice that routes completions to
 //! connections adds a generation count to each id.
@@ -30,11 +36,15 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("../constants.zig");
 const io = @import("../io/root.zig");
+const http_request = @import("http_request.zig");
 
 pub const PeerId = io.PeerId;
 
 /// A Linux file descriptor, as the I/O boundary defines it.
 pub const Socket = io.Socket;
+
+/// How far the search for the end of the current request head has got.
+pub const HeadScan = http_request.HeadScan;
 
 pub const AcquireError = error{TableFull};
 
@@ -54,7 +64,12 @@ pub const Entry = struct {
     /// Meaningful only while `state` is not `free`.
     socket: Socket,
     state: State,
+    /// Empty whenever `state` is `free`; the request parser advances it while reading.
+    scan: HeadScan = .{},
 };
+
+/// The value of every free entry.
+const entry_free: Entry = .{ .socket = -1, .state = .free, .scan = .{} };
 
 /// Bytes of table state one connection costs: its entry plus its slot on the free stack.
 pub const entry_bytes: u32 = @sizeOf(Entry) + @sizeOf(PeerId);
@@ -77,7 +92,7 @@ pub const Table = struct {
         const entries = try allocator.alloc(Entry, size);
         errdefer allocator.free(entries);
         const free_ids = try allocator.alloc(PeerId, size);
-        @memset(entries, .{ .socket = -1, .state = .free });
+        @memset(entries, entry_free);
         // Push the ids in reverse, so the first acquire hands out id 0.
         var position: u32 = 0;
         while (position < size) : (position += 1) {
@@ -113,8 +128,9 @@ pub const Table = struct {
         return table_capacity - self.free_count;
     }
 
-    /// Takes a free entry for `socket` and returns its id. The entry starts in `reading`.
-    /// When every entry is in use, returns `error.TableFull` and changes nothing.
+    /// Takes a free entry for `socket` and returns its id. The entry starts in `reading`,
+    /// with an empty head scan. When every entry is in use, returns `error.TableFull` and
+    /// changes nothing.
     pub fn acquire(self: *Table, socket: Socket) AcquireError!PeerId {
         assert(socket >= 0);
         const count_before = self.count();
@@ -127,13 +143,14 @@ pub const Table = struct {
         assert(id < self.capacity());
         const entry = &self.entries[id];
         assert(entry.state == .free); // A free id names a free entry.
-        entry.* = .{ .socket = socket, .state = .reading };
+        assert(entry.scan.resume_at == 0); // release empties the scan of every entry it frees.
+        entry.* = .{ .socket = socket, .state = .reading, .scan = .{} };
         assert(self.count() == count_before + 1);
         return id;
     }
 
-    /// Returns `id`'s entry to the free stack and hands back its socket, which the caller
-    /// must close. Releasing an entry not in use is a bug.
+    /// Returns `id`'s entry to the free stack, emptying its head scan, and hands back its
+    /// socket, which the caller must close. Releasing an entry not in use is a bug.
     pub fn release(self: *Table, id: PeerId) Socket {
         assert(id < self.capacity());
         const count_before = self.count();
@@ -142,7 +159,7 @@ pub const Table = struct {
         assert(entry.state != .free); // Release of an entry not in use.
         const socket = entry.socket;
         assert(socket >= 0);
-        entry.* = .{ .socket = -1, .state = .free };
+        entry.* = entry_free;
         self.free_ids[self.free_count] = id;
         self.free_count += 1;
         assert(self.count() == count_before - 1);
@@ -150,13 +167,25 @@ pub const Table = struct {
     }
 
     /// The entry `id` names, which must be in use. Read-only: change its state through
-    /// `setState`, and free it through `release`.
+    /// `setState`, its head scan through `headScan`, and free it through `release`.
     pub fn get(self: *const Table, id: PeerId) *const Entry {
         assert(id < self.capacity());
         const entry = &self.entries[id];
         assert(entry.state != .free); // Lookup of an entry not in use.
         assert(entry.socket >= 0);
         return entry;
+    }
+
+    /// The head scan of `id`'s connection, which must be reading, for the request parser to
+    /// advance. `acquire` and `release` empty it; nothing else in the table touches it.
+    pub fn headScan(self: *Table, id: PeerId) *HeadScan {
+        assert(id < self.capacity());
+        const entry = &self.entries[id];
+        assert(entry.state == .reading); // Only a connection reading a head is parsed.
+        // The parser backs off three bytes from the end of a buffer of at most
+        // http_request_size_max bytes, so it never resumes past that.
+        assert(entry.scan.resume_at <= constants.http_request_size_max - 3);
+        return &entry.scan;
     }
 
     /// Moves `id`'s connection between reading and writing. Only `release` frees an entry,
@@ -166,6 +195,8 @@ pub const Table = struct {
         assert(state != .free); // Free an entry through release.
         const entry = &self.entries[id];
         assert(entry.state != .free); // State change of an entry not in use.
+        // A parsed head empties the scan, so a connection never writes with a scan part way.
+        assert(state != .writing or entry.scan.resume_at == 0);
         entry.state = state;
     }
 
@@ -179,6 +210,7 @@ pub const Table = struct {
         for (self.free_ids[0..self.free_count]) |id| {
             assert(id < table_capacity);
             assert(self.entries[id].state == .free);
+            assert(self.entries[id].scan.resume_at == 0); // A free entry holds no scan.
             assert(!stacked.isSet(id)); // An id on the free stack twice.
             stacked.set(id);
         }
@@ -298,6 +330,65 @@ test "connections: release hands back the socket, then acquire reuses the entry"
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);
 }
 
+test "connections: a fresh entry starts with an empty head scan" {
+    var startup = StartupAllocator.init(testing.allocator, 2 * entry_bytes);
+    const gpa = startup.allocator();
+    var table = try Table.init(gpa, 2);
+    startup.finishStartup();
+
+    for (table.entries) |entry| try testing.expectEqual(@as(u32, 0), entry.scan.resume_at);
+    const id = try table.acquire(10);
+    try testing.expectEqual(@as(u32, 0), table.get(id).scan.resume_at);
+    try testing.expectEqual(@as(u32, 0), table.headScan(id).resume_at);
+
+    _ = table.release(id);
+    startup.beginShutdown();
+    table.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "connections: an entry released mid-scan is acquired again with an empty scan" {
+    var startup = StartupAllocator.init(testing.allocator, 2 * entry_bytes);
+    const gpa = startup.allocator();
+    var table = try Table.init(gpa, 2);
+    startup.finishStartup();
+
+    const first = try table.acquire(10);
+    const other = try table.acquire(11);
+    // Half a request head: the parser asks for more and remembers where it got to.
+    const partial = "GET /index HTTP/1.1\r\nHost: example\r\n";
+    try testing.expectError(error.Incomplete, http_request.parse(partial, table.headScan(first)));
+    try testing.expect(table.get(first).scan.resume_at > 0);
+    // The other connection's scan is its own, and resumes through the table to a request.
+    try testing.expectEqual(@as(u32, 0), table.get(other).scan.resume_at);
+    const grown = "POST /form HTTP/1.1\r\nHost: example\r\nContent-Length: 0\r\n\r\n";
+    const cut: u32 = 30;
+    try testing.expectError(error.Incomplete, http_request.parse(grown[0..cut], table.headScan(other)));
+    try testing.expect(table.get(other).scan.resume_at > 0);
+    const resumed = try http_request.parse(grown, table.headScan(other));
+    try testing.expectEqual(@as(u32, grown.len), resumed.head_len);
+    try testing.expectEqual(@as(u32, 0), table.get(other).scan.resume_at);
+    table.setState(other, .writing);
+
+    _ = table.release(first);
+    try testing.expectEqual(@as(u32, 0), table.entries[first].scan.resume_at);
+    table.assertInvariants();
+    const reused = try table.acquire(12);
+    try testing.expectEqual(first, reused);
+    try testing.expectEqual(@as(u32, 0), table.get(reused).scan.resume_at);
+    // A new connection's head parses from the start of its buffer.
+    const whole = "GET / HTTP/1.1\r\nHost: example\r\n\r\n";
+    const request = try http_request.parse(whole, table.headScan(reused));
+    try testing.expectEqual(@as(u32, whole.len), request.head_len);
+    try testing.expectEqual(@as(u32, 0), table.get(reused).scan.resume_at);
+
+    _ = table.release(other);
+    _ = table.release(reused);
+    startup.beginShutdown();
+    table.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
 test "connections: a smaller table refuses at its own size" {
     var startup = StartupAllocator.init(testing.allocator, 2 * entry_bytes);
     const gpa = startup.allocator();
@@ -363,6 +454,10 @@ test "connections: seeded random accepts and closes against a model, filling the
             const socket: Socket = @intCast(100 + step);
             if (table.acquire(socket)) |id| {
                 try testing.expectEqual(@as(Socket, -1), model_sockets[id]);
+                try testing.expectEqual(@as(u32, 0), table.get(id).scan.resume_at);
+                // Leave some scans part way, so releases mid-scan are exercised too.
+                const resume_max = constants.http_request_size_max - 3;
+                table.headScan(id).resume_at = random.uintAtMost(u32, resume_max);
                 model_sockets[id] = socket;
                 in_use += 1;
             } else |err| switch (err) {
@@ -379,10 +474,12 @@ test "connections: seeded random accepts and closes against a model, filling the
                 id = (id + 1) % size;
             }
             try testing.expectEqual(model_sockets[id], table.release(id));
+            try testing.expectEqual(@as(u32, 0), table.entries[id].scan.resume_at);
             model_sockets[id] = -1;
             in_use -= 1;
         }
         try testing.expectEqual(in_use, table.count());
+        if (step % 1024 == 0) table.assertInvariants();
     }
     table.assertInvariants();
     try testing.expect(full_refusals > 0);
