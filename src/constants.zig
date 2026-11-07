@@ -136,6 +136,36 @@ pub const valkey_message_size_max: u32 = 512 * 1024;
 /// Largest audit-log entry. Reason: an entry records who, what, when and a short reason.
 pub const audit_entry_size_max: u32 = 4 * 1024;
 
+// ---- Config file ---------------------------------------------------------------------
+
+/// Largest config file. Reason: the file holds a handful of settings, so 4 KiB is far more
+/// than a real one needs and bounds the read buffer.
+pub const config_file_size_max: u32 = 4 * 1024;
+
+/// Working memory for parsing the config file, one fixed region used once at startup and
+/// freed before the server runs. Reason: the heaviest file src/config.zig's prescan lets
+/// through (the most fields with the longest names) needs under 20 KiB, measured on 0.17.1;
+/// 64 KiB leaves three times that, and a test parses each heavy shape against it.
+pub const config_parse_scratch_size_max: u32 = 64 * 1024;
+
+/// Bytes the config loader holds while it runs: the file buffer (the largest file, one
+/// byte more so an oversized file is seen, and the parser's sentinel) and the parse
+/// scratch. Reason: counted in the memory table; src/config.zig checks it matches.
+pub const config_load_bytes_max: u64 = config_file_size_max + 2 + config_parse_scratch_size_max;
+
+/// Longest local socket path, in bytes. Reason: Linux's `sun_path` holds 108 bytes,
+/// including the NUL that ends the path.
+pub const config_socket_path_max: u32 = 107;
+
+/// Fields in the config file. Reason: the file holds two today; 16 leaves room for later
+/// settings and bounds what the ZON parser is given.
+pub const config_fields_max: u32 = 16;
+
+/// read calls for the config file. Reason: a regular file of at most
+/// `config_file_size_max` bytes reads whole in one or two calls; the bound leaves room for
+/// signals and stops a file that keeps growing.
+pub const config_read_attempts_max: u32 = 8;
+
 // ---- Importer and services -----------------------------------------------------------
 
 /// Largest single record in an Alliance Auth export. Reason: the importer streams the
@@ -256,6 +286,11 @@ pub const memory_table = [_]MemoryRow{
         .name = "io_uring ring and in-flight table of the real I/O type",
         .count = 1,
         .size = io_ring_size_max,
+    },
+    .{
+        .name = "Config file buffer and parse scratch, freed before the server runs",
+        .count = 1,
+        .size = config_load_bytes_max,
     },
     .{
         .name = "Importer record buffer",
@@ -507,8 +542,9 @@ test "constants: the real memory table counts every planned buffer" {
         @as(u64, postgres_connections_max) * postgres_message_size_max +
         @as(u64, valkey_connections_max) * valkey_message_size_max +
         io_ring_size_max +
+        config_load_bytes_max +
         import_record_size_max;
     const rows: u32 = memory_table.len;
-    try std.testing.expectEqual(@as(u32, 10), rows);
+    try std.testing.expectEqual(@as(u32, 11), rows);
     try std.testing.expectEqual(expected, try memoryTableBytes(&memory_table));
 }

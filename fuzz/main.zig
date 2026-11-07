@@ -7,10 +7,15 @@
 //!                  limit with the exact error expected, and a check that the run reached
 //!                  every one of those limits. Every input is also fed again in reads of
 //!                  random sizes, split at random points, and must get the same answer.
-//!   http_response  generated responses, valid or with one fault per field, written into
-//!                  buffers of the exact length, one byte short or at random, checked
-//!                  byte for byte against a model in fuzz/http_response.zig, with every
-//!                  error, fault kind and limit required to come up (see that file).
+//!   http_response  generated responses, valid or with a name or value fault in a field,
+//!                  written into buffers of the exact length, one byte short or at random,
+//!                  checked byte for byte against a model in fuzz/http_response.zig, with
+//!                  every outcome, fault pair and limit required to come up (see that file).
+//!   config         valid config files from a generator, sometimes mutated, plus random
+//!                  bytes and random runs of ZON tokens: every input must give a config or a
+//!                  named error, never a crash, and an unmutated file must give exactly the
+//!                  values the generator wrote. The run must reach success, syntax errors
+//!                  and the nesting limit.
 //! Each component adds its own target as it lands (parsers first). A failing seed replays
 //! exactly.
 
@@ -604,6 +609,290 @@ fn runHttp(seed: u64) FuzzError!void {
     std.debug.print("fuzz http_request: seed={d} iterations={d} ok\n", .{ seed, iteration });
 }
 
+const config = cc.config;
+const config_file_size_max = cc.constants.config_file_size_max;
+
+/// The values a generated config file holds.
+const ConfigModel = struct {
+    socket_path: [cc.constants.config_socket_path_max]u8,
+    socket_path_len: u32,
+    connections_max: u32,
+};
+
+/// How a config input was made, so the result can be judged.
+const ConfigKind = enum(u8) { valid, mutated, random_bytes, random_tokens, many_fields, heavy };
+
+const ConfigCounts = struct {
+    ok: u32 = 0,
+    syntax: u32 = 0,
+    too_many_fields: u32 = 0,
+    /// Never expected: every input the prescan passes fits the scratch region.
+    too_complex: u32 = 0,
+    other: u32 = 0,
+
+    fn add(counts: *ConfigCounts, result: config.ParseError!config.Config) void {
+        const total_before = counts.ok + counts.syntax + counts.too_many_fields + counts.too_complex + counts.other;
+        assert(total_before < cc.constants.fuzz_iterations_max);
+        if (result) |_| {
+            counts.ok += 1;
+        } else |err| switch (err) {
+            error.ConfigSyntax => counts.syntax += 1,
+            error.ConfigTooManyFields => counts.too_many_fields += 1,
+            error.ConfigTooComplex => counts.too_complex += 1,
+            else => counts.other += 1,
+        }
+        assert(counts.ok + counts.syntax + counts.too_many_fields + counts.too_complex + counts.other == total_before + 1);
+    }
+};
+
+comptime {
+    // A generated file is the path, a limit of at most ten digits and under 64 bytes of
+    // ZON around them, so it always fits: configGenerate's bufPrint can't fail.
+    assert(cc.constants.config_socket_path_max + 10 + 64 < config_file_size_max);
+}
+
+/// Writes a valid config file into `buffer` and returns its length and the values in it.
+fn configGenerate(random: std.Random, buffer: *[config_file_size_max:0]u8, model: *ConfigModel) u32 {
+    const path_chars = "abcdefghijklmnopqrstuvwxyz0123456789-_./ (){}[]!";
+    model.socket_path_len = random.intRangeAtMost(u32, 1, cc.constants.config_socket_path_max);
+    model.socket_path[0] = '/';
+    var index: u32 = 1;
+    while (index < model.socket_path_len) : (index += 1) {
+        model.socket_path[index] = path_chars[random.uintLessThan(u32, path_chars.len)];
+    }
+    model.connections_max = random.intRangeAtMost(u32, 1, cc.constants.http_connections_max);
+    const path = model.socket_path[0..model.socket_path_len];
+    const written = std.fmt.bufPrint(buffer, ".{{\n    .socket_path = \"{s}\",\n    .connections_max = {d},\n}}\n", .{
+        path, model.connections_max,
+    }) catch unreachable; // The comptime block above proves it fits.
+    assert(written.len < config_file_size_max);
+    assert(index == model.socket_path_len);
+    return @intCast(written.len);
+}
+
+/// Changes, inserts or deletes up to eight bytes, or appends a run of one byte.
+fn configMutate(random: std.Random, buffer: *[config_file_size_max:0]u8, len: u32) u32 {
+    assert(len > 0 and len <= config_file_size_max);
+    var new_len = len;
+    const mutations = random.intRangeAtMost(u32, 1, 8);
+    var mutation: u32 = 0;
+    while (mutation < mutations) : (mutation += 1) {
+        const at = random.uintLessThan(u32, new_len);
+        switch (random.uintLessThan(u8, 4)) {
+            0 => buffer[at] = random.int(u8),
+            1 => if (new_len < config_file_size_max) {
+                std.mem.copyBackwards(u8, buffer[at + 1 .. new_len + 1], buffer[at..new_len]);
+                buffer[at] = random.int(u8);
+                new_len += 1;
+            },
+            2 => if (new_len > 1) {
+                std.mem.copyForwards(u8, buffer[at .. new_len - 1], buffer[at + 1 .. new_len]);
+                new_len -= 1;
+            },
+            else => {
+                const run = @min(random.uintAtMost(u32, 64), config_file_size_max - new_len);
+                @memset(buffer[new_len..][0..run], "({[\"/\\"[random.uintLessThan(u32, 6)]);
+                new_len += run;
+            },
+        }
+    }
+    assert(mutation == mutations);
+    assert(new_len > 0 and new_len <= config_file_size_max);
+    return new_len;
+}
+
+/// Fills up to the whole file with random bytes, or with random ZON tokens.
+fn configRandom(random: std.Random, buffer: *[config_file_size_max:0]u8, tokens: bool) u32 {
+    const token_set = [_][]const u8{
+        ".{",   "{",      "}",       ".",    "=",    ",",       "\"", "a",      "1",     " ",      "\n",
+        "(",    "//",     "\\",      "\r",   "\t",   ".a = 1,", "-",  "\"\\\n", "\\x",   "struct", "const",
+        "try ", "break ", "return ", "\x00", "\x7f", "true",    "_",  "0x1F",   "1.5e3",
+    };
+    // Mostly short inputs keep the run fast; one in sixteen fills the file.
+    const len_max: u32 = if (random.uintLessThan(u8, 16) == 0) config_file_size_max else 256;
+    const len = random.uintAtMost(u32, len_max);
+    if (!tokens) {
+        random.bytes(buffer[0..len]);
+        assert(len <= config_file_size_max);
+        return len;
+    }
+    var index: u32 = 0;
+    var picks: u32 = 0;
+    while (index < len) : (picks += 1) {
+        assert(picks < config_file_size_max);
+        const token = token_set[random.uintLessThan(u32, token_set.len)];
+        const take = @min(token.len, len - index);
+        @memcpy(buffer[index..][0..take], token[0..take]);
+        index += @intCast(take);
+    }
+    assert(index == len);
+    return len;
+}
+
+/// Writes a file of up to half again `config_fields_max` well-formed fields the config
+/// doesn't know, and returns its length and how many fields it holds.
+fn configManyFields(random: std.Random, buffer: *[config_file_size_max:0]u8, fields: *u32) u32 {
+    const fields_max = cc.constants.config_fields_max;
+    comptime assert((fields_max + fields_max / 2) * 16 + 8 < config_file_size_max);
+    fields.* = random.uintAtMost(u32, fields_max + fields_max / 2);
+    buffer[0] = '.';
+    buffer[1] = '{';
+    var len: u32 = 2;
+    var field: u32 = 0;
+    while (field < fields.*) : (field += 1) {
+        const written = std.fmt.bufPrint(buffer[len..], " .f{d} = {d},", .{ field, field }) catch unreachable; // The comptime assert above bounds it.
+        len += @intCast(written.len);
+    }
+    assert(field == fields.*);
+    buffer[len] = '}';
+    len += 1;
+    assert(len < config_file_size_max);
+    return len;
+}
+
+/// Appends `count` bytes drawn from `alphabet` at `len` and returns the new length.
+fn configAppendFrom(random: std.Random, buffer: *[config_file_size_max:0]u8, len: u32, count: u32, alphabet: []const u8) u32 {
+    assert(len + count <= config_file_size_max);
+    assert(alphabet.len > 0);
+    for (buffer[len..][0..count]) |*byte| byte.* = alphabet[random.uintLessThan(u32, @intCast(alphabet.len))];
+    return len + count;
+}
+
+/// Writes a file the prescan accepts but that is as heavy as it can make it for the parser:
+/// up to `config_fields_max` fields with long names (keywords too), long numbers and long
+/// strings full of escapes and non-ASCII bytes, filling the file.
+fn configHeavy(random: std.Random, buffer: *[config_file_size_max:0]u8) u32 {
+    const names = [_][]const u8{ "socket_path", "connections_max", "struct", "try", "comptime", "_", "a" };
+    const string_chunks = [_][]const u8{ "\\u{10ffff}", "\\x41", "\\\"", "\\\\", "\xc3\xa9", "\xff", "a", " ", "\\n" };
+    const fields = random.intRangeAtMost(u32, 1, cc.constants.config_fields_max);
+    const room: u32 = config_file_size_max / fields - 8;
+    var len: u32 = 0;
+    buffer[0] = '.';
+    buffer[1] = '{';
+    len = 2;
+    var field: u32 = 0;
+    while (field < fields) : (field += 1) {
+        const name = names[random.uintLessThan(u32, names.len)];
+        const name_len = @min(room / 4, @as(u32, @intCast(name.len)) + random.uintAtMost(u32, room / 4));
+        buffer[len] = '.';
+        len = configAppendFrom(random, buffer, len + 1, 1, name[0..1]);
+        len = configAppendFrom(random, buffer, len, name_len - 1, name);
+        @memcpy(buffer[len..][0..3], " = ");
+        len += 3;
+        const value_room = room - name_len - 6;
+        if (random.boolean()) {
+            len = configAppendFrom(random, buffer, len, 1, "0123456789");
+            len = configAppendFrom(random, buffer, len, value_room - 1, "0123456789abcdefxXoOb_eE");
+        } else {
+            buffer[len] = '"';
+            len += 1;
+            var used: u32 = 0;
+            var chunks: u32 = 0;
+            while (chunks < value_room) : (chunks += 1) {
+                const chunk = string_chunks[random.uintLessThan(u32, string_chunks.len)];
+                if (used + chunk.len + 2 > value_room) break;
+                @memcpy(buffer[len..][0..chunk.len], chunk);
+                len += @intCast(chunk.len);
+                used += @intCast(chunk.len);
+            }
+            buffer[len] = '"';
+            len += 1;
+        }
+        buffer[len] = ',';
+        len += 1;
+    }
+    assert(field == fields);
+    buffer[len] = '}';
+    len += 1;
+    assert(len <= config_file_size_max);
+    return len;
+}
+
+fn configStep(random: std.Random, buffer: *[config_file_size_max:0]u8, scratch: []u8, counts: *ConfigCounts) FuzzError!void {
+    var model: ConfigModel = undefined;
+    var fields: u32 = 0;
+    const kind: ConfigKind = @fromBackingInt(@intCast(random.uintLessThan(u8, 6)));
+    const len: u32 = switch (kind) {
+        .heavy => configHeavy(random, buffer),
+        .many_fields => configManyFields(random, buffer, &fields),
+        .valid => configGenerate(random, buffer, &model),
+        .mutated => configMutate(random, buffer, configGenerate(random, buffer, &model)),
+        .random_bytes => configRandom(random, buffer, false),
+        .random_tokens => configRandom(random, buffer, true),
+    };
+    assert(len <= config_file_size_max);
+    buffer[len] = 0;
+    var report: config.SyntaxReport = .{};
+    const result = config.parse(buffer[0..len :0], scratch, &report);
+    counts.add(result);
+    // Every syntax report names a place in the file.
+    assert(report.errors == 0 or (report.line > 0 and report.column > 0));
+    const syntax = if (result) |_| false else |err| err == error.ConfigSyntax;
+    if (syntax != (report.errors > 0)) return error.Mismatch;
+    if (kind == .many_fields) {
+        // Unknown fields are a syntax error, unless there are too many to read at all.
+        const over = fields > cc.constants.config_fields_max;
+        const expected: config.ParseError = if (over) error.ConfigTooManyFields else error.ConfigSyntax;
+        if (result) |_| return error.Mismatch else |err| if (err != expected) return error.Mismatch;
+        return;
+    }
+    if (kind != .valid) return; // Bad input: a config or any named error is a correct answer.
+    const parsed = result catch |err| {
+        std.debug.print("fuzz config: valid file rejected with {s}\n", .{@errorName(err)});
+        return error.Mismatch;
+    };
+    if (!std.mem.eql(u8, parsed.socketPath(), model.socket_path[0..model.socket_path_len])) return error.Mismatch;
+    if (parsed.connections_max != model.connections_max) return error.Mismatch;
+}
+
+fn runConfig(seed: u64) FuzzError!void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    const scratch = std.heap.page_allocator.alloc(u8, cc.constants.config_parse_scratch_size_max) catch {
+        std.debug.print("fuzz config: no memory for the parse scratch\n", .{});
+        return error.Mismatch;
+    };
+    defer std.heap.page_allocator.free(scratch);
+    assert(scratch.len == cc.constants.config_parse_scratch_size_max);
+    var buffer: [config_file_size_max:0]u8 = undefined;
+    var counts: ConfigCounts = .{};
+
+    var iteration: u32 = 0;
+    while (iteration < cc.constants.fuzz_iterations_max) : (iteration += 1) {
+        configStep(random, &buffer, scratch, &counts) catch |err| {
+            std.debug.print("fuzz config: seed={d} failed at iteration {d}\n", .{ seed, iteration });
+            return err;
+        };
+    }
+    std.debug.print("fuzz config: seed={d} ok={d} syntax={d} too_many_fields={d} too_complex={d} other={d}\n", .{
+        seed, counts.ok, counts.syntax, counts.too_many_fields, counts.too_complex, counts.other,
+    });
+    assert(counts.ok + counts.syntax + counts.too_many_fields + counts.too_complex + counts.other == iteration);
+    if (counts.too_complex > 0) {
+        std.debug.print("fuzz config: seed={d} an input outgrew the parse scratch\n", .{seed});
+        return error.Mismatch;
+    }
+    if (counts.ok == 0 or counts.syntax == 0 or counts.too_many_fields == 0) {
+        std.debug.print("fuzz config: seed={d} missed an outcome\n", .{seed});
+        return error.LimitMissed;
+    }
+    std.debug.print("fuzz config: seed={d} iterations={d} ok\n", .{ seed, iteration });
+}
+
+/// Stack for the config target's thread. Reason: the parser must stay shallow on every
+/// input the prescan passes; a small stack turns any regression into a crash here instead
+/// of a deep recursion that the main thread's 8 MiB would hide.
+const config_stack_size: u32 = 256 * 1024;
+
+fn runConfigThread(seed: u64, failure: *?FuzzError, finished: *bool) void {
+    assert(!finished.*);
+    assert(failure.* == null);
+    runConfig(seed) catch |err| {
+        failure.* = err;
+    };
+    finished.* = true;
+}
+
 pub fn main() FuzzError!void {
     const seed: u64 = build_options.seed;
     comptime assert(cc.constants.fuzz_iterations_max > 0);
@@ -611,4 +900,14 @@ pub fn main() FuzzError!void {
     try runQueue(seed);
     try runHttp(seed);
     try http_response_fuzz.run(seed);
+    var config_failure: ?FuzzError = null;
+    var config_finished = false;
+    const spawn_config: std.Thread.SpawnConfig = .{ .stack_size = config_stack_size };
+    const thread = std.Thread.spawn(spawn_config, runConfigThread, .{ seed, &config_failure, &config_finished }) catch {
+        std.debug.print("fuzz config: could not start its thread\n", .{});
+        return error.Mismatch;
+    };
+    thread.join();
+    assert(config_finished);
+    if (config_failure) |err| return err;
 }

@@ -8,6 +8,7 @@ pub const constants = @import("constants.zig");
 pub const BoundedQueue = @import("bounded_queue.zig").BoundedQueue;
 pub const StartupAllocator = @import("startup_allocator.zig").StartupAllocator;
 pub const io = @import("io/root.zig");
+pub const config = @import("config.zig");
 
 // Components, in build order.
 pub const sso = @import("sso/root.zig");
@@ -26,6 +27,7 @@ test {
     _ = @import("bounded_queue.zig");
     _ = @import("startup_allocator.zig");
     _ = io;
+    _ = config;
     _ = sso;
     _ = esi;
     _ = access;
