@@ -1,6 +1,8 @@
 //! Startup-trip harness: proves `StartupAllocator` stops the process when code calls it in
-//! a phase that forbids the call, before the child allocator is touched, and that the
-//! connection table stops it when code releases, reads or moves an entry not in use.
+//! a phase that forbids the call, before the child allocator is touched, that the
+//! connection table stops it when code releases, reads or moves an entry not in use, and
+//! that the real I/O type stops it when its clock steps back, when it is handed an execute,
+//! when a send names a peer not in the table, and when it is set up after startup.
 //!
 //! The guard is an assertion, and a tripped assertion panics, which ends the process. A
 //! test block can't catch that, so `zig build test` builds this file once, in ReleaseSafe,
@@ -14,9 +16,10 @@
 //!   42  a trip case tripped: an assertion failed (for the allocator, before the child
 //!       allocator was reached)
 //!   0   a control case finished, and its call did what it should
-//!   1   a panic before the call was made (a setup bug, not a result)
+//!   1   a panic outside the call: in setup, or in a control's checks after it
 //!   2   a trip case's call returned without tripping: the check is missing
-//!   3   the call panicked, but not on an assertion
+//!   3   the call panicked, but not the way its case expects: not on an assertion, or for
+//!       a submitted execute, not on the real type's placeholder panic
 //!   4   setup failed
 //!   5   the call reached the child allocator before tripping: the guard came too late
 //!   6   a control case's call was refused, or left the accounting or the table wrong
@@ -40,10 +43,19 @@
 //! of bounds (exit 3). `release` and `get` also check the entry's socket, which a free entry
 //! holds as -1, so a stale-socket case writes a valid-looking socket into the free entry
 //! first: then only the state check can stop the call.
+//!
+//! For the real I/O type, the entry in use holds one end of a real socketpair, so the
+//! controls' sends really go out and their completions really come back. A send to the
+//! free entry is tried three ways: as it is (socket -1), with the live descriptor written
+//! back into it (only the table's state check can stop that one, and without it the bytes
+//! would reach the socket), and with every slot of the ring in use (the peer must be checked
+//! before the queue, or the call returns QueueFull instead of tripping). These cases need
+//! io_uring; where the kernel refuses a ring, they fail with the setup code, never pass.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const linux = std.os.linux;
 const cc = @import("coalition_connection");
 const trip = @import("startup_trip_cases.zig");
 
@@ -78,12 +90,15 @@ comptime {
             assert(c.trips or bytesExpected(on.call) != null);
         },
         .connection_table => |call| assert(c.trips != tableCallAllowed(call)),
+        .real_io => |call| assert(c.trips != realCallAllowed(call)),
     };
 }
 
 /// The case this run makes, by name, for the panic handler's messages. Set once the
 /// argument has named a case; a global, because the panic handler takes no context.
 var case_name: []const u8 = "(no case chosen yet)";
+/// How the chosen case must stop if it trips; set with `case_name`.
+var panic_expected: trip.Panic = .assertion;
 /// Set just before the one call and cleared just after, so the panic handler can tell a
 /// trip in that call from a panic anywhere else.
 var armed: bool = false;
@@ -98,12 +113,19 @@ pub const panic = std.debug.FullPanic(onPanic);
 fn onPanic(message: []const u8, first_trace_address: ?usize) noreturn {
     _ = first_trace_address;
     if (!armed) {
-        std.debug.print("startup_trip: {s} panicked before the call: {s}\n", .{ case_name, message });
+        std.debug.print("startup_trip: {s} panicked outside the call: {s}\n", .{ case_name, message });
         std.process.exit(exit_early_panic);
     }
-    // std.debug.assert fails through `unreachable`, whose safety panic has this message.
-    if (!std.mem.eql(u8, message, "reached unreachable code")) {
-        std.debug.print("startup_trip: {s} panicked, but not on an assertion: {s}\n", .{ case_name, message });
+    // std.debug.assert fails through `unreachable`, whose safety panic has this message;
+    // the real type's execute panic begins with its own.
+    const expected = switch (panic_expected) {
+        .assertion => std.mem.eql(u8, message, trip.message_assertion),
+        .execute_placeholder => std.mem.startsWith(u8, message, trip.message_execute_head),
+    };
+    if (!expected) {
+        std.debug.print("startup_trip: {s} panicked, but not as expected ({t}): {s}\n", .{
+            case_name, panic_expected, message,
+        });
         std.process.exit(exit_other_panic);
     }
     if (child_calls != child_calls_armed) {
@@ -175,6 +197,8 @@ const backing_len: u32 = 256;
 comptime {
     assert(2 * setup_len <= budget_bytes);
     assert(trip.table_size * cc.live.connections.entry_bytes <= budget_bytes);
+    assert(trip.real_table_size * cc.live.connections.entry_bytes <= budget_bytes);
+    assert(trip.real_table_size <= trip.table_size);
     assert(budget_bytes + 2 * @alignOf(cc.live.connections.Entry) <= backing_len);
     assert(@TypeOf(trip.socket_base) == cc.live.connections.Socket);
 }
@@ -188,7 +212,9 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(trip.exit_bad_argument);
     };
     case_name = case.name;
+    panic_expected = case.panic;
     assert(case.name.len > 0);
+    assert(case.trips or case.panic == .assertion);
 
     // A fixed child keeps the run off the operating system's allocator.
     var backing: [backing_len]u8 = undefined;
@@ -198,6 +224,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     switch (case.target) {
         .startup_allocator => |on| runAllocatorCase(&startup, &fixed, on.phase, on.call, case),
         .connection_table => |call| runTableCase(&startup, call, case),
+        .real_io => |call| runRealCase(&startup, call, case),
     }
 }
 
@@ -555,4 +582,343 @@ fn tableAgrees(table: *const connections.Table) bool {
         if ((entry.state == .free) != is_stacked) return false;
     }
     return true;
+}
+
+const Real = cc.io.real.Real;
+/// The real type's ring depth: operations it holds in flight before QueueFull.
+const slots_max: u32 = cc.constants.io_operations_in_flight_max;
+/// Empty polls `drain` allows, 1 ms apart. Reason: a socketpair send completes during the
+/// submitting system call; a second is ample even on a loaded CI machine.
+const poll_attempts_max: u32 = 1_000;
+/// The operation id the send control uses; the queue-full fill numbers its sends from 1.
+const send_peer_id: cc.io.OperationId = slots_max + 1;
+
+comptime {
+    assert(slots_max > 0);
+    assert(send_peer_id > slots_max);
+}
+
+/// Whether the real type allows `call`: the controls. The cases file says the same through
+/// each case's outcome, and the comptime block at the top checks the two agree.
+fn realCallAllowed(call: trip.RealCall) bool {
+    return switch (call) {
+        .now_fresh, .send_peer, .send_queue_full => true,
+        .now_after_max,
+        .submit_execute,
+        .send_free,
+        .send_free_stale_socket,
+        .send_out_of_range,
+        .send_free_queue_full,
+        .init_running,
+        => false,
+    };
+}
+
+/// The peer a send case names, or null for a call that sends nothing.
+fn realCallPeer(call: trip.RealCall) ?cc.io.PeerId {
+    const peer: ?cc.io.PeerId = switch (call) {
+        .send_free, .send_free_stale_socket, .send_free_queue_full => trip.real_free_id,
+        .send_out_of_range => trip.real_table_size,
+        .send_peer, .send_queue_full => trip.real_peer_id,
+        .now_after_max, .submit_execute, .init_running, .now_fresh => null,
+    };
+    // Every allowed send names the entry in use; every forbidden one does not.
+    assert(peer == null or (peer.? == trip.real_peer_id) == realCallAllowed(call));
+    return peer;
+}
+
+/// Whether the case fills every slot of the ring before its call.
+fn realCallFillsRing(call: trip.RealCall) bool {
+    return call == .send_free_queue_full or call == .send_queue_full;
+}
+
+/// What a real-I/O call handed back, for the controls' checks.
+const RealResult = struct {
+    /// A clock call's reading; 0 for any other call.
+    reading: cc.io.Instant = 0,
+    /// Whether a submit returned QueueFull.
+    queue_full: bool = false,
+};
+
+/// The state a real-I/O control's call must leave as it was, or change as it says.
+const RealBefore = struct {
+    entries: [trip.real_table_size]Entry,
+    in_flight: u32,
+    submitted: u64,
+    completed: u64,
+    last: cc.io.Instant,
+};
+
+fn setupFailed(case: trip.Case, comptime what: []const u8) noreturn {
+    std.debug.print("startup_trip: {s} setup failed: " ++ what ++ "\n", .{case.name});
+    std.process.exit(exit_setup_failed);
+}
+
+/// Builds a `real_table_size`-entry table during startup with `real_peer_id` holding one
+/// end of a socketpair and `real_free_id` released again, sets up the real type on it
+/// (unless the case does that itself, too late), ends startup, and makes the case's call.
+fn runRealCase(startup: *cc.StartupAllocator, call: trip.RealCall, case: trip.Case) noreturn {
+    assert(startup.bytes_live == 0);
+    assert(startup.phase == .startup);
+    const pair = socketPair(case);
+    const local = pair[0];
+    const remote = pair[1];
+    var table = realTable(startup, case, local);
+
+    var real: Real = undefined;
+    if (call != .init_running) {
+        real = Real.init(startup, &table) catch |err| {
+            std.debug.print("startup_trip: {s} setup failed: no io_uring ring ({t})\n", .{ case.name, err });
+            std.process.exit(exit_setup_failed);
+        };
+        assert(real.inFlight() == 0);
+    }
+    startup.finishStartup();
+    table.assertInvariants();
+    assert(table.count() == trip.real_table_size - 1);
+    assert(table.entries[trip.real_free_id].state == .free);
+    assert(table.entries[trip.real_free_id].socket == -1);
+    assert(table.get(trip.real_peer_id).socket == local);
+
+    switch (call) {
+        .now_after_max => real.last = std.math.maxInt(cc.io.Instant),
+        // The descriptor the entry held before it was released, as a stale field keeps it.
+        .send_free_stale_socket => table.entries[trip.real_free_id].socket = local,
+        else => {},
+    }
+    if (realCallFillsRing(call)) fillRing(&real, case);
+
+    var before: RealBefore = undefined;
+    @memcpy(&before.entries, table.entries);
+    if (call != .init_running) {
+        before.in_flight = real.inFlight();
+        before.submitted = real.submitted;
+        before.completed = real.completed;
+        before.last = real.last;
+    }
+
+    child_calls_armed = child_calls;
+    armed = true;
+    const result = callReal(&real, startup, &table, call);
+    armed = false;
+
+    if (case.trips) {
+        std.debug.print("startup_trip: {s} returned without tripping: the check is missing\n", .{case.name});
+        std.process.exit(exit_not_tripped);
+    }
+    if (!realControlHeld(&real, &table, &before, call, result, local, remote)) {
+        std.debug.print("startup_trip: {s} control failed: in flight={d} submitted={d} child calls={d}\n", .{
+            case.name, real.inFlight(), real.submitted, child_calls - child_calls_armed,
+        });
+        std.process.exit(exit_control_failed);
+    }
+    std.process.exit(trip.exit_finished);
+}
+
+/// Both ends of a fresh stream socketpair: the first goes in the table, the second is the
+/// far end the send control reads.
+fn socketPair(case: trip.Case) [2]linux.fd_t {
+    assert(!armed);
+    var fds: [2]linux.fd_t = .{ -1, -1 };
+    const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &fds)) != .SUCCESS) {
+        setupFailed(case, "no socketpair");
+    }
+    assert(fds[0] >= 0 and fds[1] >= 0);
+    assert(fds[0] != fds[1]);
+    return fds;
+}
+
+/// A `real_table_size`-entry table, built during startup, with `real_peer_id` holding
+/// `local` and `real_free_id` released again.
+fn realTable(startup: *cc.StartupAllocator, case: trip.Case, local: linux.fd_t) connections.Table {
+    assert(startup.phase == .startup);
+    assert(local >= 0);
+    var table = connections.Table.init(startup.allocator(), trip.real_table_size) catch |err| switch (err) {
+        error.OutOfMemory => setupFailed(case, "could not allocate the table"),
+    };
+    var id: u32 = 0;
+    while (id < trip.real_table_size) : (id += 1) {
+        // Every entry holds the local end; all but one are released again below.
+        const acquired = table.acquire(local) catch |err| switch (err) {
+            error.TableFull => setupFailed(case, "found the table full"),
+        };
+        assert(acquired == id);
+    }
+    assert(id == trip.real_table_size);
+    assert(table.release(trip.real_free_id) == local);
+    assert(table.count() == trip.real_table_size - 1);
+    return table;
+}
+
+/// Puts a one-byte send to the entry in use in every slot of the ring, before the call.
+fn fillRing(real: *Real, case: trip.Case) void {
+    assert(!armed);
+    assert(real.inFlight() == 0);
+    var filled: u32 = 0;
+    while (filled < slots_max) : (filled += 1) {
+        const send: cc.io.Send = .{ .peer = trip.real_peer_id, .bytes = "x" };
+        real.submit(.{ .id = filled + 1, .operation = .{ .send = send } }) catch |err| switch (err) {
+            error.QueueFull => setupFailed(case, "the ring filled early"),
+        };
+    }
+    assert(filled == slots_max);
+    assert(real.inFlight() == slots_max);
+    assert(real.free_count == 0);
+}
+
+/// Makes the case's one call on the real type; nothing else runs while `armed` is set.
+fn callReal(
+    real: *Real,
+    startup: *const cc.StartupAllocator,
+    table: *connections.Table,
+    call: trip.RealCall,
+) RealResult {
+    assert(armed);
+    assert(child_calls == child_calls_armed);
+    if (realCallPeer(call)) |peer| {
+        const bytes = trip.real_send_bytes;
+        const id: cc.io.OperationId = send_peer_id;
+        real.submit(.{ .id = id, .operation = .{ .send = .{ .peer = peer, .bytes = bytes } } }) catch |err| {
+            switch (err) {
+                error.QueueFull => return .{ .queue_full = true },
+            }
+        };
+        return .{};
+    }
+    switch (call) {
+        .now_after_max, .now_fresh => return .{ .reading = real.now() },
+        .submit_execute => {
+            const execute: cc.io.Execute = .{ .statement = "select 1" };
+            real.submit(.{ .id = send_peer_id, .operation = .{ .execute = execute } }) catch {};
+            return .{};
+        },
+        .init_running => {
+            // A ring set up here would be leaked; the process ends straight after.
+            if (Real.init(startup, table)) |_| {} else |_| {}
+            return .{};
+        },
+        .send_free,
+        .send_free_stale_socket,
+        .send_out_of_range,
+        .send_free_queue_full,
+        .send_peer,
+        .send_queue_full,
+        => unreachable, // realCallPeer named a peer for each of these.
+    }
+}
+
+/// A control's call must touch no allocator and leave the table as it was. The clock
+/// control's reading is at or after the last and becomes the last. The send control's
+/// completion comes back with its byte count and the far end reads the same bytes. The
+/// queue-full control returns QueueFull with nothing changed, and every send already on
+/// the ring still completes with its byte. Both send controls end with the ring empty and
+/// closed, as `deinit` requires.
+fn realControlHeld(
+    real: *Real,
+    table: *const connections.Table,
+    before: *const RealBefore,
+    call: trip.RealCall,
+    result: RealResult,
+    local: linux.fd_t,
+    remote: linux.fd_t,
+) bool {
+    assert(!armed);
+    assert(realCallAllowed(call));
+    if (child_calls != child_calls_armed) return false;
+    for (table.entries, before.entries) |entry, entry_before| {
+        if (!std.meta.eql(entry, entry_before)) return false;
+    }
+    if (table.get(trip.real_peer_id).socket != local) return false;
+    switch (call) {
+        .now_fresh => {
+            if (result.reading < before.last or result.reading < real.epoch) return false;
+            if (real.last != result.reading) return false;
+            return real.inFlight() == 0 and real.submitted == 0;
+        },
+        .send_peer => if (!sendPeerHeld(real, before, result, remote)) return false,
+        .send_queue_full => if (!queueFullHeld(real, before, result)) return false,
+        .now_after_max,
+        .submit_execute,
+        .send_free,
+        .send_free_stale_socket,
+        .send_out_of_range,
+        .send_free_queue_full,
+        .init_running,
+        => unreachable, // Asserted allowed above.
+    }
+    if (real.inFlight() != 0 or real.completed != real.submitted) return false;
+    real.deinit();
+    return true;
+}
+
+/// The send control: one more submission, whose completion comes back under its id with
+/// every byte sent, and the far end reads exactly those bytes.
+fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
+    assert(!armed);
+    assert(remote >= 0);
+    if (result.queue_full) return false;
+    if (real.submitted != before.submitted + 1) return false;
+    var completions: [1]cc.io.Completion = undefined;
+    if (drain(real, &completions) != 1) return false;
+    if (completions[0].id != send_peer_id) return false;
+    const sent = switch (completions[0].result) {
+        .send => |sent| sent catch return false,
+        .execute, .accept => return false,
+    };
+    if (sent != trip.real_send_bytes.len) return false;
+    // One byte of room past the message, so a send that wrote extra bytes reads longer.
+    var received: [trip.real_send_bytes.len + 1]u8 = undefined;
+    const rc = linux.recvfrom(remote, &received, received.len, linux.MSG.DONTWAIT, null, null);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    return std.mem.eql(u8, received[0..rc], trip.real_send_bytes);
+}
+
+/// The queue-full control: QueueFull with the counts unchanged, then every send already on
+/// the ring completes once, under the id it was given, with its one byte.
+fn queueFullHeld(real: *Real, before: *const RealBefore, result: RealResult) bool {
+    assert(!armed);
+    assert(before.in_flight == slots_max);
+    if (!result.queue_full) return false;
+    if (real.inFlight() != before.in_flight) return false;
+    if (real.submitted != before.submitted or real.completed != before.completed) return false;
+    var completions: [slots_max]cc.io.Completion = undefined;
+    if (drain(real, &completions) != slots_max) return false;
+    var seen: [slots_max]bool = @splat(false);
+    for (completions) |completion| {
+        if (completion.id == 0 or completion.id > slots_max) return false;
+        const index: u32 = @intCast(completion.id - 1);
+        if (seen[index]) return false;
+        seen[index] = true;
+        const sent = switch (completion.result) {
+            .send => |sent| sent catch return false,
+            .execute, .accept => return false,
+        };
+        if (sent != 1) return false;
+    }
+    return true;
+}
+
+/// Polls until `completions` is full or `poll_attempts_max` polls come back empty, and
+/// returns how many arrived.
+fn drain(real: *Real, completions: []cc.io.Completion) u32 {
+    assert(!armed);
+    assert(completions.len > 0 and completions.len <= slots_max);
+    var count: u32 = 0;
+    var empty: u32 = 0;
+    var polls: u32 = 0;
+    // Each poll either hands back at least one completion or counts as empty, so the loop
+    // runs at most `completions.len + poll_attempts_max` times.
+    while (count < completions.len and empty < poll_attempts_max) : (polls += 1) {
+        assert(polls < slots_max + poll_attempts_max);
+        const got = real.poll(completions[count..]);
+        count += got;
+        if (got > 0) continue;
+        empty += 1;
+        const pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&pause, null);
+    }
+    assert(count <= completions.len);
+    assert(empty <= poll_attempts_max);
+    return count;
 }
