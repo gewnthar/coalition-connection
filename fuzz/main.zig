@@ -7,6 +7,10 @@
 //!                  limit with the exact error expected, and a check that the run reached
 //!                  every one of those limits. Every input is also fed again in reads of
 //!                  random sizes, split at random points, and must get the same answer.
+//!   http_response  generated responses, valid or with one fault per field, written into
+//!                  buffers of the exact length, one byte short or at random, checked
+//!                  byte for byte against a model in fuzz/http_response.zig, with every
+//!                  error, fault kind and limit required to come up (see that file).
 //! Each component adds its own target as it lands (parsers first). A failing seed replays
 //! exactly.
 
@@ -14,6 +18,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const cc = @import("coalition_connection");
 const build_options = @import("build_options");
+const http_response_fuzz = @import("http_response.zig");
 
 const capacity: u32 = 16;
 const Queue = cc.BoundedQueue(u32, capacity);
@@ -605,4 +610,5 @@ pub fn main() FuzzError!void {
     comptime assert(http_buffer_size > 0);
     try runQueue(seed);
     try runHttp(seed);
+    try http_response_fuzz.run(seed);
 }
