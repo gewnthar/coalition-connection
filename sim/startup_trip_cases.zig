@@ -75,7 +75,8 @@ pub const RealCall = enum(u8) {
     now_after_max,
     /// A submitted execute, which the real type refuses with its placeholder panic.
     submit_execute,
-    /// A send naming the free entry, whose socket field is -1.
+    /// A send naming the free entry, whose socket field is -1, so the socket checks in
+    /// `get` and the real type can stop it as well as the state check.
     send_free,
     /// The same after the harness writes the socketpair's live descriptor back into the
     /// free entry, as a stale field would hold it: only the table's state check can stop
@@ -84,8 +85,9 @@ pub const RealCall = enum(u8) {
     /// A send naming an id one past the table's last entry: the id check must stop it, not
     /// an out-of-bounds index.
     send_out_of_range,
-    /// A send naming the free entry with every slot in use: the peer is checked before the
-    /// queue, so the call trips instead of returning QueueFull.
+    /// A send naming the free entry, with the stale descriptor written back as above and
+    /// every slot in use: the peer is checked before the queue, so the call trips instead
+    /// of returning QueueFull.
     send_free_queue_full,
     /// `Real.init` after startup has finished.
     init_running,
@@ -120,7 +122,6 @@ comptime {
     assert(real_free_id < real_table_size);
     assert(real_peer_id != real_free_id);
     assert(real_send_bytes.len > 0);
-    assert(!std.mem.eql(u8, message_assertion, message_execute_head));
 }
 
 pub const table_size: u32 = 4;
