@@ -18,6 +18,7 @@
 //!   http_request_size_max
 //!   http_headers_max
 //!   http_response_size_max
+//!   http_response_headers_max
 //!   http_response_buffers_max
 //!   websocket_connections_max
 //!   websocket_message_size_max
@@ -25,8 +26,9 @@
 //!   live_events_backlog_bytes_max
 //!
 //! Status: the connection table (roadmap core 4) is in `connections.zig` and the HTTP/1.1
-//! request parser (roadmap core 5) in `http_request.zig`; the rest is a
-//! stub. See docs/roadmap.md (core milestone, live-update slices).
+//! request parser (roadmap core 5) in `http_request.zig`, and the response writer (roadmap
+//! core 6) in `http_response.zig`; the rest is a stub. See docs/roadmap.md (core milestone,
+//! live-update slices).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -34,6 +36,7 @@ const constants = @import("../constants.zig");
 
 pub const connections = @import("connections.zig");
 pub const http_request = @import("http_request.zig");
+pub const http_response = @import("http_response.zig");
 
 comptime {
     assert(constants.websocket_connections_max <= constants.http_connections_max);
@@ -55,4 +58,5 @@ test "live: stub compiles and its limits are set" {
 test {
     _ = connections;
     _ = http_request;
+    _ = http_response;
 }

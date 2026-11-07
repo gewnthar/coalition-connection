@@ -85,6 +85,11 @@ pub const http_headers_max: u32 = 64;
 /// fits; bigger views paginate.
 pub const http_response_size_max: u32 = 1024 * 1024;
 
+/// Header fields a handler adds to one HTTP response, besides the Content-Length and
+/// Connection fields the response writer adds itself. Reason: a page sets a few (type,
+/// caching, cookies, security headers); 32 bounds the writer's loop with room to spare.
+pub const http_response_headers_max: u32 = 32;
+
 /// Response buffers, each `http_response_size_max` bytes, shared by all connections.
 /// Reason: a connection holds one only while it renders a page and writes it to nginx on
 /// the local socket, and nginx buffers responses for slow clients, so a buffer is back in
@@ -320,6 +325,7 @@ comptime {
     // The smallest header line is "a:" plus CRLF, 4 bytes, so a full header table must fit.
     assert(http_headers_max * 4 < http_request_size_max);
     assert(websocket_message_size_max <= http_response_size_max);
+    assert(http_response_headers_max > 0);
     assert(esi_error_limit_floor > 0);
     assert(esi_retries_max > 0);
     assert(sim_fault_percent_max < 100);
