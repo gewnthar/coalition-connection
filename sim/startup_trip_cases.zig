@@ -4,9 +4,12 @@
 //!
 //! Each case names its target and makes one call on it. A `StartupAllocator` case puts the
 //! allocator in a phase first; a connection-table case builds a small table with one free
-//! entry and the rest in use, then ends startup. A case that `trips` must stop the process
-//! on an assertion (before the child allocator is touched, for the allocator); a control
-//! case makes a call its target allows and must finish normally.
+//! entry and the rest in use, then ends startup; a real-I/O case builds a two-entry table
+//! whose entry in use holds one end of a socketpair, sets up the real I/O type on it (except
+//! for the case that sets it up too late), then ends startup. A case that `trips` must stop
+//! the process on an assertion (before the child allocator is touched, for the allocator),
+//! or, for a submitted execute, on the real type's placeholder panic; a control case makes
+//! a call its target allows and must finish normally.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -63,6 +66,64 @@ pub const TableCall = enum(u8) {
     set_state_to_reading,
 };
 
+/// A call on the real I/O type (`cc.io.real.Real`), set up on a table of
+/// `real_table_size` entries: `real_peer_id` in use, holding one end of a socketpair, and
+/// `real_free_id` released again.
+pub const RealCall = enum(u8) {
+    /// `now` after the type's last reading is set to maxInt(u64): the next reading is
+    /// below it, which the clock check must stop.
+    now_after_max,
+    /// A submitted execute, which the real type refuses with its placeholder panic.
+    submit_execute,
+    /// A send naming the free entry, whose socket field is -1, so the socket checks in
+    /// `get` and the real type can stop it as well as the state check.
+    send_free,
+    /// The same after the harness writes the socketpair's live descriptor back into the
+    /// free entry, as a stale field would hold it: only the table's state check can stop
+    /// it, and without that check the send would really go out.
+    send_free_stale_socket,
+    /// A send naming an id one past the table's last entry: the id check must stop it, not
+    /// an out-of-bounds index.
+    send_out_of_range,
+    /// A send naming the free entry, with the stale descriptor written back as above and
+    /// every slot in use: the peer is checked before the queue, so the call trips instead
+    /// of returning QueueFull.
+    send_free_queue_full,
+    /// `Real.init` after startup has finished.
+    init_running,
+    // Controls.
+    /// `now` on a fresh type: a reading at or after the last, which becomes the last.
+    now_fresh,
+    /// A send to the entry in use: completes with its byte count, and the far end of the
+    /// socketpair reads the same bytes.
+    send_peer,
+    /// A send to the entry in use with every slot in use: QueueFull, and nothing changes.
+    send_queue_full,
+};
+
+/// How a tripping case must stop: on a failed assertion, or on the real type's panic for a
+/// submitted execute. A control case doesn't stop, and carries `.assertion` unused.
+pub const Panic = enum(u8) { assertion, execute_placeholder };
+
+/// The panic message a failed std.debug.assert gives: it fails through `unreachable`.
+pub const message_assertion = "reached unreachable code";
+/// How the real type's execute panic begins. A prefix, so rewording the explanation after
+/// it doesn't break the case, but replacing the panic with an assertion does.
+pub const message_execute_head = "io.real: execute is a simulator placeholder;";
+
+pub const real_table_size: u32 = 2;
+pub const real_peer_id: u32 = 0;
+pub const real_free_id: u32 = 1;
+/// The bytes the send control sends.
+pub const real_send_bytes = "startup_trip";
+
+comptime {
+    assert(real_peer_id < real_table_size);
+    assert(real_free_id < real_table_size);
+    assert(real_peer_id != real_free_id);
+    assert(real_send_bytes.len > 0);
+}
+
 pub const table_size: u32 = 4;
 /// The one free entry; the harness acquires every entry, then releases this one. Every
 /// call is made with this one entry free, so the tests show each check at that fill level.
@@ -84,12 +145,15 @@ comptime {
 pub const Target = union(enum) {
     startup_allocator: struct { phase: Phase, call: AllocatorCall },
     connection_table: TableCall,
+    real_io: RealCall,
 };
 
 pub const Case = struct {
     name: []const u8,
     target: Target,
     trips: bool,
+    /// How a tripping case must stop.
+    panic: Panic = .assertion,
 };
 
 pub const Outcome = enum(u8) { trips, finishes };
@@ -112,6 +176,21 @@ fn onTable(name: []const u8, call: TableCall, outcome: Outcome) Case {
     return .{ .name = name, .target = .{ .connection_table = call }, .trips = outcome == .trips };
 }
 
+fn onReal(name: []const u8, call: RealCall, outcome: Outcome) Case {
+    assert(name.len > 0);
+    // Real-I/O case names start with "real_", so the build log groups them.
+    assert(std.mem.startsWith(u8, name, "real_"));
+    const panic: Panic = if (call == .submit_execute) .execute_placeholder else .assertion;
+    // Only a tripping case has a panic to match.
+    assert(panic == .assertion or outcome == .trips);
+    return .{
+        .name = name,
+        .target = .{ .real_io = call },
+        .trips = outcome == .trips,
+        .panic = panic,
+    };
+}
+
 pub const exit_finished: u8 = 0;
 pub const exit_tripped: u8 = 42;
 /// The arguments named no case. A bad argument must end the run with this code, never
@@ -124,7 +203,7 @@ pub fn expectedExit(case: Case) u8 {
     return if (case.trips) exit_tripped else exit_finished;
 }
 
-pub const cases_max: u32 = 48;
+pub const cases_max: u32 = 64;
 
 pub const cases = [_]Case{
     // Every call the running phase forbids.
@@ -180,6 +259,20 @@ pub const cases = [_]Case{
     onTable("table_release_writing", .release_writing, .finishes),
     onTable("table_get_writing", .get_writing, .finishes),
     onTable("table_set_state_to_reading", .set_state_to_reading, .finishes),
+    // The real I/O type: its clock never steps back, it refuses an execute, a send must
+    // name an entry in use (checked before the queue), and it is set up during startup only.
+    onReal("real_now_after_max", .now_after_max, .trips),
+    onReal("real_submit_execute", .submit_execute, .trips),
+    onReal("real_send_free", .send_free, .trips),
+    onReal("real_send_free_stale_socket", .send_free_stale_socket, .trips),
+    onReal("real_send_out_of_range", .send_out_of_range, .trips),
+    onReal("real_send_free_queue_full", .send_free_queue_full, .trips),
+    onReal("real_init_running", .init_running, .trips),
+    // Controls: the clock read once, a send to the entry in use, and that send on a full
+    // ring.
+    onReal("real_now_fresh", .now_fresh, .finishes),
+    onReal("real_send_peer", .send_peer, .finishes),
+    onReal("real_send_queue_full", .send_queue_full, .finishes),
 };
 
 /// The index of the case with exactly this name, or null.
@@ -239,15 +332,31 @@ comptime {
 }
 
 comptime {
+    // Every case is visited once per enum value below.
+    @setEvalBranchQuota(10_000);
     // Every table call has exactly one case.
     for (std.enums.values(TableCall)) |call| {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .connection_table => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator => {},
+            .startup_allocator, .real_io => {},
         };
         assert(found == 1);
     }
+    // Every real-I/O call has exactly one case.
+    for (std.enums.values(RealCall)) |call| {
+        var found: u32 = 0;
+        for (cases) |case| switch (case.target) {
+            .real_io => |case_call| found += @intFromBool(case_call == call),
+            .startup_allocator, .connection_table => {},
+        };
+        assert(found == 1);
+    }
+    // Only real-I/O cases expect a panic other than an assertion.
+    for (cases) |case| switch (case.target) {
+        .real_io => {},
+        .startup_allocator, .connection_table => assert(case.panic == .assertion),
+    };
 }
 
 comptime {
