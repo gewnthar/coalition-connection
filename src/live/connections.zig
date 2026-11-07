@@ -33,9 +33,8 @@ const io = @import("../io/root.zig");
 
 pub const PeerId = io.PeerId;
 
-/// A Linux file descriptor. The event loop is io_uring, so the table is Linux-only, and the
-/// type is spelled out instead of taken from a portable layer whose size varies by target.
-pub const Socket = i32;
+/// A Linux file descriptor, as the I/O boundary defines it.
+pub const Socket = io.Socket;
 
 pub const AcquireError = error{TableFull};
 
