@@ -877,3 +877,360 @@ test "real: every getrandom errno has an outcome" {
     try testing.expectEqual(Step.unavailable, classify(.PERM));
     try testing.expectEqual(Step.unavailable, classify(.NOMEM));
 }
+
+/// Far ends in the send soak. Reason: enough that closes and live peers mix in one run, few
+/// enough that each gets thousands of bytes.
+const soak_peers_count: u32 = 4;
+/// Rounds per seed. Each round tops the ring up and then polls part of it back.
+const soak_rounds_max: u32 = 32;
+/// Every `soak_fill_every`-th round fills the ring to its depth, so every slot is taken.
+const soak_fill_every: u32 = 8;
+/// A round closes a far end with odds of one in this many. Reason: about four closes in a
+/// run of 32 rounds, so most seeds close all three closable far ends partway through.
+const soak_close_odds: u32 = 8;
+/// Largest send. Reason: small enough that a peer's socket buffer rarely fills; when it
+/// does, the send waits in the kernel until `pollDown` drains that far end.
+const soak_send_bytes_max: u32 = 512;
+/// Operation ids a run can use: each round submits at most a full ring.
+const soak_operations_max: u32 = soak_rounds_max * slots_count;
+/// The buffer one read of a far end fills.
+const soak_scratch_bytes: u32 = 4096;
+/// Reads per drain of one far end. Reason: a full ring of the largest sends to one peer is
+/// 128 KiB, 32 reads; the rest is margin.
+const soak_reads_max: u32 = 1_024;
+/// Empty polls in a row before the soak gives up on the kernel, 1 ms apart.
+const soak_empty_polls_max: u32 = poll_attempts_max;
+/// Seeds the soak replays. A failed check prints its seed. Each seed's schedule (targets,
+/// peers, lengths, closes, how many to poll back) comes from one stream, and poll buffer
+/// sizes from a second, so kernel timing can't change what a seed submits.
+const soak_seeds = [_]u64{ 0x5eed, 1, 2, 3, 4, 5, 0xdead_beef, 0x0123_4567_89ab_cdef };
+
+comptime {
+    assert(soak_peers_count >= 2); // Peer 0 is never closed; at least one other is closable.
+    assert(soak_peers_count <= std.math.maxInt(u8)); // SoakOperation.peer is a u8.
+    assert(soak_rounds_max >= 2 * soak_fill_every); // At least two full rounds: slots reused.
+    assert(soak_send_bytes_max <= constants.http_response_size_max);
+    // One drain can read a full ring's bytes to one peer, so the final drain empties it.
+    assert(@as(u64, slots_count) * soak_send_bytes_max <= @as(u64, soak_reads_max - 1) * soak_scratch_bytes);
+}
+
+/// What the soak knows about one operation it submitted.
+const SoakOperation = struct {
+    peer: u8,
+    length: u32,
+    /// The far end was closed before this send was submitted, so it must end in PeerDown.
+    after_close: bool,
+    completions: u8,
+};
+
+/// A seeded run of many sends over several socketpairs, with far ends closed partway.
+/// Set up in place, because `Real` keeps a pointer to the table.
+const Soak = struct {
+    seed: u64,
+    /// The schedule: targets, peers, lengths, closes and how many to poll back.
+    schedule: std.Random.DefaultPrng,
+    /// Poll buffer sizes only; how many are drawn depends on kernel timing.
+    poll_sizes: std.Random.DefaultPrng,
+    startup: StartupAllocator,
+    gpa: std.mem.Allocator,
+    table: connections.Table,
+    real: Real,
+    locals: [soak_peers_count]linux.fd_t,
+    /// -1 once the soak has closed it.
+    remotes: [soak_peers_count]linux.fd_t,
+    peers: [soak_peers_count]io.PeerId,
+    operations: [soak_operations_max]SoakOperation,
+    /// Operation ids handed out so far; the next id is this.
+    submitted: u32,
+    completed: u32,
+    /// Times each slot was taken by a submission.
+    slot_uses: [slots_count]u32,
+    /// Bytes successful completions report sent, and bytes the far end has read, per peer.
+    sent: [soak_peers_count]u64,
+    received: [soak_peers_count]u64,
+    sends_after_close: u32,
+    peer_down: u32,
+    closes: u32,
+    /// Every send points into this; it never changes, so no send's bytes move in flight.
+    bytes: [soak_send_bytes_max]u8,
+
+    fn setUp(self: *Soak, seed: u64) !void {
+        self.seed = seed;
+        self.schedule = .init(seed);
+        self.poll_sizes = .init(seed ^ 0x9e37_79b9_7f4a_7c15);
+        self.locals = @splat(-1);
+        self.remotes = @splat(-1);
+        errdefer for (self.locals, self.remotes) |local, remote| {
+            if (local >= 0) _ = linux.close(local);
+            if (remote >= 0) _ = linux.close(remote);
+        };
+        self.startup = .init(testing.allocator, soak_peers_count * connections.entry_bytes);
+        self.gpa = self.startup.allocator();
+        self.table = try connections.Table.init(self.gpa, soak_peers_count);
+        errdefer self.table.deinit(self.gpa);
+        for (&self.locals, &self.remotes, &self.peers) |*local, *remote, *peer| {
+            var fds: [2]linux.fd_t = undefined;
+            const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+            try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &fds)));
+            local.* = fds[0];
+            remote.* = fds[1];
+            peer.* = try self.table.acquire(fds[0]);
+        }
+        self.real = try Real.init(&self.startup, &self.table);
+        self.startup.finishStartup();
+        self.submitted = 0;
+        self.completed = 0;
+        self.slot_uses = @splat(0);
+        self.sent = @splat(0);
+        self.received = @splat(0);
+        self.sends_after_close = 0;
+        self.peer_down = 0;
+        self.closes = 0;
+        var position: u32 = 0;
+        while (position < soak_send_bytes_max) : (position += 1) self.bytes[position] = @truncate(position);
+        assert(self.real.inFlight() == 0);
+        assert(self.table.count() == soak_peers_count);
+    }
+
+    /// Closes the ring first, so nothing in flight still names a socket. After a failed
+    /// check, operations may still be in flight: they are polled back and dropped. If some
+    /// never come back, the ring is left open and false is returned, so the caller leaks
+    /// this rather than free bytes the kernel may still read; the check's failure shows
+    /// instead of `deinit`'s assertion.
+    fn tearDown(self: *Soak) bool {
+        assert(self.table.count() == soak_peers_count);
+        assert(self.startup.phase == .running);
+        var completions: [slots_count]io.Completion = undefined;
+        var polls: u32 = 0;
+        while (self.real.inFlight() > 0 and polls < soak_empty_polls_max) : (polls += 1) {
+            if (self.real.poll(&completions) > 0) continue;
+            _ = self.drain();
+            const pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+            _ = linux.nanosleep(&pause, null);
+        }
+        const settled = self.real.inFlight() == 0;
+        if (settled) self.real.deinit();
+        for (self.peers, self.locals) |peer, local| assert(self.table.release(peer) == local);
+        self.startup.beginShutdown();
+        self.table.deinit(self.gpa);
+        assert(self.startup.bytes_live == 0);
+        for (self.locals, self.remotes) |local, remote| {
+            _ = linux.close(local);
+            if (remote >= 0) _ = linux.close(remote);
+        }
+        return settled;
+    }
+
+    /// Submits one send of random length to a random peer, and checks the slot it took.
+    fn submitOne(self: *Soak) !void {
+        assert(self.real.inFlight() < slots_count);
+        assert(self.submitted < soak_operations_max);
+        const random = self.schedule.random();
+        const peer = random.uintLessThan(u8, soak_peers_count);
+        const length = random.intRangeAtMost(u32, 1, soak_send_bytes_max);
+        const id = self.submitted;
+        const after_close = self.remotes[peer] < 0;
+        self.operations[id] = .{ .peer = peer, .length = length, .after_close = after_close, .completions = 0 };
+        try self.real.submit(.{
+            .id = id,
+            .operation = .{ .send = .{ .peer = self.peers[peer], .bytes = self.bytes[0..length] } },
+        });
+        self.submitted += 1;
+        if (after_close) self.sends_after_close += 1;
+        // Exactly one slot in use holds the new id; found by search, so the test doesn't
+        // depend on how the free list orders slots.
+        var found: ?u32 = null;
+        for (self.real.slots, 0..) |slot, index| {
+            if (!slot.in_use or slot.id != id) continue;
+            try testing.expect(found == null);
+            found = @intCast(index);
+        }
+        const index = found orelse return error.TestExpectedSlot;
+        self.slot_uses[index] += 1;
+        try testing.expectEqual(self.submitted - self.completed, self.real.inFlight());
+    }
+
+    /// Checks one completion against what was submitted, and counts it.
+    fn record(self: *Soak, completion: io.Completion) !void {
+        try testing.expect(self.completed < self.submitted);
+        try testing.expect(completion.id < self.submitted);
+        const operation = &self.operations[@intCast(completion.id)];
+        try testing.expectEqual(@as(u8, 0), operation.completions); // Exactly once.
+        operation.completions = 1;
+        self.completed += 1;
+        if (completion.result.send) |sent| {
+            try testing.expect(!operation.after_close);
+            try testing.expect(sent > 0 and sent <= operation.length);
+            self.sent[operation.peer] += sent;
+        } else |err| switch (err) {
+            // Only a closed far end makes a send fail. A send in flight when its far end
+            // closed may still have gone through, but one submitted after can't.
+            error.PeerDown => {
+                try testing.expect(self.remotes[operation.peer] < 0);
+                self.peer_down += 1;
+            },
+            // A send on a blocking socketpair waits in the kernel instead of failing with
+            // EAGAIN; only a machine out of buffers (ENOBUFS, ENOMEM) could report this.
+            error.Backpressure => return error.TestUnexpectedBackpressure,
+        }
+        assert(self.completed <= self.submitted);
+    }
+
+    /// Reads whatever the open far ends have received, without waiting. Returns whether
+    /// every open far end was read until it had nothing more.
+    fn drain(self: *Soak) bool {
+        assert(self.closes < soak_peers_count);
+        assert(self.remotes[0] >= 0);
+        var empty: bool = true;
+        for (self.remotes, &self.received) |remote, *received| {
+            if (remote < 0) continue;
+            var scratch: [soak_scratch_bytes]u8 = undefined;
+            var reads: u32 = 0;
+            while (reads < soak_reads_max) : (reads += 1) {
+                const rc = linux.recvfrom(remote, &scratch, scratch.len, linux.MSG.DONTWAIT, null, null);
+                if (linux.errno(rc) != .SUCCESS or rc == 0) break;
+                assert(rc <= scratch.len);
+                received.* += @as(u32, @intCast(rc));
+            }
+            if (reads == soak_reads_max) empty = false;
+        }
+        return empty;
+    }
+
+    /// Polls until exactly `leftover` operations are in flight, never asking for more
+    /// completions than that leaves. Fails the test if the kernel stops completing.
+    fn pollDown(self: *Soak, leftover: u32) !void {
+        assert(leftover <= self.real.inFlight());
+        assert(leftover < slots_count);
+        var completions: [slots_count]io.Completion = undefined;
+        var empty_polls: u32 = 0;
+        var polls: u32 = 0;
+        // Each non-empty poll takes at least one completion, so at most slots_count of them,
+        // each after at most soak_empty_polls_max empty ones.
+        const polls_max: u32 = slots_count * (soak_empty_polls_max + 1);
+        while (self.real.inFlight() > leftover and empty_polls < soak_empty_polls_max) : (polls += 1) {
+            assert(polls < polls_max);
+            const wanted = self.real.inFlight() - leftover;
+            const size = self.poll_sizes.random().intRangeAtMost(u32, 1, wanted);
+            const got = self.real.poll(completions[0..size]);
+            for (completions[0..got]) |completion| try self.record(completion);
+            _ = self.drain();
+            if (got > 0) {
+                empty_polls = 0;
+                continue;
+            }
+            empty_polls += 1;
+            const pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+            _ = linux.nanosleep(&pause, null);
+        }
+        try testing.expectEqual(leftover, self.real.inFlight());
+        try testing.expectEqual(self.submitted - self.completed, self.real.inFlight());
+    }
+
+    /// Closes one random far end other than peer 0, if any is still open. Our own end stays
+    /// open, as the contract requires while its sends are in flight.
+    fn closeOne(self: *Soak) !void {
+        assert(self.remotes[0] >= 0);
+        const closes_before = self.closes;
+        const start = self.schedule.random().intRangeAtMost(u32, 1, soak_peers_count - 1);
+        var probes: u32 = 0;
+        while (probes < soak_peers_count - 1) : (probes += 1) {
+            const peer = 1 + (start - 1 + probes) % (soak_peers_count - 1);
+            if (self.remotes[peer] < 0) continue;
+            try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.close(self.remotes[peer])));
+            self.remotes[peer] = -1;
+            self.closes += 1;
+            break;
+        }
+        assert(self.closes <= closes_before + 1);
+        assert(self.closes < soak_peers_count);
+    }
+
+    /// A full ring refuses one more submission and changes nothing.
+    fn expectFullRefusal(self: *Soak) !void {
+        assert(self.real.inFlight() == slots_count);
+        assert(self.real.free_count == 0);
+        const submitted_before = self.real.submitted;
+        const sqe_tail_before = self.real.ring.sq.sqe_tail;
+        const slots_before = self.real.slots;
+        const refused: io.Submission = .{
+            .id = self.submitted,
+            .operation = .{ .send = .{ .peer = self.peers[0], .bytes = self.bytes[0..1] } },
+        };
+        try testing.expectError(error.QueueFull, self.real.submit(refused));
+        try testing.expectEqual(submitted_before, self.real.submitted);
+        try testing.expectEqual(sqe_tail_before, self.real.ring.sq.sqe_tail);
+        try testing.expectEqualSlices(Slot, &slots_before, &self.real.slots);
+        try testing.expectEqual(slots_count, self.real.inFlight());
+    }
+
+    /// One round: top the ring up to a target, maybe close a far end, poll part of it back.
+    fn round(self: *Soak, number: u32) !void {
+        assert(number < soak_rounds_max);
+        assert(self.real.inFlight() < slots_count);
+        const random = self.schedule.random();
+        // At least one send a round, so there is always something to poll back.
+        const target = if (number % soak_fill_every == 0)
+            slots_count
+        else
+            random.intRangeAtMost(u32, self.real.inFlight() + 1, slots_count);
+        var submissions: u32 = 0;
+        while (self.real.inFlight() < target) : (submissions += 1) {
+            assert(submissions < slots_count);
+            try self.submitOne();
+        }
+        if (target == slots_count) try self.expectFullRefusal();
+        // Random closes, plus one before the second full round if none came yet, so every
+        // seed sends to a closed far end.
+        const forced = number == soak_fill_every - 1 and self.closes == 0;
+        if (forced or random.uintLessThan(u32, soak_close_odds) == 0) try self.closeOne();
+        try self.pollDown(random.uintLessThan(u32, self.real.inFlight()));
+    }
+
+    /// Runs every round, then lets everything finish and checks the totals.
+    fn run(self: *Soak) !void {
+        assert(self.submitted == 0);
+        assert(self.real.inFlight() == 0);
+        errdefer std.debug.print("real: send soak failed with seed 0x{x}\n", .{self.seed});
+        var number: u32 = 0;
+        while (number < soak_rounds_max) : (number += 1) try self.round(number);
+        try self.pollDown(0);
+        try self.checkTotals();
+    }
+
+    /// After the run: every operation completed once, every slot was reused, and each far
+    /// end never closed read exactly the bytes its sends reported.
+    fn checkTotals(self: *Soak) !void {
+        assert(self.real.inFlight() == 0);
+        assert(self.submitted <= soak_operations_max);
+        try testing.expectEqual(self.submitted, self.completed);
+        try testing.expectEqual(@as(u64, self.submitted), self.real.submitted);
+        try testing.expectEqual(self.real.submitted, self.real.completed);
+        for (self.operations[0..self.submitted]) |operation| {
+            try testing.expectEqual(@as(u8, 1), operation.completions);
+        }
+        for (self.slot_uses) |uses| try testing.expect(uses >= 2);
+        // Every send has completed, so every byte reported sent is already in a far end's
+        // buffer: one drain reads all of it.
+        try testing.expect(self.drain());
+        for (self.remotes, self.sent, self.received) |remote, sent, received| {
+            if (remote >= 0) try testing.expectEqual(sent, received);
+        }
+        try testing.expect(self.sent[0] > 0);
+        // The run did what it is for: sends after a close, each of which failed.
+        try testing.expect(self.sends_after_close >= 1);
+    }
+};
+
+test "real: a seeded send soak over socketpairs completes every send once and frees every slot" {
+    for (soak_seeds) |seed| {
+        const soak = try testing.allocator.create(Soak);
+        soak.setUp(seed) catch |err| {
+            testing.allocator.destroy(soak);
+            return err;
+        };
+        // A soak whose ring never settled is leaked on purpose; see `tearDown`.
+        defer if (soak.tearDown()) testing.allocator.destroy(soak);
+        try soak.run();
+    }
+}
