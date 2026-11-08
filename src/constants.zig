@@ -157,6 +157,11 @@ pub const config_load_bytes_max: u64 = config_file_size_max + 2 + config_parse_s
 /// including the NUL that ends the path.
 pub const config_socket_path_max: u32 = 107;
 
+/// Longest path of the config file itself, in bytes, as the server's one command-line
+/// argument. Reason: Linux's `PATH_MAX` is 4096 bytes including the NUL that ends a path, so
+/// no longer path can be opened, and the bound caps the scan for the argument's end.
+pub const config_file_path_max: u32 = 4095;
+
 /// Fields in the config file. Reason: the file holds two today; 16 leaves room for later
 /// settings and bounds what the ZON parser is given.
 pub const config_fields_max: u32 = 16;
