@@ -406,27 +406,60 @@ fn tableCallAllowed(call: trip.TableCall) bool {
         .release_out_of_range,
         .get_out_of_range,
         .set_state_out_of_range,
+        .lookup_out_of_range,
+        .release_stale,
+        .get_stale,
+        .set_state_stale,
         => false,
     };
-    // Every allowed call names an entry in use; every forbidden one names the free entry,
-    // a move to free, or an id out of range.
-    assert(allowed == (tableCallId(call) != trip.free_id and call != .set_state_to_free and
-        tableCallId(call) < trip.table_size));
+    // Every allowed call names an entry in use under its live generation; every forbidden
+    // one names the free entry, a move to free, an id out of range, or a stale generation.
+    const parts: connections.IdParts = @bitCast(tableCallId(call));
+    const live = parts.index < trip.table_size and parts.index != trip.free_id and
+        parts.generation == live_generation;
+    assert(allowed == (live and call != .set_state_to_free));
     return allowed;
 }
 
-/// The id the call names.
-fn tableCallId(call: trip.TableCall) u32 {
-    const id: u32 = switch (call) {
+/// The generation of every entry the harness holds in use: none of them is ever released.
+const live_generation: connections.Generation = 0;
+
+/// The entry index the call names.
+fn tableCallIndex(call: trip.TableCall) u32 {
+    const index: u32 = switch (call) {
         .release_free, .get_free, .set_state_free => trip.free_id,
         .release_free_stale_socket, .get_free_stale_socket => trip.free_id,
         .release_out_of_range, .get_out_of_range, .set_state_out_of_range => trip.table_size,
+        .lookup_out_of_range => trip.table_size,
         .release_reading, .get_reading, .set_state_to_writing, .set_state_to_free => trip.reading_id,
+        .release_stale, .get_stale, .set_state_stale => trip.reading_id,
         .release_writing, .get_writing, .set_state_to_reading => trip.writing_id,
     };
-    assert(id <= trip.table_size);
-    assert(id != trip.free_id or call != .set_state_to_free);
-    return id;
+    assert(index <= trip.table_size);
+    assert(index != trip.free_id or call != .set_state_to_free);
+    return index;
+}
+
+/// The generation of the free entry, released once during setup: the id the next acquire
+/// would hand out carries it, so a call naming the free entry through that id passes the
+/// generation check and only the state check can stop it.
+const free_generation: connections.Generation = live_generation +% 1;
+
+/// The id the call names: its entry's index under that entry's current generation, except
+/// for the stale cases, which carry the generation before it (wrapping), one no live id
+/// holds, so only the generation check can stop them.
+fn tableCallId(call: trip.TableCall) connections.PeerId {
+    const stale = call == .release_stale or call == .get_stale or call == .set_state_stale;
+    const index = tableCallIndex(call);
+    const generation: connections.Generation = if (stale)
+        live_generation -% 1
+    else if (index == trip.free_id)
+        free_generation
+    else
+        live_generation;
+    assert(!stale or index == trip.reading_id); // A stale id names an entry in use.
+    assert(index < trip.table_size or generation == live_generation);
+    return @bitCast(connections.IdParts{ .index = @intCast(index), .generation = generation });
 }
 
 fn socketOf(id: u32) connections.Socket {
@@ -503,14 +536,16 @@ fn callTable(table: *connections.Table, call: trip.TableCall) connections.Socket
         .release_out_of_range,
         .release_reading,
         .release_writing,
+        .release_stale,
         => table.release(id),
         .get_free,
         .get_free_stale_socket,
         .get_out_of_range,
+        .get_stale,
         .get_reading,
         .get_writing,
         => table.get(id).socket,
-        .set_state_free, .set_state_out_of_range, .set_state_to_writing => state: {
+        .set_state_free, .set_state_out_of_range, .set_state_stale, .set_state_to_writing => state: {
             table.setState(id, .writing);
             break :state -1;
         },
@@ -521,6 +556,10 @@ fn callTable(table: *connections.Table, call: trip.TableCall) connections.Socket
         .set_state_to_reading => state: {
             table.setState(id, .reading);
             break :state -1;
+        },
+        .lookup_out_of_range => lookup: {
+            _ = table.lookup(id);
+            break :lookup -1;
         },
     };
 }
@@ -535,52 +574,68 @@ fn tableControlHeld(
     socket: connections.Socket,
 ) bool {
     assert(!armed);
-    const id = tableCallId(call);
-    assert(id < trip.table_size and id != trip.free_id);
+    const index = tableCallIndex(call);
+    assert(index < trip.table_size and index != trip.free_id);
     if (child_calls != child_calls_armed) return false;
     var other: u32 = 0;
     while (other < trip.table_size) : (other += 1) {
-        if (other == id) continue;
+        if (other == index) continue;
         if (!std.meta.eql(table.entries[other], before[other])) return false;
     }
     assert(other == trip.table_size);
-    const entry = table.entries[id];
+    const entry = table.entries[index];
     const expected: Entry = switch (call) {
-        .release_reading, .release_writing => .{ .socket = -1, .state = .free },
-        .get_reading, .get_writing => before[id],
-        .set_state_to_writing => .{ .socket = before[id].socket, .state = .writing },
-        .set_state_to_reading => .{ .socket = before[id].socket, .state = .reading },
+        // A release advances the entry's generation, so the id it was called with is stale.
+        .release_reading, .release_writing => .{
+            .socket = -1,
+            .state = .free,
+            .generation = before[index].generation +% 1,
+        },
+        .get_reading, .get_writing => before[index],
+        .set_state_to_writing => state: {
+            var moved = before[index];
+            moved.state = .writing;
+            break :state moved;
+        },
+        .set_state_to_reading => state: {
+            var moved = before[index];
+            moved.state = .reading;
+            break :state moved;
+        },
         else => unreachable, // tableCallAllowed: the comptime block admits only these.
     };
     if (!std.meta.eql(entry, expected)) return false;
     const released = call == .release_reading or call == .release_writing;
     const socket_expected: connections.Socket = if (call == .get_reading or call == .get_writing or released)
-        socketOf(id)
+        socketOf(index)
     else
         -1;
     if (socket != socket_expected) return false;
     const count_expected: u32 = if (released) trip.table_size - 2 else trip.table_size - 1;
     if (table.count() != count_expected) return false;
-    if (released and table.free_ids[table.free_count - 1] != id) return false;
+    if (released and table.free_indices[table.free_count - 1] != index) return false;
+    if (released and table.lookup(tableCallId(call)) != null) return false;
     return tableAgrees(table);
 }
 
-/// Whether the free stack and the entries agree: every stacked id names a free entry and is
-/// stacked once, and every free entry is stacked. The table's own `assertInvariants`
-/// checks the same, but a failed assertion here would read as a panic outside the call.
+/// Whether the free stack and the entries agree: every stacked index names a free entry and
+/// is stacked once, every free entry is stacked, and no free entry holds a socket. The
+/// table's own `assertInvariants` checks the same, but a failed assertion here would read
+/// as a panic outside the call.
 fn tableAgrees(table: *const connections.Table) bool {
     assert(!armed);
     assert(table.entries.len == trip.table_size);
     if (table.capacity() != trip.table_size) return false;
     if (table.free_count > trip.table_size) return false;
     var stacked: [trip.table_size]bool = @splat(false);
-    for (table.free_ids[0..table.free_count]) |id| {
-        if (id >= trip.table_size) return false;
-        if (stacked[id] or table.entries[id].state != .free) return false;
-        stacked[id] = true;
+    for (table.free_indices[0..table.free_count]) |index| {
+        if (index >= trip.table_size) return false;
+        if (stacked[index] or table.entries[index].state != .free) return false;
+        stacked[index] = true;
     }
     for (table.entries, stacked) |entry, is_stacked| {
         if ((entry.state == .free) != is_stacked) return false;
+        if (entry.state == .free and entry.socket != -1) return false;
     }
     return true;
 }
@@ -618,17 +673,24 @@ fn realCallAllowed(call: trip.RealCall) bool {
     return allowed;
 }
 
-/// The peer a send case names, or null for a call that sends nothing.
+/// The peer a send case names, or null for a call that sends nothing. The free entry was
+/// released once during setup, so it is named under its advanced generation: the id the
+/// next acquire would hand out, which only the table's state check can refuse.
 fn realCallPeer(call: trip.RealCall) ?cc.io.PeerId {
+    const free_peer: cc.io.PeerId = @bitCast(connections.IdParts{
+        .index = trip.real_free_id,
+        .generation = free_generation,
+    });
     const peer: ?cc.io.PeerId = switch (call) {
-        .send_free, .send_free_stale_socket, .send_free_queue_full => trip.real_free_id,
+        .send_free, .send_free_stale_socket, .send_free_queue_full => free_peer,
         .send_out_of_range => trip.real_table_size,
         .send_peer, .send_queue_full => trip.real_peer_id,
         .now_after_max, .submit_execute, .init_running, .now_fresh => null,
     };
     // Only the two send controls name the entry in use; the forbidden sends name the free
     // entry or an id past the table.
-    assert(peer == null or peer.? <= trip.real_table_size);
+    const index: ?connections.Index = if (peer) |id| @as(connections.IdParts, @bitCast(id)).index else null;
+    assert(index == null or index.? <= trip.real_table_size);
     assert((peer == trip.real_peer_id) == (call == .send_peer or call == .send_queue_full));
     return peer;
 }

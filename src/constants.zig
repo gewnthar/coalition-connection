@@ -67,11 +67,12 @@ pub const esi_retries_max: u32 = 3;
 /// the connection table sized at startup. Provisional.
 pub const http_connections_max: u32 = 4_096;
 
-/// Bytes of connection-table state per connection: its entry (socket, state and request
-/// head scan) plus its slot on the free-id stack. Reason: the table is sized once at
-/// startup and counted in the memory table; `src/live/connections.zig` checks at compile
-/// time that its entry fits. The entry fills all 16 bytes on every target, so any further
-/// field means raising this number in review.
+/// Bytes of connection-table state per connection: its entry (socket, state, generation
+/// and request head scan) plus its slot on the free-index stack. Reason: the table is sized
+/// once at startup and counted in the memory table; `src/live/connections.zig` checks at
+/// compile time that its entry fits. The entry and its slot take 14 of the 16 bytes on
+/// every target, so any further field beyond one more byte means raising this number in
+/// review.
 pub const http_connection_entry_size_max: u32 = 16;
 
 /// Largest HTTP request head plus body. Reason: forms are small; anything larger is
@@ -248,7 +249,7 @@ pub const memory_table_rows_max: u32 = 64;
 /// for the real I/O type, with its in-flight slots), not stacks or the program itself.
 pub const memory_table = [_]MemoryRow{
     .{
-        .name = "Connection table entry and free-id slot, one per connection",
+        .name = "Connection table entry and free-index slot, one per connection",
         .count = http_connections_max,
         .size = http_connection_entry_size_max,
     },

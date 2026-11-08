@@ -81,6 +81,8 @@ const Workload = struct {
     outstanding: [outstanding_window]bool,
     /// The socket each entry in use holds, or -1.
     sockets: [capacity]io.Socket,
+    /// The id each entry in use was accepted under; meaningful only where `sockets` isn't -1.
+    peers: [capacity]io.PeerId,
     in_use: u32,
     /// The largest socket an arrival got; the simulator never hands one out twice.
     socket_last: io.Socket,
@@ -150,15 +152,17 @@ fn check(w: *Workload, completion: io.Completion) Error!void {
         trace(&w.counts, 1 | outcome << 8 | completion.id << 16);
         return;
     };
-    if (peer >= capacity or w.sockets[peer] != -1) return error.InvariantBroken;
+    const index = @as(connections.IdParts, @bitCast(peer)).index;
+    if (index >= capacity or w.sockets[index] != -1) return error.InvariantBroken;
     const socket = w.table.get(peer).socket;
     if (socket <= w.socket_last) return error.InvariantBroken; // A socket handed out twice.
     w.socket_last = socket;
-    w.sockets[peer] = socket;
+    w.sockets[index] = socket;
+    w.peers[index] = peer;
     w.in_use += 1;
     w.counts.accepted += 1;
     w.counts.peak = @max(w.counts.peak, w.in_use);
-    trace(&w.counts, 2 | @as(u64, peer) << 8 | completion.id << 32);
+    trace(&w.counts, 2 | (@as(u64, index) << 8) | (completion.id << 32));
     // The simulator took the entries for a whole poll at once, in completion order, so the
     // model catches up with the table only at the end of the batch (`drain` checks it).
     assert(w.in_use <= w.table.count());
@@ -184,17 +188,18 @@ fn drain(w: *Workload) Error!void {
 /// Releases a random connection in use, found by probing from a random entry.
 fn depart(w: *Workload) Error!void {
     assert(w.in_use > 0);
-    var peer = w.random.uintLessThan(io.PeerId, capacity);
+    var index = w.random.uintLessThan(u32, capacity);
     var probes: u32 = 0;
-    while (w.sockets[peer] == -1) : (probes += 1) {
+    while (w.sockets[index] == -1) : (probes += 1) {
         assert(probes < capacity); // At least one entry is in use.
-        peer = (peer + 1) % capacity;
+        index = (index + 1) % capacity;
     }
-    if (w.table.release(peer) != w.sockets[peer]) return error.InvariantBroken;
-    w.sockets[peer] = -1;
+    const peer = w.peers[index];
+    if (w.table.release(peer) != w.sockets[index]) return error.InvariantBroken;
+    w.sockets[index] = -1;
     w.in_use -= 1;
     w.counts.departures += 1;
-    trace(&w.counts, 3 | @as(u64, peer) << 8);
+    trace(&w.counts, 3 | (@as(u64, index) << 8));
     assert(w.in_use == w.table.count());
 }
 
@@ -265,6 +270,7 @@ fn runOnce(seed: u64, w: *Workload) Error!Counts {
         .next_id = 0,
         .outstanding = @splat(false),
         .sockets = @splat(-1),
+        .peers = undefined,
         .in_use = 0,
         .socket_last = -1,
     };

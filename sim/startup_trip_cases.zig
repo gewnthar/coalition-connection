@@ -39,8 +39,9 @@ pub const AllocatorCall = enum(u8) {
 /// A call on the connection table the harness builds: `table_size` entries, `free_id`
 /// released again, `writing_id` moved to writing, and the others in use and reading.
 pub const TableCall = enum(u8) {
-    // release, get and setState(.writing) on the free entry. Its socket field is -1, so
-    // release and get may trip on their socket check as well as their state check.
+    // release, get and setState(.writing) on the free entry, named under its current
+    // generation (the id the next acquire would hand out), so the generation check passes.
+    // Its socket field is -1, but the state check comes first.
     release_free,
     get_free,
     set_state_free,
@@ -55,6 +56,15 @@ pub const TableCall = enum(u8) {
     release_out_of_range,
     get_out_of_range,
     set_state_out_of_range,
+    // lookup, which completions use, returns null for a stale id, but an index past the
+    // table is still a bug and must trip on the id check.
+    lookup_out_of_range,
+    // The same three calls through a stale id for the reading entry: its index is in use,
+    // but the id carries another generation, as an id kept past its connection's release
+    // would. The generation check alone must stop these.
+    release_stale,
+    get_stale,
+    set_state_stale,
     // Controls on the reading entry: release, get, and a move to writing.
     release_reading,
     get_reading,
@@ -75,8 +85,8 @@ pub const RealCall = enum(u8) {
     now_after_max,
     /// A submitted execute, which the real type refuses with its placeholder panic.
     submit_execute,
-    /// A send naming the free entry, whose socket field is -1, so the socket checks in
-    /// `get` and the real type can stop it as well as the state check.
+    /// A send naming the free entry under its current generation, so the generation check
+    /// passes and the table's state check stops it.
     send_free,
     /// The same after the harness writes the socketpair's live descriptor back into the
     /// free entry, as a stale field would hold it: only the table's state check can stop
@@ -240,9 +250,9 @@ pub const cases = [_]Case{
     onAllocator("free_startup", .startup, .free, .finishes),
     onAllocator("free_shutdown", .shutdown, .free, .finishes),
     onAllocator("resize_zero_shutdown", .shutdown, .resize_zero, .finishes),
-    // The connection table: an entry not in use can't be released, read or moved, and only
-    // release frees an entry. The first two may trip on the socket check; the stale-socket
-    // pair below pins the state check.
+    // The connection table: an entry not in use, or an id gone stale, can't be released,
+    // read or moved, and only release frees an entry. The stale-socket pair pins the state
+    // check even with a valid-looking socket; the stale trio pins the generation check.
     onTable("table_release_free", .release_free, .trips),
     onTable("table_get_free", .get_free, .trips),
     onTable("table_set_state_free", .set_state_free, .trips),
@@ -252,6 +262,10 @@ pub const cases = [_]Case{
     onTable("table_release_out_of_range", .release_out_of_range, .trips),
     onTable("table_get_out_of_range", .get_out_of_range, .trips),
     onTable("table_set_state_out_of_range", .set_state_out_of_range, .trips),
+    onTable("table_lookup_out_of_range", .lookup_out_of_range, .trips),
+    onTable("table_release_stale", .release_stale, .trips),
+    onTable("table_get_stale", .get_stale, .trips),
+    onTable("table_set_state_stale", .set_state_stale, .trips),
     // Controls: the same calls on entries in use, reading and writing.
     onTable("table_release_reading", .release_reading, .finishes),
     onTable("table_get_reading", .get_reading, .finishes),

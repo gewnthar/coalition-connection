@@ -2,12 +2,14 @@
 //!
 //! Seeded arrivals and departures drive a full-size table (http_connections_max entries) to
 //! its limit and past it, then empty it again, for `rounds` rounds. A model kept beside the
-//! table predicts every answer: which id an arrival gets (the free stack hands out the id
-//! released last), when an arrival is refused, which socket a departure hands back, and
-//! each entry's state. A refused arrival must leave the whole table as it was. From the
-//! second round on, the table can only hand out ids it took back earlier.
+//! table predicts every answer: which entry an arrival gets (the free stack hands out the
+//! entry released last) and under which generation (one more than the entry's releases so
+//! far), when an arrival is refused, which socket a departure hands back, and each entry's
+//! state. A refused arrival must leave the whole table as it was, and when an entry is
+//! handed out again, the id it was released under must find nothing. From the second round on, the table can only hand out entries it took
+//! back earlier.
 //!
-//! Each step folds what it did (the id, socket and state) into a trace hash, and the
+//! Each step folds what it did (the entry, socket and state) into a trace hash, and the
 //! workload runs twice per seed: both runs must produce the same trace. Before the runs, a
 //! startup with one byte too few must fail with OutOfMemory and leave nothing allocated.
 
@@ -19,6 +21,8 @@ const constants = cc.constants;
 const connections = cc.live.connections;
 const Table = connections.Table;
 const PeerId = connections.PeerId;
+const Index = connections.Index;
+const IdParts = connections.IdParts;
 const Socket = connections.Socket;
 const State = connections.State;
 
@@ -47,7 +51,7 @@ const phase_steps_max: u32 = 8 * capacity;
 const socket_first: Socket = 0;
 
 comptime {
-    assert(rounds >= 2); // Round 2 onward hands out only ids released before.
+    assert(rounds >= 2); // Round 2 onward hands out only entries released before.
     assert(fill_arrival_eighths > 4 and empty_arrival_eighths < 4);
     assert(state_change_eighths < 8);
     // Every arrival gets a distinct socket, and the last one still fits a Socket.
@@ -61,7 +65,7 @@ pub const Counts = struct {
     accepted: u32 = 0,
     refused: u32 = 0,
     departures: u32 = 0,
-    /// Arrivals handed an id that was released before.
+    /// Arrivals handed an entry that was released before.
     reused: u32 = 0,
     state_changes: u32 = 0,
     peak: u32 = 0,
@@ -82,30 +86,35 @@ fn trace(counts: *Counts, value: u64) void {
 
 /// The table as it should be.
 const Model = struct {
-    /// The socket each id in use was given, or -1.
+    /// The socket each entry in use was given, or -1.
     sockets: [capacity]Socket,
     states: [capacity]State,
-    /// The free stack as it should be: `free_ids[0..free_count]`, top last.
-    free_ids: [capacity]PeerId,
+    /// The id each entry was last handed out under: live while `sockets` isn't -1, stale
+    /// after its release; meaningful once `acquired` is above zero.
+    ids: [capacity]PeerId,
+    /// The free stack as it should be: `free_indices[0..free_count]`, top last.
+    free_indices: [capacity]Index,
     free_count: u32,
-    /// How many times each id was handed out.
+    /// How many times each entry was handed out. Every hand-out but the newest was
+    /// released, so for an entry in use this is one more than its generation, wrapping.
     acquired: [capacity]u32,
     next_socket: Socket,
 
     fn init(model: *Model) void {
         model.sockets = @splat(-1);
         model.states = @splat(.free);
+        model.ids = undefined;
         model.acquired = @splat(0);
         model.free_count = capacity;
         model.next_socket = socket_first;
-        // Table.init pushes the ids in reverse, so id 0 is on top.
+        // Table.init pushes the indices in reverse, so entry 0 is on top.
         var position: u32 = 0;
         while (position < capacity) : (position += 1) {
-            model.free_ids[position] = capacity - 1 - position;
+            model.free_indices[position] = @intCast(capacity - 1 - position);
         }
         assert(position == capacity);
-        assert(model.free_ids[capacity - 1] == 0);
-        assert(model.free_ids[0] == capacity - 1);
+        assert(model.free_indices[capacity - 1] == 0);
+        assert(model.free_indices[0] == capacity - 1);
     }
 
     fn inUse(model: *const Model) u32 {
@@ -123,7 +132,8 @@ const Workload = struct {
     counts: Counts,
 };
 
-/// One arrival: the table must hand out the model's top free id, or refuse when full.
+/// One arrival: the table must hand out the model's top free entry under the generation
+/// its releases predict, or refuse when full.
 fn arrive(w: *Workload) Error!void {
     const model = w.model;
     assert(model.next_socket >= socket_first);
@@ -142,63 +152,76 @@ fn arrive(w: *Workload) Error!void {
     };
     if (in_use == capacity) return error.InvariantBroken; // Accepted past the limit.
     model.free_count -= 1;
-    if (id != model.free_ids[model.free_count]) return error.InvariantBroken;
-    if (model.sockets[id] != -1) return error.InvariantBroken;
-    model.sockets[id] = socket;
-    model.states[id] = .reading;
-    if (model.acquired[id] > 0) w.counts.reused += 1;
-    model.acquired[id] += 1;
+    const parts: IdParts = @bitCast(id);
+    const index = parts.index;
+    if (index != model.free_indices[model.free_count]) return error.InvariantBroken;
+    if (model.sockets[index] != -1) return error.InvariantBroken;
+    // Each earlier hand-out of this entry was released once, advancing its generation.
+    const generation: connections.Generation = @truncate(model.acquired[index]);
+    if (parts.generation != generation) return error.InvariantBroken;
+    model.sockets[index] = socket;
+    model.states[index] = .reading;
+    // A reused entry: the id it was released under last names the old connection, so a
+    // completion still carrying it must not find the new one.
+    if (model.acquired[index] > 0) {
+        if (w.table.lookup(model.ids[index]) != null) return error.InvariantBroken;
+        w.counts.reused += 1;
+    }
+    model.ids[index] = id;
+    model.acquired[index] += 1;
     w.counts.accepted += 1;
     w.counts.peak = @max(w.counts.peak, model.inUse());
     assert(w.counts.peak <= capacity);
-    trace(&w.counts, 2 | @as(u64, id) << 8 | @as(u64, @intCast(socket)) << 32);
+    trace(&w.counts, 2 | (@as(u64, index) << 8) | (@as(u64, @intCast(socket)) << 32));
     const entry = w.table.get(id);
     if (entry.socket != socket or entry.state != .reading) return error.InvariantBroken;
 }
 
-/// A random connection in use, found by probing from a random id, or null when none is.
-fn pickInUse(w: *Workload) ?PeerId {
+/// A random entry in use, found by probing from a random index, or null when none is.
+fn pickInUse(w: *Workload) ?u32 {
     const model = w.model;
     if (model.inUse() == 0) return null;
-    var id = w.random.uintLessThan(PeerId, capacity);
+    var index = w.random.uintLessThan(u32, capacity);
     var probes: u32 = 0;
-    while (model.sockets[id] == -1) : (probes += 1) {
-        assert(probes < capacity); // At least one id is in use.
-        id = (id + 1) % capacity;
+    while (model.sockets[index] == -1) : (probes += 1) {
+        assert(probes < capacity); // At least one entry is in use.
+        index = (index + 1) % capacity;
     }
-    assert(model.states[id] != .free);
-    return id;
+    assert(model.states[index] != .free);
+    return index;
 }
 
-/// One departure: the table must hand back the socket the model gave that id.
+/// One departure: the table must hand back the socket the model gave that entry.
 fn depart(w: *Workload) Error!void {
     const model = w.model;
-    const id = pickInUse(w) orelse return;
+    const index = pickInUse(w) orelse return;
     assert(model.free_count < capacity);
+    const id = model.ids[index];
     const socket = w.table.release(id);
-    if (socket != model.sockets[id]) return error.InvariantBroken;
-    model.sockets[id] = -1;
-    model.states[id] = .free;
-    model.free_ids[model.free_count] = id;
+    if (socket != model.sockets[index]) return error.InvariantBroken;
+    model.sockets[index] = -1;
+    model.states[index] = .free;
+    model.free_indices[model.free_count] = @intCast(index);
     model.free_count += 1;
     w.counts.departures += 1;
-    trace(&w.counts, 3 | @as(u64, id) << 8 | @as(u64, @intCast(socket)) << 32);
+    trace(&w.counts, 3 | (@as(u64, index) << 8) | (@as(u64, @intCast(socket)) << 32));
     assert(model.free_count <= capacity);
 }
 
 /// Moves a random connection to the state it isn't in.
 fn changeState(w: *Workload) Error!void {
     const model = w.model;
-    const id = pickInUse(w) orelse return;
-    assert(model.sockets[id] >= socket_first);
-    assert(model.states[id] != .free);
-    const state: State = if (model.states[id] == .reading) .writing else .reading;
+    const index = pickInUse(w) orelse return;
+    assert(model.sockets[index] >= socket_first);
+    assert(model.states[index] != .free);
+    const id = model.ids[index];
+    const state: State = if (model.states[index] == .reading) .writing else .reading;
     w.table.setState(id, state);
-    model.states[id] = state;
+    model.states[index] = state;
     w.counts.state_changes += 1;
-    trace(&w.counts, 4 | @as(u64, id) << 8 | @as(u64, @backingInt(state)) << 32);
+    trace(&w.counts, 4 | (@as(u64, index) << 8) | (@as(u64, @backingInt(state)) << 32));
     const entry = w.table.get(id);
-    if (entry.state != state or entry.socket != model.sockets[id]) return error.InvariantBroken;
+    if (entry.state != state or entry.socket != model.sockets[index]) return error.InvariantBroken;
 }
 
 fn step(w: *Workload, arrival_eighths: u8) Error!void {
@@ -236,30 +259,30 @@ fn empty(w: *Workload) Error!void {
 }
 
 /// Walks the whole table against the model: every entry in use holds the model's socket and
-/// state, and the free stack matches the model's, id for id.
+/// state under the model's id, and the free stack matches the model's, entry for entry.
 fn checkTable(w: *const Workload) Error!void {
     const model = w.model;
     assert(model.free_count <= capacity);
     w.table.assertInvariants();
     assert(w.table.capacity() == capacity);
     if (w.table.free_count != model.free_count) return error.InvariantBroken;
-    const stack = w.table.free_ids[0..w.table.free_count];
-    if (!std.mem.eql(PeerId, stack, model.free_ids[0..model.free_count])) {
+    const stack = w.table.free_indices[0..w.table.free_count];
+    if (!std.mem.eql(Index, stack, model.free_indices[0..model.free_count])) {
         return error.InvariantBroken;
     }
-    var id: PeerId = 0;
-    while (id < capacity) : (id += 1) {
-        const socket = model.sockets[id];
+    var index: u32 = 0;
+    while (index < capacity) : (index += 1) {
+        const socket = model.sockets[index];
         if (socket == -1) continue;
-        const entry = w.table.get(id);
-        if (entry.socket != socket or entry.state != model.states[id]) {
+        const entry = w.table.get(model.ids[index]);
+        if (entry.socket != socket or entry.state != model.states[index]) {
             return error.InvariantBroken;
         }
     }
-    assert(id == capacity);
+    assert(index == capacity);
 }
 
-/// After every round: the table reached its limit and refused past it, and every id was
+/// After every round: the table reached its limit and refused past it, and every entry was
 /// handed out at least `rounds` times in all, so each was handed out again after a release.
 fn checkEnd(w: *const Workload) Error!void {
     const counts = w.counts;

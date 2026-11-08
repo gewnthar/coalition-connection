@@ -65,7 +65,9 @@ pub const real = @import("real.zig");
 /// Nanoseconds on a monotonic clock. Never wall-clock time.
 pub const Instant = u64;
 
-/// Index of a connection in the startup-sized connection table.
+/// A connection in the startup-sized connection table: the entry's index in the low 16 bits
+/// and the entry's generation in the high 16, so an id goes stale once its connection is
+/// released (`src/live/connections.zig`).
 pub const PeerId = u32;
 
 /// A Linux file descriptor. The event loop is io_uring, so the boundary is Linux-only, and
