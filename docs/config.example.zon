@@ -1,0 +1,10 @@
+// An example config for the server: `coalition-connection docs/config.example.zon`.
+// `zig build test` starts the server with this file, so it is always one the server
+// accepts. Every field is required and unknown fields are refused; src/config.zig has the
+// limits.
+.{
+    // The local socket nginx reaches; the server doesn't open it yet.
+    .socket_path = "/run/coalition-connection/app.sock",
+    // The most client connections at once, at most http_connections_max.
+    .connections_max = 1024,
+}

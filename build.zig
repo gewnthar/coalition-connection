@@ -6,8 +6,9 @@ const assert = std.debug.assert;
 //                             (ReleaseSafe): --release, --release=safe, =fast and =small all
 //                             build safe. The server is Linux only, so a build for another
 //                             operating system stops with a compile error.
-//   zig build test            unit tests in src/, the server's tests and version check, plus
-//                             the startup-trip harness
+//   zig build test            unit tests in src/, the server's tests, its start with the
+//                             example config and the command lines it refuses, plus the
+//                             startup-trip harness
 //   zig build fuzz -Dseed=N   seeded fuzz run (fuzz/main.zig)
 //   zig build sim -Dseed=N    seeded deterministic simulation run (sim/main.zig)
 
@@ -35,13 +36,48 @@ pub fn build(b: *std.Build) void {
     addServer(b, root, target, optimize, test_step);
     addRunners(b, root, target, optimize, seed);
     addStartupTrip(b, target, test_step);
-    // The unit tests, the server's tests and version check, one run per trip case and one
-    // per bad argument list.
-    assert(test_step.dependencies.items.len == 3 + trip.cases.len + trip.bad_arguments.len);
+    // The unit tests, the server's tests and its start, one run per refused server command
+    // line, one per trip case and one per bad argument list.
+    assert(test_step.dependencies.items.len ==
+        3 + server_refusals.len + trip.cases.len + trip.bad_arguments.len);
 }
 
+/// A command line the server must refuse, what it must log and the status it must exit with.
+const ServerRefusal = struct {
+    name: []const u8,
+    arguments: []const []const u8,
+    stderr: []const u8,
+    exit_code: u8,
+};
+
+/// A config path that can't exist, so the server must refuse to start.
+const config_missing = "/nonexistent/coalition-connection.zon";
+
+/// src/main.zig exits 2 for a bad command line and 1 for a refused config.
+const server_refusals = [_]ServerRefusal{
+    .{
+        .name = "no config path",
+        .arguments = &.{},
+        .stderr = "error: usage: coalition-connection <config file> (ArgumentCount)\n",
+        .exit_code = 2,
+    },
+    .{
+        .name = "an option",
+        .arguments = &.{"--help"},
+        .stderr = "error: usage: coalition-connection <config file> (PathIsOption)\n",
+        .exit_code = 2,
+    },
+    .{
+        .name = "a missing config file",
+        .arguments = &.{config_missing},
+        .stderr = "error: config " ++ config_missing ++ ": ConfigUnavailable\n",
+        .exit_code = 1,
+    },
+};
+
 /// The server program, installed by the default step. `zig build test` runs its tests, then
-/// runs it once and checks its version line.
+/// starts it with docs/config.example.zon, where it must print its version line and
+/// nothing else, and with each command line in `server_refusals`.
 fn addServer(
     b: *std.Build,
     root: *std.Build.Module,
@@ -73,12 +109,28 @@ fn addServer(
     const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = module }));
     test_step.dependOn(&run_tests.step);
     const run = b.addRunArtifact(exe);
-    run.expectStdOutEqual("coalition-connection " ++ package.version ++ "\n");
+    run.addFileArg(b.path("docs/config.example.zon"));
     run.expectExitCode(0);
-    // The version check runs after the tests, so a failing write shows up as a test first.
+    run.expectStdOutEqual("coalition-connection " ++ package.version ++ "\n");
+    // Checking stderr also captures it: a clean start logs nothing.
+    run.expectStdErrEqual("");
+    // The start runs after the tests, so a failing write shows up as a test first.
     run.step.dependOn(&run_tests.step);
     test_step.dependOn(&run.step);
-    assert(test_step.dependencies.items.len == dependencies_before + 2);
+    for (server_refusals) |refusal| {
+        const refused = b.addRunArtifact(exe);
+        refused.setName(b.fmt("coalition-connection refuses {s}", .{refusal.name}));
+        refused.addArgs(refusal.arguments);
+        refused.expectExitCode(refusal.exit_code);
+        // A refused start prints no version line.
+        refused.expectStdOutEqual("");
+        // Checking stderr also captures it, so the expected message doesn't show in the
+        // test log as if the run had failed.
+        refused.expectStdErrEqual(refusal.stderr);
+        refused.step.dependOn(&run_tests.step);
+        test_step.dependOn(&refused.step);
+    }
+    assert(test_step.dependencies.items.len == dependencies_before + 2 + server_refusals.len);
 }
 
 const Runner = struct {

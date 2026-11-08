@@ -24,11 +24,13 @@ zig build fuzz --release=safe -Dseed=1   # seeded fuzzer
 zig build sim --release=safe -Dseed=1    # seeded deterministic simulation
 ```
 
-The first line installs the server as `zig-out/bin/coalition-connection`. For now it prints
-its version and exits; it serves nothing yet, and it builds only for Linux. The last three
-lines compile every target in ReleaseSafe. A fuzz or simulation failure prints its seed, and
-the same `-Dseed` replays it. [CONTRIBUTING.md](CONTRIBUTING.md#running-the-checks) lists
-every check CI runs.
+The first line installs the server as `zig-out/bin/coalition-connection`. It takes one
+argument, the path of its config file, and [docs/config.example.zon](docs/config.example.zon)
+is a working example: `zig-out/bin/coalition-connection docs/config.example.zon`. For now it
+checks the config, prints its version and exits; it serves nothing yet, and it builds only
+for Linux. The last three lines compile every target in ReleaseSafe. A fuzz or simulation
+failure prints its seed, and the same `-Dseed` replays it.
+[CONTRIBUTING.md](CONTRIBUTING.md#running-the-checks) lists every check CI runs.
 
 ## Documentation
 
