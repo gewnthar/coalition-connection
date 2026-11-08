@@ -3,8 +3,9 @@
 //!
 //! Job:
 //!   Hand out a `PeerId` for every accepted connection and take it back when the connection
-//!   closes. A `PeerId` is an index into a table allocated once at startup, so looking up a
-//!   connection is one bounds-checked array access and the table never grows.
+//!   closes. A `PeerId` carries the index of an entry in a table allocated once at startup,
+//!   so looking up a connection is one bounds-checked array access and the table never
+//!   grows.
 //!
 //! Inputs:
 //!   An allocator during startup (a `StartupAllocator`), the table's size, and the socket of
@@ -19,18 +20,26 @@
 //!   http_connection_entry_size_max: bytes of table state per connection, counted in the
 //!   memory table.
 //!
-//! Free ids sit on a stack, so `acquire` and `release` take constant time and the id
-//! released last is handed out first. A full table refuses the connection with
-//! `error.TableFull` and leaves every entry as it was.
+//! Free entries' indices sit on a stack, so `acquire` and `release` take constant time and
+//! the entry released last is handed out first, under a new id. A full table refuses the
+//! connection with `error.TableFull` and leaves every entry as it was.
 //!
 //! Each entry carries the connection's `HeadScan`, so the parser resumes its search for the
 //! end of a request head between reads. `acquire` hands out an entry with an empty scan and
 //! `release` empties it again, so a free entry never holds scan state and a reused entry
 //! never inherits the last connection's.
 //!
-//! Not yet: a released id can be handed out again at once, so an I/O completion that still
-//! names the old connection would reach the new one. The slice that routes completions to
-//! connections adds a generation count to each id.
+//! A `PeerId` names an entry and a generation of it: the low 16 bits are the entry's index
+//! and the high 16 bits the entry's generation, which `release` advances, wrapping. An id
+//! handed out before a release is stale afterwards, so an I/O completion that still names
+//! the old connection can't reach the next connection on that entry: completions find
+//! their entry through `lookup`, which returns null for a stale id. `get`, `headScan`,
+//! `setState` and `release` are for callers holding a live id, and assert it is live.
+//!
+//! The limit: after 65,536 releases of one entry its generation is back where it started,
+//! so an id stays distinct from every later one for 65,535 reuses of its entry. The free
+//! stack hands the same entry out again first, so work in flight on a connection must not
+//! outlast that many reuses of its entry.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -39,6 +48,20 @@ const io = @import("../io/root.zig");
 const http_request = @import("http_request.zig");
 
 pub const PeerId = io.PeerId;
+
+/// The position of an entry in the table: the low half of a `PeerId`.
+pub const Index = u16;
+
+/// How many times an entry has been released, wrapping: the high half of a `PeerId`.
+pub const Generation = u16;
+
+/// A `PeerId` split into its halves. A packed struct lays its fields out from the least
+/// significant bit, so `@bitCast` between the two puts `index` in the low 16 bits and does
+/// no arithmetic that could overflow.
+pub const IdParts = packed struct(PeerId) {
+    index: Index,
+    generation: Generation,
+};
 
 /// A Linux file descriptor, as the I/O boundary defines it.
 pub const Socket = io.Socket;
@@ -52,7 +75,7 @@ pub const InitError = error{OutOfMemory};
 
 /// Where a connection is in its request and response.
 pub const State = enum(u8) {
-    /// Not in use: the entry's id is on the free stack.
+    /// Not in use: the entry's index is on the free stack.
     free,
     /// Reading a request head or body.
     reading,
@@ -66,23 +89,27 @@ pub const Entry = struct {
     state: State,
     /// Empty whenever `state` is `free`; the request parser advances it while reading.
     scan: HeadScan = .{},
+    /// The generation every live id for this entry carries. Kept while the entry is free:
+    /// `release` advances it, and the next `acquire` hands it out.
+    generation: Generation = 0,
 };
 
-/// The value of every free entry.
-const entry_free: Entry = .{ .socket = -1, .state = .free, .scan = .{} };
-
 /// Bytes of table state one connection costs: its entry plus its slot on the free stack.
-pub const entry_bytes: u32 = @sizeOf(Entry) + @sizeOf(PeerId);
+pub const entry_bytes: u32 = @sizeOf(Entry) + @sizeOf(Index);
 
 comptime {
     assert(entry_bytes <= constants.http_connection_entry_size_max);
     assert(constants.http_connections_max > 0);
+    // Every entry's index fits the low half of a PeerId.
+    assert(constants.http_connections_max - 1 <= std.math.maxInt(Index));
+    // The layout the docs promise: index in the low half, generation in the high half.
+    assert(@as(PeerId, @bitCast(IdParts{ .index = 1, .generation = 2 })) == 0x0002_0001);
 }
 
 pub const Table = struct {
     entries: []Entry,
-    /// Free ids, a stack: `free_ids[0..free_count]` are the ids not in use.
-    free_ids: []PeerId,
+    /// Free entries, a stack of indices: `free_indices[0..free_count]` are not in use.
+    free_indices: []Index,
     free_count: u32,
 
     /// Allocates a table of `size` entries, all free. Call it during startup only.
@@ -91,16 +118,20 @@ pub const Table = struct {
         assert(size <= constants.http_connections_max);
         const entries = try allocator.alloc(Entry, size);
         errdefer allocator.free(entries);
-        const free_ids = try allocator.alloc(PeerId, size);
-        @memset(entries, entry_free);
-        // Push the ids in reverse, so the first acquire hands out id 0.
+        const free_indices = try allocator.alloc(Index, size);
+        @memset(entries, .{ .socket = -1, .state = .free });
+        // Push the indices in reverse, so the first acquire hands out entry 0.
         var position: u32 = 0;
         while (position < size) : (position += 1) {
-            assert(position < free_ids.len);
-            free_ids[position] = size - 1 - position;
+            assert(position < free_indices.len);
+            free_indices[position] = @intCast(size - 1 - position);
         }
         assert(position == size);
-        const table: Table = .{ .entries = entries, .free_ids = free_ids, .free_count = size };
+        const table: Table = .{
+            .entries = entries,
+            .free_indices = free_indices,
+            .free_count = size,
+        };
         table.assertInvariants();
         return table;
     }
@@ -108,14 +139,14 @@ pub const Table = struct {
     /// Frees the table's memory. Call it during shutdown only.
     pub fn deinit(self: *Table, allocator: std.mem.Allocator) void {
         self.assertInvariants();
-        assert(self.entries.len == self.free_ids.len);
-        allocator.free(self.free_ids);
+        assert(self.entries.len == self.free_indices.len);
+        allocator.free(self.free_indices);
         allocator.free(self.entries);
         self.* = undefined;
     }
 
     pub fn capacity(self: *const Table) u32 {
-        assert(self.entries.len == self.free_ids.len);
+        assert(self.entries.len == self.free_indices.len);
         assert(self.entries.len <= constants.http_connections_max);
         return @intCast(self.entries.len);
     }
@@ -128,9 +159,9 @@ pub const Table = struct {
         return table_capacity - self.free_count;
     }
 
-    /// Takes a free entry for `socket` and returns its id. The entry starts in `reading`,
-    /// with an empty head scan. When every entry is in use, returns `error.TableFull` and
-    /// changes nothing.
+    /// Takes a free entry for `socket` and returns its id, which carries the entry's
+    /// current generation. The entry starts in `reading`, with an empty head scan. When
+    /// every entry is in use, returns `error.TableFull` and changes nothing.
     pub fn acquire(self: *Table, socket: Socket) AcquireError!PeerId {
         assert(socket >= 0);
         const count_before = self.count();
@@ -139,48 +170,68 @@ pub const Table = struct {
             return error.TableFull;
         }
         self.free_count -= 1;
-        const id = self.free_ids[self.free_count];
-        assert(id < self.capacity());
-        const entry = &self.entries[id];
-        assert(entry.state == .free); // A free id names a free entry.
+        const index = self.free_indices[self.free_count];
+        assert(index < self.capacity());
+        const entry = &self.entries[index];
+        assert(entry.state == .free); // A stacked index names a free entry.
         assert(entry.scan.resume_at == 0); // release empties the scan of every entry it frees.
-        entry.* = .{ .socket = socket, .state = .reading, .scan = .{} };
+        assert(entry.socket == -1); // release clears the socket of every entry it frees.
+        entry.socket = socket;
+        entry.state = .reading;
+        const id: PeerId = @bitCast(IdParts{ .index = index, .generation = entry.generation });
         assert(self.count() == count_before + 1);
         return id;
     }
 
-    /// Returns `id`'s entry to the free stack, emptying its head scan, and hands back its
-    /// socket, which the caller must close. Releasing an entry not in use is a bug.
+    /// Returns `id`'s entry to the free stack, emptying its head scan and advancing its
+    /// generation, so `id` is stale from now on. Hands back the socket, which the caller
+    /// must close. Releasing an entry not in use, or through a stale id, is a bug.
     pub fn release(self: *Table, id: PeerId) Socket {
-        assert(id < self.capacity());
         const count_before = self.count();
         assert(count_before > 0);
-        const entry = &self.entries[id];
-        assert(entry.state != .free); // Release of an entry not in use.
+        const index = self.liveIndex(id);
+        const entry = &self.entries[index];
         const socket = entry.socket;
         assert(socket >= 0);
-        entry.* = entry_free;
-        self.free_ids[self.free_count] = id;
+        const generation_next = entry.generation +% 1;
+        entry.* = .{ .socket = -1, .state = .free, .generation = generation_next };
+        assert(self.free_count < self.capacity()); // An entry in use has no slot on the stack.
+        self.free_indices[self.free_count] = index;
         self.free_count += 1;
         assert(self.count() == count_before - 1);
         return socket;
     }
 
-    /// The entry `id` names, which must be in use. Read-only: change its state through
-    /// `setState`, its head scan through `headScan`, and free it through `release`.
-    pub fn get(self: *const Table, id: PeerId) *const Entry {
-        assert(id < self.capacity());
-        const entry = &self.entries[id];
-        assert(entry.state != .free); // Lookup of an entry not in use.
+    /// The entry `id` names, if it is in use under `id`'s generation; null for a free entry
+    /// or a stale id (one released since it was handed out). For I/O completions, which
+    /// can arrive after their connection was released. An index past the table is a bug,
+    /// not a stale id: every id comes from `acquire`.
+    pub fn lookup(self: *const Table, id: PeerId) ?*const Entry {
+        const parts: IdParts = @bitCast(id);
+        assert(parts.index < self.capacity());
+        const entry = &self.entries[parts.index];
+        if (entry.state == .free) return null;
+        if (entry.generation != parts.generation) return null;
         assert(entry.socket >= 0);
         return entry;
     }
 
-    /// The head scan of `id`'s connection, which must be reading, for the request parser to
-    /// advance. `acquire` and `release` empty it; nothing else in the table touches it.
+    /// The entry `id` names, which must be in use under `id`'s generation. Read-only:
+    /// change its state through `setState`, its head scan through `headScan`, and free it
+    /// through `release`.
+    pub fn get(self: *const Table, id: PeerId) *const Entry {
+        const entry = &self.entries[self.liveIndex(id)];
+        assert(entry.socket >= 0);
+        // The parser never resumes past the last three bytes of the largest request.
+        assert(entry.scan.resume_at <= constants.http_request_size_max - 3);
+        return entry;
+    }
+
+    /// The head scan of `id`'s connection, which must be live and reading, for the request
+    /// parser to advance. `acquire` and `release` empty it; nothing else in the table
+    /// touches it.
     pub fn headScan(self: *Table, id: PeerId) *HeadScan {
-        assert(id < self.capacity());
-        const entry = &self.entries[id];
+        const entry = &self.entries[self.liveIndex(id)];
         assert(entry.state == .reading); // Only a connection reading a head is parsed.
         // The parser backs off three bytes from the end of a buffer of at most
         // http_request_size_max bytes, so it never resumes past that.
@@ -191,28 +242,39 @@ pub const Table = struct {
     /// Moves `id`'s connection between reading and writing. Only `release` frees an entry,
     /// so the free stack and the entries always agree.
     pub fn setState(self: *Table, id: PeerId, state: State) void {
-        assert(id < self.capacity());
         assert(state != .free); // Free an entry through release.
-        const entry = &self.entries[id];
-        assert(entry.state != .free); // State change of an entry not in use.
+        const entry = &self.entries[self.liveIndex(id)];
         // A parsed head empties the scan, so a connection never writes with a scan part way.
         assert(state != .writing or entry.scan.resume_at == 0);
         entry.state = state;
     }
 
-    /// Checks that the free stack and the entries agree: every stacked id is free and stacked
-    /// once, and no other entry is free. It walks the whole table, so it runs at startup,
-    /// at shutdown and in tests; each method keeps cheaper checks of its own.
+    /// The index of `id`'s entry, checking that `id` is live: inside the table, naming an
+    /// entry in use, and carrying that entry's generation. For callers holding a live id;
+    /// completions, which may hold a stale one, go through `lookup`.
+    fn liveIndex(self: *const Table, id: PeerId) Index {
+        const parts: IdParts = @bitCast(id);
+        assert(parts.index < self.capacity());
+        const entry = &self.entries[parts.index];
+        assert(entry.state != .free); // An entry not in use.
+        assert(entry.generation == parts.generation); // A stale id: released since.
+        return parts.index;
+    }
+
+    /// Checks that the free stack and the entries agree: every stacked index is free and
+    /// stacked once, and no other entry is free. It walks the whole table, so it runs at
+    /// startup, at shutdown and in tests; each method keeps cheaper checks of its own.
     pub fn assertInvariants(self: *const Table) void {
         const table_capacity = self.capacity();
         assert(self.free_count <= table_capacity);
         var stacked: std.bit_set.Static(constants.http_connections_max) = .empty;
-        for (self.free_ids[0..self.free_count]) |id| {
-            assert(id < table_capacity);
-            assert(self.entries[id].state == .free);
-            assert(self.entries[id].scan.resume_at == 0); // A free entry holds no scan.
-            assert(!stacked.isSet(id)); // An id on the free stack twice.
-            stacked.set(id);
+        for (self.free_indices[0..self.free_count]) |index| {
+            assert(index < table_capacity);
+            assert(self.entries[index].state == .free);
+            assert(self.entries[index].scan.resume_at == 0); // A free entry holds no scan.
+            assert(self.entries[index].socket == -1);
+            assert(!stacked.isSet(index)); // An index on the free stack twice.
+            stacked.set(index);
         }
         for (self.entries, 0..) |entry, index| {
             assert((entry.state == .free) == stacked.isSet(index));
@@ -223,7 +285,7 @@ pub const Table = struct {
 const testing = std.testing;
 const StartupAllocator = @import("../startup_allocator.zig").StartupAllocator;
 
-const connection_row_name = "Connection table entry and free-id slot, one per connection";
+const connection_row_name = "Connection table entry and free-index slot, one per connection";
 
 /// The table's row in the memory table.
 fn memoryRow() constants.MemoryRow {
@@ -269,7 +331,7 @@ test "connections: fill to the limit, then the next acquire fails and changes no
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);
 }
 
-test "connections: a refused acquire leaves every entry and free id as it was" {
+test "connections: a refused acquire leaves every entry and free index as it was" {
     var startup = StartupAllocator.init(testing.allocator, 4 * entry_bytes);
     const gpa = startup.allocator();
     var table = try Table.init(gpa, 4);
@@ -281,13 +343,13 @@ test "connections: a refused acquire leaves every entry and free id as it was" {
     _ = try table.acquire(13);
     table.setState(2, .writing);
     var entries_before: [4]Entry = undefined;
-    var free_ids_before: [4]PeerId = undefined;
+    var free_indices_before: [4]Index = undefined;
     @memcpy(&entries_before, table.entries);
-    @memcpy(&free_ids_before, table.free_ids);
+    @memcpy(&free_indices_before, table.free_indices);
 
     try testing.expectError(error.TableFull, table.acquire(14));
     try testing.expectEqualSlices(Entry, &entries_before, table.entries);
-    try testing.expectEqualSlices(PeerId, &free_ids_before, table.free_ids);
+    try testing.expectEqualSlices(Index, &free_indices_before, table.free_indices);
     try testing.expectEqual(@as(u32, 0), table.free_count);
 
     startup.beginShutdown();
@@ -295,7 +357,7 @@ test "connections: a refused acquire leaves every entry and free id as it was" {
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);
 }
 
-test "connections: release hands back the socket, then acquire reuses the entry" {
+test "connections: release hands back the socket, then acquire reuses the entry anew" {
     var startup = StartupAllocator.init(testing.allocator, 4 * entry_bytes);
     const gpa = startup.allocator();
     var table = try Table.init(gpa, 4);
@@ -313,7 +375,14 @@ test "connections: release hands back the socket, then acquire reuses the entry"
     table.assertInvariants();
 
     const reused = try table.acquire(12);
-    try testing.expectEqual(first, reused);
+    try testing.expect(reused != first);
+    const first_parts: IdParts = @bitCast(first);
+    const reused_parts: IdParts = @bitCast(reused);
+    try testing.expectEqual(first_parts.index, reused_parts.index);
+    try testing.expectEqual(first_parts.generation +% 1, reused_parts.generation);
+    // The old id is stale: lookup refuses it, and the new one finds the same entry.
+    try testing.expectEqual(@as(?*const Entry, null), table.lookup(first));
+    try testing.expectEqual(table.get(reused), table.lookup(reused).?);
     try testing.expectEqual(State.reading, table.get(reused).state);
     try testing.expectEqual(@as(Socket, 12), table.get(reused).socket);
     try testing.expectEqual(@as(Socket, 11), table.get(second).socket);
@@ -371,10 +440,12 @@ test "connections: an entry released mid-scan is acquired again with an empty sc
     table.setState(other, .writing);
 
     _ = table.release(first);
-    try testing.expectEqual(@as(u32, 0), table.entries[first].scan.resume_at);
+    const first_index = @as(IdParts, @bitCast(first)).index;
+    try testing.expectEqual(@as(u32, 0), table.entries[first_index].scan.resume_at);
     table.assertInvariants();
     const reused = try table.acquire(12);
-    try testing.expectEqual(first, reused);
+    try testing.expectEqual(first_index, @as(IdParts, @bitCast(reused)).index);
+    try testing.expectEqual(@as(?*const Entry, null), table.lookup(first));
     try testing.expectEqual(@as(u32, 0), table.get(reused).scan.resume_at);
     // A new connection's head parses from the start of its buffer.
     const whole = "GET / HTTP/1.1\r\nHost: example\r\n\r\n";
@@ -432,10 +503,68 @@ test "connections: the memory table counts a full table" {
     try testing.expect(constants.memoryTableFits(&constants.memory_table, budget));
 }
 
+/// What the seeded test expects of each entry of its table.
+/// The seeded test's table size: small, so random runs often hit full and empty.
+const seeded_size: u32 = 64;
+
+const SeededModel = struct {
+    /// The socket each entry in use was given, or -1.
+    sockets: [seeded_size]Socket = @splat(-1),
+    /// The live id of each entry in use; meaningful only where `sockets` isn't -1.
+    ids: [seeded_size]PeerId = undefined,
+    /// The last id each entry was released under, stale ever since.
+    stale_ids: [seeded_size]?PeerId = @splat(null),
+    /// Releases of each entry so far, which its generation must match.
+    releases: [seeded_size]u32 = @splat(0),
+    in_use: u32 = 0,
+
+    /// One accept: a free entry under the generation its releases predict, or a refusal
+    /// only when full. Returns whether the table refused.
+    fn accept(model: *SeededModel, table: *Table, socket: Socket, random: std.Random) !bool {
+        assert(model.in_use <= seeded_size);
+        const id = table.acquire(socket) catch |err| switch (err) {
+            error.TableFull => {
+                try testing.expectEqual(seeded_size, model.in_use);
+                return true;
+            },
+        };
+        const parts: IdParts = @bitCast(id);
+        try testing.expectEqual(@as(Socket, -1), model.sockets[parts.index]);
+        const generation: Generation = @truncate(model.releases[parts.index]);
+        try testing.expectEqual(generation, parts.generation);
+        try testing.expectEqual(@as(u32, 0), table.get(id).scan.resume_at);
+        // Leave some scans part way, so releases mid-scan are exercised too.
+        const resume_max = constants.http_request_size_max - 3;
+        table.headScan(id).resume_at = random.uintAtMost(u32, resume_max);
+        model.sockets[parts.index] = socket;
+        model.ids[parts.index] = id;
+        model.in_use += 1;
+        assert(model.in_use <= seeded_size);
+        return false;
+    }
+
+    /// One close of a random connection in use, found by probing from a random entry.
+    fn close(model: *SeededModel, table: *Table, random: std.Random) !void {
+        assert(model.in_use > 0);
+        var index = random.uintLessThan(Index, seeded_size);
+        var probes: u32 = 0;
+        while (model.sockets[index] == -1) : (probes += 1) {
+            assert(probes < seeded_size);
+            index = @intCast((index + 1) % seeded_size);
+        }
+        const id = model.ids[index];
+        try testing.expectEqual(model.sockets[index], table.release(id));
+        try testing.expectEqual(@as(u32, 0), table.entries[index].scan.resume_at);
+        model.sockets[index] = -1;
+        model.stale_ids[index] = id;
+        model.releases[index] += 1;
+        model.in_use -= 1;
+        assert(model.in_use < seeded_size);
+    }
+};
+
 test "connections: seeded random accepts and closes against a model, filling the table" {
-    // A small table, so random runs often hit full and empty. The model holds the socket
-    // each id in use was given, or -1.
-    const size: u32 = 64;
+    const size = seeded_size;
     const steps_max: u32 = 20_000;
     var startup = StartupAllocator.init(testing.allocator, size * entry_bytes);
     const gpa = startup.allocator();
@@ -444,46 +573,93 @@ test "connections: seeded random accepts and closes against a model, filling the
 
     var prng: std.Random.DefaultPrng = .init(0x5eed);
     const random = prng.random();
-    var model_sockets: [size]Socket = @splat(-1);
-    var in_use: u32 = 0;
+    var model: SeededModel = .{};
     var full_refusals: u32 = 0;
+    var stale_lookups: u32 = 0;
     var step: u32 = 0;
     while (step < steps_max) : (step += 1) {
         // Lean toward accepts, so the table fills and refuses.
         if (random.uintLessThan(u8, 8) < 5) {
             const socket: Socket = @intCast(100 + step);
-            if (table.acquire(socket)) |id| {
-                try testing.expectEqual(@as(Socket, -1), model_sockets[id]);
-                try testing.expectEqual(@as(u32, 0), table.get(id).scan.resume_at);
-                // Leave some scans part way, so releases mid-scan are exercised too.
-                const resume_max = constants.http_request_size_max - 3;
-                table.headScan(id).resume_at = random.uintAtMost(u32, resume_max);
-                model_sockets[id] = socket;
-                in_use += 1;
-            } else |err| switch (err) {
-                error.TableFull => {
-                    try testing.expectEqual(size, in_use);
-                    full_refusals += 1;
-                },
-            }
-        } else if (in_use > 0) {
-            var id = random.uintLessThan(PeerId, size);
-            var probes: u32 = 0;
-            while (model_sockets[id] == -1) : (probes += 1) {
-                assert(probes < size);
-                id = (id + 1) % size;
-            }
-            try testing.expectEqual(model_sockets[id], table.release(id));
-            try testing.expectEqual(@as(u32, 0), table.entries[id].scan.resume_at);
-            model_sockets[id] = -1;
-            in_use -= 1;
+            if (try model.accept(&table, socket, random)) full_refusals += 1;
+        } else if (model.in_use > 0) {
+            try model.close(&table, random);
         }
-        try testing.expectEqual(in_use, table.count());
+        // A completion naming any released id finds nothing, whether its entry is free or
+        // was handed out again.
+        if (model.stale_ids[random.uintLessThan(Index, size)]) |stale| {
+            try testing.expectEqual(@as(?*const Entry, null), table.lookup(stale));
+            stale_lookups += 1;
+        }
+        try testing.expectEqual(model.in_use, table.count());
         if (step % 1024 == 0) table.assertInvariants();
     }
     table.assertInvariants();
     try testing.expect(full_refusals > 0);
+    try testing.expect(stale_lookups > 0);
 
+    startup.beginShutdown();
+    table.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "connections: lookup finds a live id and refuses a free entry's id" {
+    var startup = StartupAllocator.init(testing.allocator, 2 * entry_bytes);
+    const gpa = startup.allocator();
+    var table = try Table.init(gpa, 2);
+    startup.finishStartup();
+
+    // Entry 1 has never been handed out, and entry 0 is free again after a release: an
+    // id naming either, at any generation, finds nothing.
+    const id = try table.acquire(10);
+    try testing.expectEqual(table.get(id), table.lookup(id).?);
+    const never_handed_out: PeerId = @bitCast(IdParts{ .index = 1, .generation = 0 });
+    try testing.expectEqual(@as(?*const Entry, null), table.lookup(never_handed_out));
+    _ = table.release(id);
+    try testing.expectEqual(@as(?*const Entry, null), table.lookup(id));
+    const advanced: PeerId = @bitCast(IdParts{ .index = 0, .generation = 1 });
+    try testing.expectEqual(@as(?*const Entry, null), table.lookup(advanced));
+    // The next acquire hands out exactly that advanced id.
+    try testing.expectEqual(advanced, try table.acquire(11));
+    try testing.expectEqual(@as(Socket, 11), table.lookup(advanced).?.socket);
+
+    _ = table.release(advanced);
+    startup.beginShutdown();
+    table.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "connections: a generation wraps to zero, and only the newest id is live" {
+    // One entry, released and acquired again until its generation wraps past its largest
+    // value back to zero. At every step only the newest id is live.
+    var startup = StartupAllocator.init(testing.allocator, entry_bytes);
+    const gpa = startup.allocator();
+    var table = try Table.init(gpa, 1);
+    startup.finishStartup();
+
+    const first = try table.acquire(10);
+    try testing.expectEqual(@as(Generation, 0), @as(IdParts, @bitCast(first)).generation);
+    const cycles: u32 = std.math.maxInt(Generation) + 1;
+    var id = first;
+    var cycle: u32 = 0;
+    while (cycle < cycles) : (cycle += 1) {
+        const socket: Socket = @intCast(11 + cycle % 1000);
+        try testing.expectEqual(table.get(id).socket, table.release(id));
+        const next = try table.acquire(socket);
+        try testing.expectEqual(@as(?*const Entry, null), table.lookup(id));
+        try testing.expectEqual(socket, table.lookup(next).?.socket);
+        id = next;
+    }
+    try testing.expectEqual(cycles, cycle);
+    // After 65,536 releases the generation is back at zero: the first id names the live
+    // connection again. A completion would have to wait out that many reuses of its entry
+    // to be misrouted.
+    try testing.expectEqual(first, id);
+    const generation_max = std.math.maxInt(Generation);
+    const last_stale: PeerId = @bitCast(IdParts{ .index = 0, .generation = generation_max });
+    try testing.expectEqual(@as(?*const Entry, null), table.lookup(last_stale));
+
+    _ = table.release(id);
     startup.beginShutdown();
     table.deinit(gpa);
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);

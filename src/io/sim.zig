@@ -401,7 +401,8 @@ pub const Sim = struct {
 fn assertOperation(operation: io.Operation) void {
     switch (operation) {
         .send => |send| {
-            assert(send.peer < constants.http_connections_max);
+            const peer: connections.IdParts = @bitCast(send.peer);
+            assert(peer.index < constants.http_connections_max);
             assert(send.bytes.len > 0);
             assert(send.bytes.len <= constants.http_response_size_max);
         },
