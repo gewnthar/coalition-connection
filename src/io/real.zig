@@ -15,8 +15,12 @@
 //!
 //! Sends: `IORING_OP_SEND` on the peer's socket from the connection table, with
 //! `MSG_NOSIGNAL`, so a peer that has gone away fails the send with `EPIPE` instead of
-//! ending the process with `SIGPIPE`. Every errno maps to `PeerDown`, `Backpressure` or a
-//! stop with its reason (`sendError`).
+//! ending the process with `SIGPIPE`. Each errno send(2) documents maps to `PeerDown` or
+//! `Backpressure`, or stops the process when it can only mean a bug in this file or its
+//! caller (`sendErrno`). An errno send(2) doesn't document is a fact about the kernel this
+//! file didn't know, not a bug a client caused, so it fails only that connection: it maps
+//! to `PeerDown` and is counted in `send_errno_undocumented_count`, with the latest one
+//! kept in `send_errno_undocumented_last`.
 //!
 //! Accepts: `IORING_OP_ACCEPT` on the caller's listening socket, with `SOCK_CLOEXEC` on the
 //! new socket. The completion takes an entry in the connection table for the new socket and
@@ -133,6 +137,13 @@ pub const Real = struct {
     enters_deferred: u64,
     /// Connections accepted and closed at once because the table was full. For metrics.
     refused: u64,
+    /// Sends that failed with an errno send(2) doesn't document; each completed as
+    /// `PeerDown`. For metrics: any count above zero means `sendErrno` is missing a case.
+    send_errno_undocumented_count: u64,
+    /// The latest of those errnos, or `.SUCCESS` if there has been none, so the missing
+    /// case can be named. It may be a value std has no name for, so print it with
+    /// `@backingInt`, never `{t}` or `@tagName`.
+    send_errno_undocumented_last: linux.E,
 
     /// Sets up the ring. `startup` proves the call happens during startup; nothing is
     /// mapped or allocated afterwards.
@@ -154,6 +165,8 @@ pub const Real = struct {
             .completed = 0,
             .enters_deferred = 0,
             .refused = 0,
+            .send_errno_undocumented_count = 0,
+            .send_errno_undocumented_last = .SUCCESS,
         };
         // Push the indices in reverse, so the first submission takes slot 0.
         var position: u32 = 0;
@@ -300,12 +313,44 @@ pub const Real = struct {
         assert(self.free_count <= slots_count);
         assert(slot.kind != .execute); // `prepare` never writes one.
         const result: io.Result = switch (slot.kind) {
-            .send => .{ .send = sendResult(cqe.res, slot.length) },
+            .send => .{ .send = self.sendResult(cqe.res, slot.length) },
             .accept => .{ .accept = self.acceptResult(cqe.res) },
             .execute => unreachable, // Asserted above.
 
         };
         return .{ .id = slot.id, .result = result };
+    }
+
+    /// A send's result from its completion: the bytes sent, or the error its errno means.
+    /// An undocumented errno completes as `PeerDown` and is counted.
+    fn sendResult(self: *Real, res: i32, length: u32) io.SendError!u32 {
+        assert(length > 0);
+        assert(length <= constants.http_response_size_max);
+        if (res > 0) {
+            const sent: u32 = @intCast(res);
+            assert(sent <= length); // The kernel never reports more bytes than it was given.
+            return sent;
+        }
+        // A stream send of at least one byte that sent none made no progress; the caller
+        // tries again later.
+        if (res == 0) return error.Backpressure;
+        assert(res > -4096);
+        const err: linux.E = @fromBackingInt(@intCast(-res));
+        // The count and the latest errno change together, so neither is set without the other.
+        assert((self.send_errno_undocumented_count == 0) == (self.send_errno_undocumented_last == .SUCCESS));
+        switch (sendErrno(err)) {
+            .peer_down => return error.PeerDown,
+            .backpressure => return error.Backpressure,
+            // A bad descriptor (a socket closed while its send was in flight), address, flag
+            // or length, a Fast Open or a cancel this type never asks for: each means a bug in
+            // this file or its caller, so the process stops with the reason.
+            .bug => std.debug.panic("io_uring send: errno {d}", .{@backingInt(err)}),
+            .peer_down_undocumented => {
+                self.send_errno_undocumented_count += 1;
+                self.send_errno_undocumented_last = err;
+                return error.PeerDown;
+            },
+        }
     }
 
     /// An accept's result from its completion: the new connection's entry, or the error its
@@ -477,47 +522,37 @@ fn copyReady(ring: *linux.IoUring, cqes: []linux.io_uring_cqe) u32 {
     return count;
 }
 
-/// A send's result from its completion: the bytes sent, or the error its errno means.
-fn sendResult(res: i32, length: u32) io.SendError!u32 {
-    assert(length > 0);
-    assert(length <= constants.http_response_size_max);
-    if (res > 0) {
-        const sent: u32 = @intCast(res);
-        assert(sent <= length); // The kernel never reports more bytes than it was given.
-        return sent;
-    }
-    // A stream send of at least one byte that sent none made no progress; the caller
-    // tries again later.
-    if (res == 0) return error.Backpressure;
-    assert(res > -4096);
-    const err: linux.E = @fromBackingInt(@intCast(-res));
-    return sendError(err);
-}
+/// What a failed send's errno means. `peer_down_undocumented` is an errno send(2) isn't
+/// documented to return; `Real.sendResult` treats it as `PeerDown` and counts it. `bug`
+/// can only mean a bug in this file or its caller; `Real.sendResult` stops the process.
+const SendOutcome = enum { peer_down, backpressure, peer_down_undocumented, bug };
 
-/// Maps a failed send's errno. Every errno has an explicit outcome.
-fn sendError(err: linux.E) io.SendError {
+/// Maps a failed send's errno to its outcome. Pure, so tests can check every arm,
+/// including the ones that stop the process.
+fn sendErrno(err: linux.E) SendOutcome {
+    // Preconditions for any caller, tests included: a failure, in the kernel's errno
+    // range of 1 to 4095.
     assert(err != .SUCCESS);
-    const result: io.SendError = switch (err) {
+    assert(@backingInt(err) < 4096);
+    return switch (err) {
         // The connection is gone or unusable: the caller closes it. EACCES and EPERM come
         // from a security module or a firewall refusing this connection, which a retry
         // won't change; EIO and EPROTO from a failed transport under the socket.
-        .PIPE, .CONNRESET, .CONNABORTED, .NOTCONN, .SHUTDOWN, .TIMEDOUT => error.PeerDown,
-        .HOSTUNREACH, .NETUNREACH, .NETDOWN, .HOSTDOWN, .NETRESET, .CONNREFUSED => error.PeerDown,
-        .ACCES, .PERM, .IO, .PROTO => error.PeerDown,
+        .PIPE, .CONNRESET, .CONNABORTED, .NOTCONN, .SHUTDOWN, .TIMEDOUT => .peer_down,
+        .HOSTUNREACH, .NETUNREACH, .NETDOWN, .HOSTDOWN, .NETRESET, .CONNREFUSED => .peer_down,
+        .ACCES, .PERM, .IO, .PROTO => .peer_down,
         // The kernel is short of buffers or the call was interrupted: try again later.
-        .AGAIN, .NOBUFS, .NOMEM, .INTR => error.Backpressure,
-        // A bad descriptor (a socket closed while its send was in flight), address, flag or
-        // length, or a cancel this type never asks for: each means a bug in this file or
-        // its caller, so the process stops with the reason.
-        .BADF, .NOTSOCK, .FAULT, .INVAL, .OPNOTSUPP, .MSGSIZE, .DESTADDRREQ, .ISCONN, .CANCELED => {
-            std.debug.panic("io_uring send: {t}", .{err});
-        },
-        // An errno send(2) isn't documented to return: this file's model of the kernel is
-        // wrong, so the process stops with the value rather than guess what it means.
-        else => std.debug.panic("io_uring send: undocumented errno {t}", .{err}),
+        .AGAIN, .NOBUFS, .NOMEM, .INTR => .backpressure,
+        // Only a bug causes these; `Real.sendResult` says which and stops. EALREADY is a
+        // second Fast Open in progress, and no send here sets MSG_FASTOPEN.
+        .BADF, .NOTSOCK, .FAULT, .INVAL, .OPNOTSUPP, .MSGSIZE, .DESTADDRREQ, .ISCONN => .bug,
+        .CANCELED, .ALREADY => .bug,
+        // An errno send(2) isn't documented to return, named in std or not. It says this
+        // file's model of the kernel is incomplete, not that this process is broken, and a
+        // client might be able to provoke it, so stopping would take the server down for
+        // everyone. Only this connection fails, and the caller counts it.
+        else => .peer_down_undocumented,
     };
-    assert(result == error.PeerDown or result == error.Backpressure);
-    return result;
 }
 
 /// Reads `CLOCK_MONOTONIC` as nanoseconds.
@@ -846,27 +881,84 @@ test "real: one submission past the ring's depth returns QueueFull and changes n
     try testing.expectEqual(id, completions[0].id);
 }
 
-test "real: every send errno has an outcome" {
-    try testing.expectEqual(error.PeerDown, sendError(.PIPE));
-    try testing.expectEqual(error.PeerDown, sendError(.CONNRESET));
-    try testing.expectEqual(error.PeerDown, sendError(.NOTCONN));
-    try testing.expectEqual(error.PeerDown, sendError(.TIMEDOUT));
-    try testing.expectEqual(error.PeerDown, sendError(.HOSTUNREACH));
-    try testing.expectEqual(error.PeerDown, sendError(.ACCES));
-    try testing.expectEqual(error.PeerDown, sendError(.IO));
-    try testing.expectEqual(error.PeerDown, sendError(.PROTO));
-    try testing.expectEqual(error.Backpressure, sendError(.AGAIN));
-    try testing.expectEqual(error.Backpressure, sendError(.NOBUFS));
-    try testing.expectEqual(error.Backpressure, sendError(.NOMEM));
-    try testing.expectEqual(error.Backpressure, sendError(.INTR));
+/// A `Real` with only the fields `sendResult` reads and writes set, so the errno tests
+/// need no ring and run where io_uring is switched off.
+fn sendResultOnly() Real {
+    var real: Real = undefined;
+    real.send_errno_undocumented_count = 0;
+    real.send_errno_undocumented_last = .SUCCESS;
+    return real;
 }
 
-test "real: a completion's result maps bytes, no progress and errnos" {
-    try testing.expectEqual(@as(u32, 5), try sendResult(5, 5));
-    try testing.expectEqual(@as(u32, 2), try sendResult(2, 5)); // A short send.
-    try testing.expectError(error.Backpressure, sendResult(0, 5));
-    try testing.expectError(error.PeerDown, sendResult(-@as(i32, @backingInt(linux.E.PIPE)), 5));
-    try testing.expectError(error.Backpressure, sendResult(-@as(i32, @backingInt(linux.E.AGAIN)), 5));
+/// Raw completion result for a failed send.
+fn sendFailed(err: linux.E) i32 {
+    return -@as(i32, @backingInt(err));
+}
+
+const send_errnos_peer_down = [_]linux.E{
+    .PIPE,        .CONNRESET,  .CONNABORTED, .NOTCONN,  .SHUTDOWN, .TIMEDOUT,
+    .HOSTUNREACH, .NETUNREACH, .NETDOWN,     .HOSTDOWN, .NETRESET, .CONNREFUSED,
+    .ACCES,       .PERM,       .IO,          .PROTO,
+};
+const send_errnos_backpressure = [_]linux.E{ .AGAIN, .NOBUFS, .NOMEM, .INTR };
+const send_errnos_bug = [_]linux.E{
+    .BADF,    .NOTSOCK,     .FAULT,  .INVAL,    .OPNOTSUPP,
+    .MSGSIZE, .DESTADDRREQ, .ISCONN, .CANCELED, .ALREADY,
+};
+
+/// Errnos send(2) doesn't document: some std names, the top of the kernel's range, and a
+/// value std has no name for.
+const send_errnos_undocumented = [_]linux.E{
+    .NOENT,    .EXIST,                .SRCH,                 .NOSPC, .ROFS, .NOSYS,
+    .HWPOISON, @fromBackingInt(4095), @fromBackingInt(1000),
+};
+
+test "real: every documented send errno has an outcome, counted nowhere" {
+    var real = sendResultOnly();
+    for (send_errnos_peer_down) |err| {
+        try testing.expectEqual(SendOutcome.peer_down, sendErrno(err));
+        try testing.expectError(error.PeerDown, real.sendResult(sendFailed(err), 5));
+    }
+    for (send_errnos_backpressure) |err| {
+        try testing.expectEqual(SendOutcome.backpressure, sendErrno(err));
+        try testing.expectError(error.Backpressure, real.sendResult(sendFailed(err), 5));
+    }
+    try testing.expectEqual(@as(u64, 0), real.send_errno_undocumented_count);
+    try testing.expectEqual(linux.E.SUCCESS, real.send_errno_undocumented_last);
+}
+
+test "real: a send errno only a bug causes is a bug, not a dropped connection" {
+    // `sendResult` stops the process on these, so only the mapping is checked here.
+    for (send_errnos_bug) |err| {
+        try testing.expectEqual(SendOutcome.bug, sendErrno(err));
+    }
+}
+
+test "real: an undocumented send errno is PeerDown and is counted" {
+    var real = sendResultOnly();
+    for (send_errnos_undocumented, 1..) |err, count| {
+        try testing.expectEqual(SendOutcome.peer_down_undocumented, sendErrno(err));
+        try testing.expectError(error.PeerDown, real.sendResult(sendFailed(err), 5));
+        try testing.expectEqual(@as(u64, count), real.send_errno_undocumented_count);
+        try testing.expectEqual(err, real.send_errno_undocumented_last);
+    }
+    // Documented errnos, bytes and no progress leave the count and the latest errno alone.
+    const counted = real.send_errno_undocumented_count;
+    try testing.expectError(error.PeerDown, real.sendResult(sendFailed(.PIPE), 5));
+    try testing.expectError(error.Backpressure, real.sendResult(sendFailed(.AGAIN), 5));
+    try testing.expectError(error.Backpressure, real.sendResult(0, 5));
+    try testing.expectEqual(@as(u32, 5), try real.sendResult(5, 5));
+    try testing.expectEqual(counted, real.send_errno_undocumented_count);
+    const latest = send_errnos_undocumented[send_errnos_undocumented.len - 1];
+    try testing.expectEqual(latest, real.send_errno_undocumented_last);
+}
+
+test "real: a completion's result maps bytes and no progress" {
+    var real = sendResultOnly();
+    try testing.expectEqual(@as(u32, 5), try real.sendResult(5, 5));
+    try testing.expectEqual(@as(u32, 2), try real.sendResult(2, 5)); // A short send.
+    try testing.expectError(error.Backpressure, real.sendResult(0, 5));
+    try testing.expectEqual(@as(u64, 0), real.send_errno_undocumented_count);
 }
 
 test "real: a poll takes no more completions than its buffer holds; the rest wait" {
