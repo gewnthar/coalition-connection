@@ -101,6 +101,7 @@ pub fn statusForParseError(err: http_request.Error) ?Status {
         error.HostDuplicate,
         error.ContentLengthInvalid,
         error.ContentLengthDuplicate,
+        error.RealIpDuplicate,
         => .bad_request,
     };
     // Guards later edits of the arms: only Incomplete waits, and a refusal is never a 2xx.
@@ -599,6 +600,7 @@ test "http_response: every parser error maps to its status" {
         .{ .err = error.HostDuplicate, .status = .bad_request },
         .{ .err = error.ContentLengthInvalid, .status = .bad_request },
         .{ .err = error.ContentLengthDuplicate, .status = .bad_request },
+        .{ .err = error.RealIpDuplicate, .status = .bad_request },
     };
     // One distinct case per parser error, so an error added without a case fails here.
     try testing.expectEqual(@typeInfo(http_request.Error).error_set.error_names.?.len, cases.len);

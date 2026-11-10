@@ -104,6 +104,8 @@ const HttpModel = struct {
     header_count: u32,
     content_length: u32,
     len: u32,
+    /// X-Real-IP fields written; more than one must be refused.
+    real_ip_fields: u32 = 0,
 };
 
 /// The limit a generated case sits on, so the run can count which limits it reached.
@@ -129,6 +131,8 @@ const HttpLimit = enum {
     content_length_over_max,
     /// A Content-Length of 6 to 20 digits.
     content_length_digits_over,
+    /// A valid request with two or more X-Real-IP fields, in any case.
+    real_ip_duplicate,
 };
 
 /// A limit case: the bytes written, the error the parser must return (null for success)
@@ -151,6 +155,7 @@ const HttpCounts = struct {
     content_length_one_over: u32 = 0,
     content_length_over_max: u32 = 0,
     content_length_digits_over: u32 = 0,
+    real_ip_duplicate: u32 = 0,
 
     fn add(self: *HttpCounts, limit: HttpLimit) void {
         const before = self.total();
@@ -167,6 +172,7 @@ const HttpCounts = struct {
             .content_length_one_over => self.content_length_one_over += 1,
             .content_length_over_max => self.content_length_over_max += 1,
             .content_length_digits_over => self.content_length_digits_over += 1,
+            .real_ip_duplicate => self.real_ip_duplicate += 1,
         }
         const expected: u32 = if (limit == .none) before else before + 1;
         assert(self.total() == expected);
@@ -186,6 +192,7 @@ const HttpCounts = struct {
         sum += self.content_length_one_over;
         sum += self.content_length_over_max;
         sum += self.content_length_digits_over;
+        sum += self.real_ip_duplicate;
         assert(sum <= cc.constants.fuzz_iterations_max);
         return sum;
     }
@@ -198,7 +205,8 @@ const HttpCounts = struct {
             self.request_exact_fit > 0 and self.body_too_large > 0 and
             self.buffer_full > 0 and self.buffer_one_short > 0 and
             self.content_length_exact_fit > 0 and self.content_length_one_over > 0 and
-            self.content_length_over_max > 0 and self.content_length_digits_over > 0;
+            self.content_length_over_max > 0 and self.content_length_digits_over > 0 and
+            self.real_ip_duplicate > 0;
     }
 
     fn print(self: *const HttpCounts, seed: u64) void {
@@ -217,6 +225,7 @@ const HttpCounts = struct {
             "  content_length_exact_fit={d} content_length_one_over={d} content_length_over_max={d} content_length_digits_over={d}\n",
             .{ self.content_length_exact_fit, self.content_length_one_over, self.content_length_over_max, self.content_length_digits_over },
         );
+        std.debug.print("  real_ip_duplicate={d}\n", .{self.real_ip_duplicate});
     }
 };
 
@@ -253,24 +262,46 @@ fn appendDecimal(buffer: *[http_buffer_size]u8, len: u32, value: u32) u32 {
     return append(buffer, len, digits[digits_max - count ..]);
 }
 
+/// X-Real-IP fields as a client might spell them; the parser must count each one.
+const http_real_ip_fields = [_][]const u8{
+    "X-Real-IP: 192.0.2.1\r\n",
+    "x-real-ip:192.0.2.1\r\n",
+    "X-REAL-IP: \t198.51.100.2 \r\n",
+};
+
 /// Writes a valid request: a method, Host, up to 7 extra fields and a one-digit Content-Length.
+/// About one extra field in eight is an X-Real-IP, so some requests carry two or more and
+/// must be refused with `error.RealIpDuplicate`.
 fn httpGenerate(random: std.Random, buffer: *[http_buffer_size]u8) HttpModel {
     const choice = http_methods[random.uintLessThan(u32, http_methods.len)];
     var len: u32 = append(buffer, 0, choice.name);
     len = append(buffer, len, if (choice.method == .options) " * HTTP/1.1\r\n" else " /p?q=1 HTTP/1.1\r\n");
     len = append(buffer, len, "Host: example.test\r\n");
     const extra = random.uintLessThan(u32, 8);
+    var real_ip_fields: u32 = 0;
     var index: u32 = 0;
     while (index < extra) : (index += 1) {
-        len = append(buffer, len, if (random.boolean()) "X-Field: \tvalue \r\n" else "cookie:k=v\r\n");
+        if (random.uintLessThan(u32, 8) == 0) {
+            len = append(buffer, len, http_real_ip_fields[random.uintLessThan(u32, http_real_ip_fields.len)]);
+            real_ip_fields += 1;
+        } else {
+            len = append(buffer, len, if (random.boolean()) "X-Field: \tvalue \r\n" else "cookie:k=v\r\n");
+        }
     }
+    assert(real_ip_fields <= extra);
     const content_length = random.uintLessThan(u8, 10);
     len = append(buffer, len, "Content-Length: ");
     buffer[len] = '0' + content_length;
     len = append(buffer, len + 1, "\r\n\r\n");
     assert(index == extra);
     assert(len <= http_buffer_size);
-    return .{ .method = choice.method, .header_count = extra + 2, .content_length = content_length, .len = len };
+    return .{
+        .method = choice.method,
+        .header_count = extra + 2,
+        .content_length = content_length,
+        .len = len,
+        .real_ip_fields = real_ip_fields,
+    };
 }
 
 /// Writes `http_headers_max - 1`, `http_headers_max` or `http_headers_max + 1` fields,
@@ -574,12 +605,18 @@ fn httpStep(random: std.Random, buffer: *[http_buffer_size]u8, counts: *HttpCoun
         if (mutations > 0) return; // Bad input: any named error is a correct answer.
         // A cut-off valid request is always incomplete, because its only CRLF CRLF is at the end.
         if (truncated and err == error.Incomplete) return;
+        if (!truncated and model.real_ip_fields > 1 and err == error.RealIpDuplicate) {
+            counts.add(.real_ip_duplicate);
+            return;
+        }
         std.debug.print("fuzz http_request: valid input rejected with {s}\n", .{@errorName(err)});
         return error.Mismatch;
     };
     try httpCheckAlways(input, &request);
     if (mutations > 0) return;
     if (truncated) return error.Mismatch; // An incomplete head must not parse.
+    if (model.real_ip_fields > 1) return error.Mismatch; // A second X-Real-IP must not parse.
+    if ((request.header("X-Real-IP") != null) != (model.real_ip_fields == 1)) return error.Mismatch;
     if (request.method != model.method) return error.Mismatch;
     if (request.header_count != model.header_count) return error.Mismatch;
     if (request.content_length != model.content_length) return error.Mismatch;
