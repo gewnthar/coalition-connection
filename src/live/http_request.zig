@@ -17,6 +17,11 @@
 //! CRLF only, obsolete line folding is refused, a header name must touch its colon, there
 //! is at most one Content-Length, and Transfer-Encoding is refused: request bodies are small
 //! forms, so chunked uploads are not needed.
+//!
+//! There is also at most one X-Real-IP. The proxy replaces any copy the client sent with
+//! its own, so two copies mean the request did not come through the proxy as expected; it
+//! is refused rather than guessing which one to believe. Whether a single copy is trusted
+//! at all is decided later, by where the connection came from, not here.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -105,6 +110,8 @@ pub const Error = error{
     /// Content-Length is empty or not all digits.
     ContentLengthInvalid,
     ContentLengthDuplicate,
+    /// More than one X-Real-IP field. See the file comment.
+    RealIpDuplicate,
     /// Transfer-Encoding is present (501). See the file comment.
     TransferEncodingUnsupported,
 };
@@ -301,15 +308,20 @@ fn parseHeaderLine(line: []const u8) Error!Header {
     return .{ .name = name, .value = value };
 }
 
-/// Checks the headers that decide where the request ends. Returns the body length.
+/// Checks the headers that decide where the request ends, and that Host, Content-Length
+/// and X-Real-IP each appear at most once, so `Request.header` returns the only copy of
+/// each. Returns the body length.
 fn checkFraming(request: *const Request) Error!u32 {
     assert(request.header_count <= headers_max);
     assert(request.head_len <= size_max);
     var host_count: u32 = 0;
+    var real_ip_count: u32 = 0;
     var content_length: ?u32 = null;
     for (request.headers[0..request.header_count]) |field| {
         if (equalIgnoreCase(field.name, "host")) {
             host_count += 1;
+        } else if (equalIgnoreCase(field.name, "x-real-ip")) {
+            real_ip_count += 1;
         } else if (equalIgnoreCase(field.name, "transfer-encoding")) {
             return error.TransferEncodingUnsupported;
         } else if (equalIgnoreCase(field.name, "content-length")) {
@@ -319,11 +331,13 @@ fn checkFraming(request: *const Request) Error!u32 {
     }
     if (host_count > 1) return error.HostDuplicate;
     if (host_count == 0 and request.version == .http_1_1) return error.HostMissing;
+    if (real_ip_count > 1) return error.RealIpDuplicate;
 
     const body_len = content_length orelse 0;
     // Both terms are at most size_max, so the sum cannot overflow a u32.
     if (request.head_len + body_len > size_max) return error.ContentTooLarge;
-    assert(host_count <= 1);
+    // Each field adds to at most one count, so the counts can't pass the field count.
+    assert(host_count + real_ip_count <= request.header_count);
     return body_len;
 }
 
@@ -523,6 +537,21 @@ test "http_request: header lookup ignores case and values are trimmed" {
     try testing.expect(request.header("Missing") == null);
 }
 
+test "http_request: one X-Real-IP is read, and only that name, in any case, counts" {
+    const one = "GET / HTTP/1.1\r\nHost: a\r\nx-real-ip:  192.0.2.7 \r\n\r\n";
+    try expectSameWhenSplit(one);
+    const request = try parseWhole(one);
+    try testing.expectEqualStrings("192.0.2.7", request.header("X-Real-IP").?);
+
+    // Fields whose names only start or end like X-Real-IP are other fields.
+    const lookalikes = "GET / HTTP/1.1\r\nHost: a\r\nX-Real-IP: 192.0.2.7\r\n" ++
+        "X-Real-IP-Chain: 192.0.2.8\r\nX-X-Real-IP: 192.0.2.9\r\n\r\n";
+    try expectSameWhenSplit(lookalikes);
+    const other = try parseWhole(lookalikes);
+    try testing.expectEqual(@as(u32, 4), other.header_count);
+    try testing.expectEqualStrings("192.0.2.7", other.header("X-Real-IP").?);
+}
+
 test "http_request: every method and version" {
     const cases = [_]struct { text: []const u8, method: Method, version: Version }{
         .{ .text = "GET / HTTP/1.0\r\n\r\n", .method = .get, .version = .http_1_0 },
@@ -560,6 +589,9 @@ test "http_request: incomplete heads ask for more bytes" {
 }
 
 test "http_request: each bad input has its own error" {
+    const real_ip_twice = "GET / HTTP/1.1\r\nHost: a\r\nX-Real-IP: 192.0.2.1\r\nX-Real-IP: 192.0.2.2\r\n";
+    // A Content-Length that parses but can't fit after any head: the size refusal comes last.
+    const size_max_text = std.fmt.comptimePrint("{d}", .{size_max});
     const cases = [_]struct { text: []const u8, err: Error }{
         .{ .text = "\r\n\r\n", .err = error.RequestLineInvalid },
         .{ .text = "GET\r\n\r\n", .err = error.RequestLineInvalid },
@@ -587,6 +619,16 @@ test "http_request: each bad input has its own error" {
         .{ .text = "GET / HTTP/1.1\r\nHost: a\nX: b\r\n\r\n", .err = error.HeaderValueInvalid },
         .{ .text = "GET / HTTP/1.1\r\n\r\n", .err = error.HostMissing },
         .{ .text = "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", .err = error.HostDuplicate },
+        .{ .text = real_ip_twice ++ "\r\n", .err = error.RealIpDuplicate },
+        .{
+            .text = "GET / HTTP/1.1\r\nx-real-ip: 192.0.2.1\r\nHost: a\r\nX-REAL-IP: 192.0.2.1\r\n\r\n",
+            .err = error.RealIpDuplicate,
+        },
+        .{ .text = "GET / HTTP/1.0\r\nX-Real-IP: 192.0.2.1\r\nX-Real-IP:\r\n\r\n", .err = error.RealIpDuplicate },
+        // Which refusal wins when a second X-Real-IP comes with another fault.
+        .{ .text = "GET / HTTP/1.1\r\nX-Real-IP: 192.0.2.1\r\nX-Real-IP: 192.0.2.2\r\n\r\n", .err = error.HostMissing },
+        .{ .text = real_ip_twice ++ "Transfer-Encoding: chunked\r\n\r\n", .err = error.TransferEncodingUnsupported },
+        .{ .text = real_ip_twice ++ "Content-Length: " ++ size_max_text ++ "\r\n\r\n", .err = error.RealIpDuplicate },
         .{ .text = "GET / HTTP/1.1\r\nHost: a\r\nContent-Length:\r\n\r\n", .err = error.ContentLengthInvalid },
         .{ .text = "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: +1\r\n\r\n", .err = error.ContentLengthInvalid },
         .{ .text = "GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 1, 1\r\n\r\n", .err = error.ContentLengthInvalid },

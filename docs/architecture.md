@@ -388,6 +388,8 @@ Cloudflare proxies every web request. Three rules follow from that:
    passes it to the app in `X-Real-IP`. The app uses `X-Real-IP` only on requests from
    nginx on its local socket; otherwise it ignores the header, uses the peer address, and
    logs the event. Without this, anyone could fake their address by sending the header.
+   nginx replaces any `X-Real-IP` the client sent, so a request that reaches the app
+   with two copies didn't come through nginx as expected and gets 400 Bad Request.
 3. **Web traffic only from Cloudflare.** firewalld opens the web port only to Cloudflare's
    ranges. nginx refuses any connection whose original peer (`$realip_remote_addr`) is
    outside them. The check must use that variable, not `allow`/`deny`, because those run
