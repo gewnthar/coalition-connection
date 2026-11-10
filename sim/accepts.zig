@@ -149,7 +149,7 @@ fn check(w: *Workload, completion: io.Completion) Error!void {
                 break :backpressure 3;
             },
         };
-        trace(&w.counts, 1 | outcome << 8 | completion.id << 16);
+        trace(&w.counts, 1 | (outcome << 8) | (completion.id << 16));
         return;
     };
     const index = @as(connections.IdParts, @bitCast(peer)).index;
