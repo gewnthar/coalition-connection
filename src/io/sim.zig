@@ -784,7 +784,7 @@ test "sim: accepts take table entries under fresh sockets until the table is ful
     try testing.expectEqual(@as(u32, 4), fixture.table.count());
     try testing.expectEqual(@as(u64, 0), sim.faults.total());
     for (completions) |completion| {
-        if (completion.result.accept) |peer| _ = fixture.table.release(peer) else |_| {}
+        if (completion.result.accept) |peer| _ = try fixture.table.release(peer) else |_| {}
     }
 }
 
@@ -814,7 +814,7 @@ fn acceptRun(seed: u64, size: u32, ids: []io.OperationId, results: []u64) !Sim {
     try testing.expectEqual(fixture.table.count(), @as(u32, @intCast(sim.accepted)));
     // Release every entry, so the fixture's shutdown sees a table it can free.
     for (completions[0..count]) |completion| {
-        if (completion.result.accept) |peer| _ = fixture.table.release(peer) else |_| {}
+        if (completion.result.accept) |peer| _ = try fixture.table.release(peer) else |_| {}
     }
     sim.table = null;
     return sim;

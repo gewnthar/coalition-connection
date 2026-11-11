@@ -492,7 +492,11 @@ fn runTableCase(startup: *cc.StartupAllocator, call: trip.TableCall, case: trip.
     }
     assert(id == trip.table_size);
     table.setState(trip.writing_id, .writing);
-    assert(table.release(trip.free_id) == socketOf(trip.free_id));
+    // The harness never counts a send, so nothing holds a release back.
+    const freed = table.release(trip.free_id) catch |err| switch (err) {
+        error.SendsInFlight => setupFailed(case, "found a send counted on the entry to free"),
+    };
+    assert(freed == socketOf(trip.free_id));
     startup.finishStartup();
     table.assertInvariants();
     assert(table.count() == trip.table_size - 1);
@@ -537,7 +541,11 @@ fn callTable(table: *connections.Table, call: trip.TableCall) connections.Socket
         .release_reading,
         .release_writing,
         .release_stale,
-        => table.release(id),
+        // The harness never counts a send, so a refusal can only mean the table is wrong:
+        // -2 matches no socket, and the control fails.
+        => table.release(id) catch |err| switch (err) {
+            error.SendsInFlight => -2,
+        },
         .get_free,
         .get_free_stale_socket,
         .get_out_of_range,
@@ -830,7 +838,11 @@ fn realTable(startup: *cc.StartupAllocator, case: trip.Case, local: linux.fd_t) 
         assert(acquired == id);
     }
     assert(id == trip.real_table_size);
-    assert(table.release(trip.real_free_id) == local);
+    // Nothing has been sent yet, so nothing holds the release back.
+    const freed = table.release(trip.real_free_id) catch |err| switch (err) {
+        error.SendsInFlight => setupFailed(case, "found a send counted on the entry to free"),
+    };
+    assert(freed == local);
     assert(table.count() == trip.real_table_size - 1);
     return table;
 }
@@ -920,8 +932,12 @@ fn realControlHeld(
     assert(!armed);
     assert(realCallAllowed(call));
     if (child_calls != child_calls_armed) return false;
-    for (table.entries, before.entries) |entry, entry_before| {
-        if (!std.meta.eql(entry, entry_before)) return false;
+    for (table.entries, before.entries, 0..) |entry, entry_before, index| {
+        // A submitted send is counted on its peer's entry until its completion; nothing
+        // else in any entry changes.
+        var expected = entry_before;
+        if (call == .send_peer and index == trip.real_peer_id) expected.sends_in_flight += 1;
+        if (!std.meta.eql(entry, expected)) return false;
     }
     if (table.get(trip.real_peer_id).socket != local) return false;
     switch (call) {
@@ -962,6 +978,8 @@ fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remo
     var completions: [1]cc.io.Completion = undefined;
     if (drain(real, &completions) != 1) return false;
     if (completions[0].id != send_peer_id) return false;
+    // The completion uncounted the send on its peer.
+    if (real.table.get(trip.real_peer_id).sends_in_flight != 0) return false;
     const sent = switch (completions[0].result) {
         .send => |sent| sent catch return false,
         .execute, .accept => return false,
