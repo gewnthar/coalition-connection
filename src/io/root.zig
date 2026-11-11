@@ -20,13 +20,13 @@
 //! Operation lifetime: the bytes an operation names belong to the caller and must stay valid
 //! and unchanged until its completion arrives, as with io_uring; the simulator checks this.
 //! Each accepted operation completes exactly once, carrying the `id` the caller gave it, and
-//! ids in flight must be distinct; the simulator and the real type both check this. A submission refused with
-//! `error.QueueFull` never completes. `poll` takes a buffer of 1 to
-//! `constants.io_operations_in_flight_max` completions. A send may complete short, reporting fewer bytes than it was given; the
-//! caller sends the rest. A send's peer stays in the connection table, with its socket
-//! open, until the send's completion arrives. The real type enforces this: it counts each
-//! send on its peer's entry, and the table refuses to release an entry with sends counted
-//! (`error.SendsInFlight`).
+//! ids in flight must be distinct; the simulator and the real type both check this. A
+//! submission refused with `error.QueueFull` never completes. `poll` takes a buffer of 1 to
+//! `constants.io_operations_in_flight_max` completions. A send may complete short,
+//! reporting fewer bytes than it was given; the caller sends the rest. A send's peer stays
+//! in the connection table, with its socket open, until the send's completion arrives. The
+//! real type enforces this: it counts each send on its peer's entry, and the table refuses
+//! to release an entry with sends counted (`error.SendsInFlight`).
 //!
 //! Accepts (roadmap core 3a): an accept waits on a listening socket until a connection
 //! arrives, then completes with the new connection's `PeerId`: the I/O type itself takes

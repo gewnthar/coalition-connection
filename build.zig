@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = root });
     const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run unit tests, the version check and the startup-trip harness");
+    const test_step = b.step("test", "Run unit tests, the server's start and refusals, and the startup-trip harness");
     test_step.dependOn(&run_tests.step);
 
     addServer(b, root, target, optimize, test_step);
