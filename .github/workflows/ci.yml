@@ -11,15 +11,29 @@ permissions:
 env:
   # The one place the Zig version is pinned.
   ZIG_VERSION: 0.17.1
+  # Zig's minisign public key, from https://ziglang.org/download/. The tarball's SHA-256
+  # comes from the same host as the tarball, so the signature is what proves the download
+  # is Zig's own.
+  ZIG_PUBLIC_KEY: RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      # Pinned to a commit, not a tag a later push could move (v5.1.0). The job's token
+      # isn't left in .git/config, so no later step, including the build of a pull
+      # request's code, can read it.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
 
-      - name: Install Zig ${{ env.ZIG_VERSION }} (SHA-256 checked against the download index)
+      - name: Install minisign
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q minisign
+
+      - name: Install Zig ${{ env.ZIG_VERSION }} (signature and SHA-256 checked)
         run: |
           set -euo pipefail
           curl -fsSL --retry 3 https://ziglang.org/download/index.json -o "$RUNNER_TEMP/index.json"
@@ -30,7 +44,17 @@ jobs:
             exit 1
           fi
           curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/zig.tar.xz"
+          curl -fsSL --retry 3 "$url.minisig" -o "$RUNNER_TEMP/zig.tar.xz.minisig"
           echo "$sha  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict -
+          # The signature must be Zig's, and its signed comment must name this very file,
+          # so another signed Zig tarball (an older version, say) can't stand in for it.
+          minisign -V -m "$RUNNER_TEMP/zig.tar.xz" -x "$RUNNER_TEMP/zig.tar.xz.minisig" \
+            -P "$ZIG_PUBLIC_KEY" | tee "$RUNNER_TEMP/minisign.out"
+          grep -q "file:$(basename "$url")\b" "$RUNNER_TEMP/minisign.out"
+          case "$(basename "$url")" in
+            *"-$ZIG_VERSION.tar.xz") ;;
+            *) echo "the index's tarball isn't Zig $ZIG_VERSION: $url" >&2; exit 1 ;;
+          esac
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
