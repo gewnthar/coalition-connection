@@ -67,13 +67,14 @@ pub const esi_retries_max: u32 = 3;
 /// the connection table sized at startup. Provisional.
 pub const http_connections_max: u32 = 4_096;
 
-/// Bytes of connection-table state per connection: its entry (socket, state, generation
-/// and request head scan) plus its slot on the free-index stack. Reason: the table is sized
-/// once at startup and counted in the memory table; `src/live/connections.zig` checks at
-/// compile time that its entry fits. The entry and its slot take 14 of the 16 bytes on
-/// every target, so any further field beyond one more byte means raising this number in
-/// review.
-pub const http_connection_entry_size_max: u32 = 16;
+/// Bytes of connection-table state per connection: its entry (socket, state, generation,
+/// request head scan and count of sends in flight) plus its slot on the free-index stack.
+/// Reason: the table is sized once at startup and counted in the memory table;
+/// `src/live/connections.zig` checks at compile time that its entry fits. The entry and its
+/// slot take 18 of the 20 bytes on every target: 13 bytes of fields, padded to 16 by the
+/// socket's 4-byte alignment, plus a 2-byte slot. Three more bytes of fields still fit in
+/// the padding; anything past that means raising this number in review.
+pub const http_connection_entry_size_max: u32 = 20;
 
 /// Largest HTTP request head plus body. Reason: forms are small; anything larger is
 /// rejected before parsing.

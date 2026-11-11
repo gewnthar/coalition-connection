@@ -40,6 +40,16 @@
 //! so an id stays distinct from every later one for 65,535 reuses of its entry. The free
 //! stack hands the same entry out again first, so work in flight on a connection must not
 //! outlast that many reuses of its entry.
+//!
+//! Sends in flight: the I/O type captures a send's socket number when the send is
+//! submitted, and the kernel may take the send later. If the entry were released and its
+//! socket closed in between, Linux would hand the same number to the next accepted
+//! connection, and the queued send would reach the wrong client. So each entry counts its
+//! sends in flight: `sendSubmitted` raises the count, `sendCompleted` lowers it, and
+//! `release` refuses with `error.SendsInFlight`, changing nothing, while it is above zero.
+//! A refusal is a state the caller meets in normal running (a second send still queued
+//! when the first fails with `PeerDown`), so it is an error to handle, not a bug: the
+//! caller stops sending on that connection and releases it after its last completion.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -71,6 +81,13 @@ pub const HeadScan = http_request.HeadScan;
 
 pub const AcquireError = error{TableFull};
 
+/// `SendsInFlight`: the connection still has sends the kernel may act on, so its socket
+/// must stay open; release it after the last one completes.
+pub const ReleaseError = error{SendsInFlight};
+
+/// Sends in flight on one connection. Never more than the I/O type has slots for.
+pub const SendCount = u16;
+
 pub const InitError = error{OutOfMemory};
 
 /// Where a connection is in its request and response.
@@ -92,6 +109,9 @@ pub const Entry = struct {
     /// The generation every live id for this entry carries. Kept while the entry is free:
     /// `release` advances it, and the next `acquire` hands it out.
     generation: Generation = 0,
+    /// Sends submitted on this connection whose completions haven't come back. Zero
+    /// whenever `state` is `free`: `release` refuses while it is above zero.
+    sends_in_flight: SendCount = 0,
 };
 
 /// Bytes of table state one connection costs: its entry plus its slot on the free stack.
@@ -104,6 +124,8 @@ comptime {
     assert(constants.http_connections_max - 1 <= std.math.maxInt(Index));
     // The layout the docs promise: index in the low half, generation in the high half.
     assert(@as(PeerId, @bitCast(IdParts{ .index = 1, .generation = 2 })) == 0x0002_0001);
+    // Every operation in flight could be a send on one connection; its count still fits.
+    assert(constants.io_operations_in_flight_max <= std.math.maxInt(SendCount));
 }
 
 pub const Table = struct {
@@ -176,6 +198,7 @@ pub const Table = struct {
         assert(entry.state == .free); // A stacked index names a free entry.
         assert(entry.scan.resume_at == 0); // release empties the scan of every entry it frees.
         assert(entry.socket == -1); // release clears the socket of every entry it frees.
+        assert(entry.sends_in_flight == 0); // release refuses an entry with sends in flight.
         entry.socket = socket;
         entry.state = .reading;
         const id: PeerId = @bitCast(IdParts{ .index = index, .generation = entry.generation });
@@ -185,14 +208,20 @@ pub const Table = struct {
 
     /// Returns `id`'s entry to the free stack, emptying its head scan and advancing its
     /// generation, so `id` is stale from now on. Hands back the socket, which the caller
-    /// must close. Releasing an entry not in use, or through a stale id, is a bug.
-    pub fn release(self: *Table, id: PeerId) Socket {
+    /// must close. While the connection has sends in flight, returns
+    /// `error.SendsInFlight` and changes nothing. Releasing an entry not in use, or through
+    /// a stale id, is a bug.
+    pub fn release(self: *Table, id: PeerId) ReleaseError!Socket {
         const count_before = self.count();
         assert(count_before > 0);
         const index = self.liveIndex(id);
         const entry = &self.entries[index];
         const socket = entry.socket;
         assert(socket >= 0);
+        if (entry.sends_in_flight > 0) {
+            assert(self.count() == count_before);
+            return error.SendsInFlight;
+        }
         const generation_next = entry.generation +% 1;
         entry.* = .{ .socket = -1, .state = .free, .generation = generation_next };
         assert(self.free_count < self.capacity()); // An entry in use has no slot on the stack.
@@ -249,6 +278,27 @@ pub const Table = struct {
         entry.state = state;
     }
 
+    /// Counts a send just submitted on `id`'s connection, which must be live. Until the
+    /// matching `sendCompleted`, `release` refuses the entry, so its socket stays open and
+    /// its number can't pass to another connection.
+    pub fn sendSubmitted(self: *Table, id: PeerId) void {
+        const entry = &self.entries[self.liveIndex(id)];
+        assert(entry.socket >= 0);
+        // The I/O type has at most this many operations in flight, sends or not.
+        assert(entry.sends_in_flight < constants.io_operations_in_flight_max);
+        entry.sends_in_flight += 1;
+    }
+
+    /// Counts a send on `id`'s connection as completed. `id` must still be live: `release`
+    /// refused it while the send was in flight, so a stale id here means a send outlived
+    /// its connection, or was never counted.
+    pub fn sendCompleted(self: *Table, id: PeerId) void {
+        const entry = &self.entries[self.liveIndex(id)];
+        assert(entry.socket >= 0);
+        assert(entry.sends_in_flight > 0); // A completion for a send never counted.
+        entry.sends_in_flight -= 1;
+    }
+
     /// The index of `id`'s entry, checking that `id` is live: inside the table, naming an
     /// entry in use, and carrying that entry's generation. For callers holding a live id;
     /// completions, which may hold a stale one, go through `lookup`.
@@ -273,6 +323,7 @@ pub const Table = struct {
             assert(self.entries[index].state == .free);
             assert(self.entries[index].scan.resume_at == 0); // A free entry holds no scan.
             assert(self.entries[index].socket == -1);
+            assert(self.entries[index].sends_in_flight == 0); // release refuses those.
             assert(!stacked.isSet(index)); // An index on the free stack twice.
             stacked.set(index);
         }
@@ -370,7 +421,7 @@ test "connections: release hands back the socket, then acquire reuses the entry 
     table.setState(first, .writing);
     try testing.expectEqual(State.writing, table.get(first).state);
 
-    try testing.expectEqual(@as(Socket, 10), table.release(first));
+    try testing.expectEqual(@as(Socket, 10), try table.release(first));
     try testing.expectEqual(@as(u32, 1), table.count());
     table.assertInvariants();
 
@@ -389,10 +440,74 @@ test "connections: release hands back the socket, then acquire reuses the entry 
     try testing.expectEqual(@as(u32, 2), table.count());
     table.assertInvariants();
 
-    try testing.expectEqual(@as(Socket, 11), table.release(second));
-    try testing.expectEqual(@as(Socket, 12), table.release(reused));
+    try testing.expectEqual(@as(Socket, 11), try table.release(second));
+    try testing.expectEqual(@as(Socket, 12), try table.release(reused));
     try testing.expectEqual(@as(u32, 0), table.count());
     table.assertInvariants();
+
+    startup.beginShutdown();
+    table.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "connections: a connection with sends in flight is refused release, changing nothing" {
+    var startup = StartupAllocator.init(testing.allocator, 4 * entry_bytes);
+    const gpa = startup.allocator();
+    var table = try Table.init(gpa, 4);
+    startup.finishStartup();
+
+    const busy = try table.acquire(10);
+    const idle = try table.acquire(11);
+    table.sendSubmitted(busy);
+    table.sendSubmitted(busy);
+    try testing.expectEqual(@as(SendCount, 2), table.get(busy).sends_in_flight);
+    var entries_before: [4]Entry = undefined;
+    var free_indices_before: [4]Index = undefined;
+    @memcpy(&entries_before, table.entries);
+    @memcpy(&free_indices_before, table.free_indices);
+
+    // Refused while either send is in flight; the entry, its id and the stack stay as they were.
+    try testing.expectError(error.SendsInFlight, table.release(busy));
+    try testing.expectEqualSlices(Entry, &entries_before, table.entries);
+    try testing.expectEqualSlices(Index, &free_indices_before, table.free_indices);
+    try testing.expectEqual(@as(u32, 2), table.count());
+    try testing.expectEqual(table.get(busy), table.lookup(busy).?);
+    table.sendCompleted(busy);
+    try testing.expectError(error.SendsInFlight, table.release(busy));
+    try testing.expectEqual(@as(u32, 2), table.count());
+    // The other connection's count is its own: it releases at once.
+    try testing.expectEqual(@as(Socket, 11), try table.release(idle));
+    table.assertInvariants();
+
+    // After the last completion the release goes through, and the entry comes back empty.
+    table.sendCompleted(busy);
+    try testing.expectEqual(@as(Socket, 10), try table.release(busy));
+    try testing.expectEqual(@as(?*const Entry, null), table.lookup(busy));
+    const reused = try table.acquire(12);
+    try testing.expectEqual(@as(SendCount, 0), table.get(reused).sends_in_flight);
+    table.assertInvariants();
+
+    _ = try table.release(reused);
+    startup.beginShutdown();
+    table.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "connections: one connection can count a send in every I/O slot" {
+    var startup = StartupAllocator.init(testing.allocator, entry_bytes);
+    const gpa = startup.allocator();
+    var table = try Table.init(gpa, 1);
+    startup.finishStartup();
+
+    const id = try table.acquire(10);
+    const sends_max = constants.io_operations_in_flight_max;
+    var sends: u32 = 0;
+    while (sends < sends_max) : (sends += 1) table.sendSubmitted(id);
+    try testing.expectEqual(@as(SendCount, @intCast(sends_max)), table.get(id).sends_in_flight);
+    try testing.expectError(error.SendsInFlight, table.release(id));
+    while (sends > 0) : (sends -= 1) table.sendCompleted(id);
+    try testing.expectEqual(@as(SendCount, 0), table.get(id).sends_in_flight);
+    try testing.expectEqual(@as(Socket, 10), try table.release(id));
 
     startup.beginShutdown();
     table.deinit(gpa);
@@ -410,7 +525,7 @@ test "connections: a fresh entry starts with an empty head scan" {
     try testing.expectEqual(@as(u32, 0), table.get(id).scan.resume_at);
     try testing.expectEqual(@as(u32, 0), table.headScan(id).resume_at);
 
-    _ = table.release(id);
+    _ = try table.release(id);
     startup.beginShutdown();
     table.deinit(gpa);
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);
@@ -439,7 +554,7 @@ test "connections: an entry released mid-scan is acquired again with an empty sc
     try testing.expectEqual(@as(u32, 0), table.get(other).scan.resume_at);
     table.setState(other, .writing);
 
-    _ = table.release(first);
+    _ = try table.release(first);
     const first_index = @as(IdParts, @bitCast(first)).index;
     try testing.expectEqual(@as(u32, 0), table.entries[first_index].scan.resume_at);
     table.assertInvariants();
@@ -453,8 +568,8 @@ test "connections: an entry released mid-scan is acquired again with an empty sc
     try testing.expectEqual(@as(u32, whole.len), request.head_len);
     try testing.expectEqual(@as(u32, 0), table.get(reused).scan.resume_at);
 
-    _ = table.release(other);
-    _ = table.release(reused);
+    _ = try table.release(other);
+    _ = try table.release(reused);
     startup.beginShutdown();
     table.deinit(gpa);
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);
@@ -516,6 +631,8 @@ const SeededModel = struct {
     stale_ids: [seeded_size]?PeerId = @splat(null),
     /// Releases of each entry so far, which its generation must match.
     releases: [seeded_size]u32 = @splat(0),
+    /// Sends in flight on each entry in use, which its count must match.
+    sends: [seeded_size]SendCount = @splat(0),
     in_use: u32 = 0,
 
     /// One accept: a free entry under the generation its releases predict, or a refusal
@@ -543,8 +660,8 @@ const SeededModel = struct {
         return false;
     }
 
-    /// One close of a random connection in use, found by probing from a random entry.
-    fn close(model: *SeededModel, table: *Table, random: std.Random) !void {
+    /// A random connection in use, found by probing from a random entry.
+    fn pick(model: *const SeededModel, random: std.Random) Index {
         assert(model.in_use > 0);
         var index = random.uintLessThan(Index, seeded_size);
         var probes: u32 = 0;
@@ -552,14 +669,51 @@ const SeededModel = struct {
             assert(probes < seeded_size);
             index = @intCast((index + 1) % seeded_size);
         }
+        assert(model.sockets[index] >= 0);
+        return index;
+    }
+
+    /// One send submitted on, or completed for, a random connection in use. Completes when
+    /// that connection has the most sends the I/O type could have in flight.
+    fn send(model: *SeededModel, table: *Table, random: std.Random) !void {
+        const index = model.pick(random);
         const id = model.ids[index];
-        try testing.expectEqual(model.sockets[index], table.release(id));
+        const sends_max = constants.io_operations_in_flight_max;
+        const complete = model.sends[index] == sends_max or
+            (model.sends[index] > 0 and random.boolean());
+        if (complete) {
+            table.sendCompleted(id);
+            model.sends[index] -= 1;
+        } else {
+            table.sendSubmitted(id);
+            model.sends[index] += 1;
+        }
+        try testing.expectEqual(model.sends[index], table.get(id).sends_in_flight);
+        assert(model.sends[index] <= sends_max);
+    }
+
+    /// One close of a random connection in use. With sends in flight the table must refuse
+    /// it and change nothing; the model then completes one, so later closes can go through.
+    /// Returns whether the table refused.
+    fn close(model: *SeededModel, table: *Table, random: std.Random) !bool {
+        const index = model.pick(random);
+        const id = model.ids[index];
+        if (model.sends[index] > 0) {
+            const entry_before = table.entries[index];
+            try testing.expectError(error.SendsInFlight, table.release(id));
+            try testing.expectEqual(entry_before, table.entries[index]);
+            table.sendCompleted(id);
+            model.sends[index] -= 1;
+            return true;
+        }
+        try testing.expectEqual(model.sockets[index], try table.release(id));
         try testing.expectEqual(@as(u32, 0), table.entries[index].scan.resume_at);
         model.sockets[index] = -1;
         model.stale_ids[index] = id;
         model.releases[index] += 1;
         model.in_use -= 1;
         assert(model.in_use < seeded_size);
+        return false;
     }
 };
 
@@ -575,15 +729,19 @@ test "connections: seeded random accepts and closes against a model, filling the
     const random = prng.random();
     var model: SeededModel = .{};
     var full_refusals: u32 = 0;
+    var busy_refusals: u32 = 0;
     var stale_lookups: u32 = 0;
     var step: u32 = 0;
     while (step < steps_max) : (step += 1) {
-        // Lean toward accepts, so the table fills and refuses.
-        if (random.uintLessThan(u8, 8) < 5) {
+        // Lean toward accepts, so the table fills and refuses; sends are as common as closes.
+        const roll = random.uintLessThan(u8, 10);
+        if (roll < 5) {
             const socket: Socket = @intCast(100 + step);
             if (try model.accept(&table, socket, random)) full_refusals += 1;
+        } else if (model.in_use > 0 and roll < 7) {
+            try model.send(&table, random);
         } else if (model.in_use > 0) {
-            try model.close(&table, random);
+            if (try model.close(&table, random)) busy_refusals += 1;
         }
         // A completion naming any released id finds nothing, whether its entry is free or
         // was handed out again.
@@ -596,6 +754,7 @@ test "connections: seeded random accepts and closes against a model, filling the
     }
     table.assertInvariants();
     try testing.expect(full_refusals > 0);
+    try testing.expect(busy_refusals > 0);
     try testing.expect(stale_lookups > 0);
 
     startup.beginShutdown();
@@ -615,7 +774,7 @@ test "connections: lookup finds a live id and refuses a free entry's id" {
     try testing.expectEqual(table.get(id), table.lookup(id).?);
     const never_handed_out: PeerId = @bitCast(IdParts{ .index = 1, .generation = 0 });
     try testing.expectEqual(@as(?*const Entry, null), table.lookup(never_handed_out));
-    _ = table.release(id);
+    _ = try table.release(id);
     try testing.expectEqual(@as(?*const Entry, null), table.lookup(id));
     const advanced: PeerId = @bitCast(IdParts{ .index = 0, .generation = 1 });
     try testing.expectEqual(@as(?*const Entry, null), table.lookup(advanced));
@@ -623,7 +782,7 @@ test "connections: lookup finds a live id and refuses a free entry's id" {
     try testing.expectEqual(advanced, try table.acquire(11));
     try testing.expectEqual(@as(Socket, 11), table.lookup(advanced).?.socket);
 
-    _ = table.release(advanced);
+    _ = try table.release(advanced);
     startup.beginShutdown();
     table.deinit(gpa);
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);
@@ -644,7 +803,7 @@ test "connections: a generation wraps to zero, and only the newest id is live" {
     var cycle: u32 = 0;
     while (cycle < cycles) : (cycle += 1) {
         const socket: Socket = @intCast(11 + cycle % 1000);
-        try testing.expectEqual(table.get(id).socket, table.release(id));
+        try testing.expectEqual(table.get(id).socket, try table.release(id));
         const next = try table.acquire(socket);
         try testing.expectEqual(@as(?*const Entry, null), table.lookup(id));
         try testing.expectEqual(socket, table.lookup(next).?.socket);
@@ -659,7 +818,7 @@ test "connections: a generation wraps to zero, and only the newest id is live" {
     const last_stale: PeerId = @bitCast(IdParts{ .index = 0, .generation = generation_max });
     try testing.expectEqual(@as(?*const Entry, null), table.lookup(last_stale));
 
-    _ = table.release(id);
+    _ = try table.release(id);
     startup.beginShutdown();
     table.deinit(gpa);
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);

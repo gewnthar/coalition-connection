@@ -195,7 +195,11 @@ fn depart(w: *Workload) Error!void {
         index = (index + 1) % capacity;
     }
     const peer = w.peers[index];
-    if (w.table.release(peer) != w.sockets[index]) return error.InvariantBroken;
+    // The workload never sends, so the table must not refuse the release.
+    const socket = w.table.release(peer) catch |err| switch (err) {
+        error.SendsInFlight => return error.InvariantBroken,
+    };
+    if (socket != w.sockets[index]) return error.InvariantBroken;
     w.sockets[index] = -1;
     w.in_use -= 1;
     w.counts.departures += 1;
