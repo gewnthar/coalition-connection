@@ -33,8 +33,18 @@
 //! new socket. The completion takes an entry in the connection table for the new socket and
 //! hands back its `PeerId`. When the table is full, the new socket is closed at once, so the
 //! client sees the connection end instead of waiting, and the accept completes with
-//! `error.TableFull`; `refused` counts these. Every errno maps to `PeerDown`,
-//! `Backpressure` or a stop with its reason (`acceptError`).
+//! `error.TableFull`; `refused` counts these. Each errno accept(2) documents maps to
+//! `PeerDown` or `Backpressure`, or stops the process when it can only mean a bug in this
+//! file or its caller (`acceptErrno`). An errno accept(2) doesn't document is a fact about
+//! the kernel this file didn't know, not a reason to stop serving everyone: it maps to
+//! `Backpressure`, so the caller accepts again later rather than at once (a listener that
+//! keeps failing the same way can't spin the loop), and is counted in
+//! `accept_errno_undocumented_count`, with the latest one kept in
+//! `accept_errno_undocumented_last`.
+//!
+//! Errnos are printed as numbers (`{d}` of `@backingInt`), never by name: `linux.E` is
+//! non-exhaustive, and printing a value std has no name for stops the process with "invalid
+//! enum value" instead of the message meant.
 //!
 //! `execute` is a simulator placeholder until Postgres is framed over sockets (roadmap
 //! core 11); submitting one here stops the process with that reason.
@@ -153,6 +163,13 @@ pub const Real = struct {
     /// case can be named. It may be a value std has no name for, so print it with
     /// `@backingInt`, never `{t}` or `@tagName`.
     send_errno_undocumented_last: linux.E,
+    /// Accepts that failed with an errno accept(2) doesn't document; each completed as
+    /// `Backpressure`. For metrics: any count above zero means `acceptErrno` is missing a
+    /// case.
+    accept_errno_undocumented_count: u64,
+    /// The latest of those errnos, or `.SUCCESS` if there has been none. Print it with
+    /// `@backingInt`, as for sends.
+    accept_errno_undocumented_last: linux.E,
 
     /// Sets up the ring. `startup` proves the call happens during startup; nothing is
     /// mapped or allocated afterwards.
@@ -176,6 +193,8 @@ pub const Real = struct {
             .refused = 0,
             .send_errno_undocumented_count = 0,
             .send_errno_undocumented_last = .SUCCESS,
+            .accept_errno_undocumented_count = 0,
+            .accept_errno_undocumented_last = .SUCCESS,
         };
         // Push the indices in reverse, so the first submission takes slot 0.
         var position: u32 = 0;
@@ -420,7 +439,7 @@ pub const Real = struct {
         assert(res > -4096);
         if (res < 0) {
             const err: linux.E = @fromBackingInt(@intCast(-res));
-            return acceptError(err);
+            return self.acceptFailed(err);
         }
         const socket: io.Socket = res;
         const count_before = self.table.count();
@@ -434,7 +453,7 @@ pub const Real = struct {
                 const closed = linux.errno(linux.close(socket));
                 switch (closed) {
                     .SUCCESS, .INTR, .IO => {},
-                    else => std.debug.panic("close of a refused connection: {t}", .{closed}),
+                    else => std.debug.panic("close of a refused connection: errno {d}", .{@backingInt(closed)}),
                 }
                 self.refused += 1;
                 return error.TableFull;
@@ -443,6 +462,27 @@ pub const Real = struct {
         assert(self.table.count() == count_before + 1);
         assert(self.table.get(peer).socket == socket);
         return peer;
+    }
+
+    /// The error a failed accept's errno means. An undocumented errno completes as
+    /// `Backpressure` and is counted.
+    fn acceptFailed(self: *Real, err: linux.E) io.AcceptError {
+        assert(err != .SUCCESS);
+        // The count and the latest errno change together, so neither is set without the other.
+        assert((self.accept_errno_undocumented_count == 0) == (self.accept_errno_undocumented_last == .SUCCESS));
+        const result: io.AcceptError = switch (acceptErrno(err)) {
+            .peer_down => error.PeerDown,
+            .backpressure => error.Backpressure,
+            .bug => std.debug.panic("io_uring accept: errno {d}", .{@backingInt(err)}),
+            .backpressure_undocumented => undocumented: {
+                self.accept_errno_undocumented_count += 1;
+                self.accept_errno_undocumented_last = err;
+                break :undocumented error.Backpressure;
+            },
+        };
+        // Only a full table, never an errno, means TableFull.
+        assert(result == error.PeerDown or result == error.Backpressure);
+        return result;
     }
 };
 
@@ -474,31 +514,40 @@ fn prepare(sqe: *linux.io_uring_sqe, submission: io.Submission, socket: io.Socke
     return slot;
 }
 
-/// Maps a failed accept's errno. Every errno has an explicit outcome.
-fn acceptError(err: linux.E) io.AcceptError {
+/// What a failed accept's errno means. `backpressure_undocumented` is an errno accept(2)
+/// isn't documented to return; `Real.acceptFailed` treats it as `Backpressure` and counts
+/// it. `bug` can only mean a bug in this file or its caller; `Real.acceptFailed` stops the
+/// process.
+const AcceptOutcome = enum { peer_down, backpressure, backpressure_undocumented, bug };
+
+/// Maps a failed accept's errno to its outcome. Pure, so tests can check every arm,
+/// including the ones that stop the process.
+fn acceptErrno(err: linux.E) AcceptOutcome {
+    // Preconditions for any caller, tests included: a failure, in the kernel's errno
+    // range of 1 to 4095.
     assert(err != .SUCCESS);
-    const result: io.AcceptError = switch (err) {
+    assert(@backingInt(err) < 4096);
+    return switch (err) {
         // The connection failed before it was taken: it aborted, a firewall refused it, or
         // Linux passed on a network error already pending on it (accept(2), "Error
         // handling", and the other errors its ERRORS section says some kernels return).
         // The listener is fine; the caller accepts again.
-        .CONNABORTED, .PERM, .PROTO, .NOPROTOOPT, .NONET => error.PeerDown,
-        .HOSTDOWN, .HOSTUNREACH, .NETDOWN, .NETUNREACH, .TIMEDOUT => error.PeerDown,
-        .NOSR, .SOCKTNOSUPPORT, .PROTONOSUPPORT => error.PeerDown,
+        .CONNABORTED, .PERM, .PROTO, .NOPROTOOPT, .NONET => .peer_down,
+        .HOSTDOWN, .HOSTUNREACH, .NETDOWN, .NETUNREACH, .TIMEDOUT => .peer_down,
+        .NOSR, .SOCKTNOSUPPORT, .PROTONOSUPPORT => .peer_down,
         // Out of descriptors, buffers or memory, or interrupted: try again later.
-        .MFILE, .NFILE, .NOBUFS, .NOMEM, .INTR, .AGAIN => error.Backpressure,
+        .MFILE, .NFILE, .NOBUFS, .NOMEM, .INTR, .AGAIN => .backpressure,
         // A bad or non-listening socket, a bad address or flag, or a cancel this type never
         // asks for: each means a bug in this file or its caller. EOPNOTSUPP is on the
         // pending-error list too, but it also means a listener that isn't a stream socket,
         // and every listener here is one, so it is treated as that bug.
-        .BADF, .NOTSOCK, .INVAL, .FAULT, .OPNOTSUPP, .CANCELED => {
-            std.debug.panic("io_uring accept: {t}", .{err});
-        },
-        else => std.debug.panic("io_uring accept: undocumented errno {t}", .{err}),
+        .BADF, .NOTSOCK, .INVAL, .FAULT, .OPNOTSUPP, .CANCELED => .bug,
+        // An errno accept(2) isn't documented to return, named in std or not. It says this
+        // file's model of the kernel is incomplete, not that this process is broken, and a
+        // client might be able to provoke it, so stopping would take the server down for
+        // everyone. The caller accepts again later, and `Real.acceptFailed` counts it.
+        else => .backpressure_undocumented,
     };
-    // Only a full table, never an errno, means TableFull.
-    assert(result == error.PeerDown or result == error.Backpressure);
-    return result;
 }
 
 /// Sets up a ring of `slots_count` entries, mapping each failure to `InitError`.
@@ -632,7 +681,7 @@ fn monotonicNow() io.Instant {
         // valid stack address, so a failure means the system is unusable. The contract's
         // `now` has no error, and running on without a clock would break every timeout, so
         // the process stops here with the reason, in every build mode.
-        else => |err| std.debug.panic("clock_gettime(CLOCK_MONOTONIC) failed: {t}", .{err}),
+        else => |err| std.debug.panic("clock_gettime(CLOCK_MONOTONIC) failed: errno {d}", .{@backingInt(err)}),
     }
     assert(rc == 0);
     // Widened to i64: `timespec` holds isize on most targets and i64 on a few 32-bit ones.
@@ -1033,12 +1082,14 @@ test "real: one submission past the ring's depth returns QueueFull and changes n
     try testing.expectEqual(id, completions[0].id);
 }
 
-/// A `Real` with only the fields `sendResult` reads and writes set, so the errno tests
-/// need no ring and run where io_uring is switched off.
-fn sendResultOnly() Real {
+/// A `Real` with only the fields `sendResult` and `acceptFailed` read and write set, so
+/// the errno tests need no ring and run where io_uring is switched off.
+fn errnoCountersOnly() Real {
     var real: Real = undefined;
     real.send_errno_undocumented_count = 0;
     real.send_errno_undocumented_last = .SUCCESS;
+    real.accept_errno_undocumented_count = 0;
+    real.accept_errno_undocumented_last = .SUCCESS;
     return real;
 }
 
@@ -1066,7 +1117,7 @@ const send_errnos_undocumented = [_]linux.E{
 };
 
 test "real: every documented send errno has an outcome, counted nowhere" {
-    var real = sendResultOnly();
+    var real = errnoCountersOnly();
     for (send_errnos_peer_down) |err| {
         try testing.expectEqual(SendOutcome.peer_down, sendErrno(err));
         try testing.expectError(error.PeerDown, real.sendResult(sendFailed(err), 5));
@@ -1087,7 +1138,7 @@ test "real: a send errno only a bug causes is a bug, not a dropped connection" {
 }
 
 test "real: an undocumented send errno is PeerDown and is counted" {
-    var real = sendResultOnly();
+    var real = errnoCountersOnly();
     for (send_errnos_undocumented, 1..) |err, count| {
         try testing.expectEqual(SendOutcome.peer_down_undocumented, sendErrno(err));
         try testing.expectError(error.PeerDown, real.sendResult(sendFailed(err), 5));
@@ -1106,7 +1157,7 @@ test "real: an undocumented send errno is PeerDown and is counted" {
 }
 
 test "real: a completion's result maps bytes and no progress" {
-    var real = sendResultOnly();
+    var real = errnoCountersOnly();
     try testing.expectEqual(@as(u32, 5), try real.sendResult(5, 5));
     try testing.expectEqual(@as(u32, 2), try real.sendResult(2, 5)); // A short send.
     try testing.expectError(error.Backpressure, real.sendResult(0, 5));
@@ -1284,26 +1335,59 @@ test "real: an accept into a full table closes the connection and completes with
     try testing.expectEqual(@as(usize, 0), rc);
 }
 
-test "real: every accept errno has an outcome" {
-    try testing.expectEqual(error.PeerDown, acceptError(.CONNABORTED));
-    try testing.expectEqual(error.PeerDown, acceptError(.PERM));
-    try testing.expectEqual(error.PeerDown, acceptError(.PROTO));
-    try testing.expectEqual(error.PeerDown, acceptError(.NOPROTOOPT));
-    try testing.expectEqual(error.PeerDown, acceptError(.NONET));
-    try testing.expectEqual(error.PeerDown, acceptError(.HOSTDOWN));
-    try testing.expectEqual(error.PeerDown, acceptError(.HOSTUNREACH));
-    try testing.expectEqual(error.PeerDown, acceptError(.NETDOWN));
-    try testing.expectEqual(error.PeerDown, acceptError(.NETUNREACH));
-    try testing.expectEqual(error.PeerDown, acceptError(.TIMEDOUT));
-    try testing.expectEqual(error.PeerDown, acceptError(.NOSR));
-    try testing.expectEqual(error.PeerDown, acceptError(.SOCKTNOSUPPORT));
-    try testing.expectEqual(error.PeerDown, acceptError(.PROTONOSUPPORT));
-    try testing.expectEqual(error.Backpressure, acceptError(.MFILE));
-    try testing.expectEqual(error.Backpressure, acceptError(.NFILE));
-    try testing.expectEqual(error.Backpressure, acceptError(.NOBUFS));
-    try testing.expectEqual(error.Backpressure, acceptError(.NOMEM));
-    try testing.expectEqual(error.Backpressure, acceptError(.INTR));
-    try testing.expectEqual(error.Backpressure, acceptError(.AGAIN));
+const accept_errnos_peer_down = [_]linux.E{
+    .CONNABORTED, .PERM,           .PROTO,          .NOPROTOOPT, .NONET,
+    .HOSTDOWN,    .HOSTUNREACH,    .NETDOWN,        .NETUNREACH, .TIMEDOUT,
+    .NOSR,        .SOCKTNOSUPPORT, .PROTONOSUPPORT,
+};
+const accept_errnos_backpressure = [_]linux.E{ .MFILE, .NFILE, .NOBUFS, .NOMEM, .INTR, .AGAIN };
+const accept_errnos_bug = [_]linux.E{ .BADF, .NOTSOCK, .INVAL, .FAULT, .OPNOTSUPP, .CANCELED };
+
+/// Errnos accept(2) doesn't document: some std names, the top of the kernel's range, and a
+/// value std has no name for.
+const accept_errnos_undocumented = [_]linux.E{
+    .NOENT,    .EXIST,                .SRCH,                 .NOSPC, .ROFS, .PIPE,
+    .HWPOISON, @fromBackingInt(4095), @fromBackingInt(1000),
+};
+
+test "real: every documented accept errno has an outcome, counted nowhere" {
+    var real = errnoCountersOnly();
+    for (accept_errnos_peer_down) |err| {
+        try testing.expectEqual(AcceptOutcome.peer_down, acceptErrno(err));
+        try testing.expectEqual(error.PeerDown, real.acceptFailed(err));
+    }
+    for (accept_errnos_backpressure) |err| {
+        try testing.expectEqual(AcceptOutcome.backpressure, acceptErrno(err));
+        try testing.expectEqual(error.Backpressure, real.acceptFailed(err));
+    }
+    try testing.expectEqual(@as(u64, 0), real.accept_errno_undocumented_count);
+    try testing.expectEqual(linux.E.SUCCESS, real.accept_errno_undocumented_last);
+}
+
+test "real: an accept errno only a bug causes is a bug, not a dropped connection" {
+    // `acceptFailed` stops the process on these, so only the mapping is checked here.
+    for (accept_errnos_bug) |err| {
+        try testing.expectEqual(AcceptOutcome.bug, acceptErrno(err));
+    }
+}
+
+test "real: an undocumented accept errno is Backpressure and is counted" {
+    var real = errnoCountersOnly();
+    for (accept_errnos_undocumented, 1..) |err, count| {
+        try testing.expectEqual(AcceptOutcome.backpressure_undocumented, acceptErrno(err));
+        try testing.expectEqual(error.Backpressure, real.acceptFailed(err));
+        try testing.expectEqual(@as(u64, count), real.accept_errno_undocumented_count);
+        try testing.expectEqual(err, real.accept_errno_undocumented_last);
+    }
+    // Documented errnos leave the count and the latest errno alone, and sends' counts stay
+    // separate.
+    const counted = real.accept_errno_undocumented_count;
+    try testing.expectEqual(error.PeerDown, real.acceptFailed(.CONNABORTED));
+    try testing.expectEqual(error.Backpressure, real.acceptFailed(.MFILE));
+    try testing.expectEqual(counted, real.accept_errno_undocumented_count);
+    const latest = accept_errnos_undocumented[accept_errnos_undocumented.len - 1];
+    try testing.expectEqual(latest, real.accept_errno_undocumented_last);
+    try testing.expectEqual(@as(u64, 0), real.send_errno_undocumented_count);
 }
 
 test "real: a failed accept changes no table entry" {
