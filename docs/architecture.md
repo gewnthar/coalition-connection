@@ -308,8 +308,8 @@ Cloudflare, and an attack on voice can't take auth down with it.
 ### Containers
 
 Each process is a Quadlet unit under the service user's `~/.config/containers/systemd/`,
-which systemd turns into ordinary services. The units live in the repository under
-`deploy/`. All four containers join one pod (a Quadlet `.pod` unit), so they share a
+which systemd turns into ordinary services. The units will live in the repository under
+`deploy/` (roadmap core 52). All four containers join one pod (a Quadlet `.pod` unit), so they share a
 network namespace: nginx reaches the app on a local socket, the app reaches Postgres and
 Valkey on `localhost`, and only nginx's web port is published to the internet. The app's
 Ice listener is published only on the main server's WireGuard tunnel address, never on a
@@ -441,5 +441,8 @@ server exists.
 
 ## Status
 
-This is the framework: every component is a stub that compiles and has a test. The build
-order and its slices are in [roadmap.md](roadmap.md).
+The first pieces of the core are built: the startup allocator and the memory table, the I/O
+boundary with its simulator and the real io_uring type (clock, random bytes, sends and
+accepts), the connection table, the HTTP request parser and response writer, and the config
+file. Nothing serves a page yet. The other components are stubs that compile and have a
+test. The build order and its slices are in [roadmap.md](roadmap.md).
