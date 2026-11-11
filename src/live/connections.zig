@@ -218,10 +218,7 @@ pub const Table = struct {
         const entry = &self.entries[index];
         const socket = entry.socket;
         assert(socket >= 0);
-        if (entry.sends_in_flight > 0) {
-            assert(self.count() == count_before);
-            return error.SendsInFlight;
-        }
+        if (entry.sends_in_flight > 0) return error.SendsInFlight;
         const generation_next = entry.generation +% 1;
         entry.* = .{ .socket = -1, .state = .free, .generation = generation_next };
         assert(self.free_count < self.capacity()); // An entry in use has no slot on the stack.
