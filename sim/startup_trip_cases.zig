@@ -6,10 +6,13 @@
 //! allocator in a phase first; a connection-table case builds a small table with one free
 //! entry and the rest in use, then ends startup; a real-I/O case builds a two-entry table
 //! whose entry in use holds one end of a socketpair, sets up the real I/O type on it (except
-//! for the case that sets it up too late), then ends startup. A case that `trips` must stop
-//! the process on an assertion (before the child allocator is touched, for the allocator),
-//! or, for a submitted execute, on the real type's placeholder panic; a control case makes
-//! a call its target allows and must finish normally.
+//! for the case that sets it up too late), then ends startup; a response-writer case ends
+//! startup, then writes one response into a buffer cut from the middle of a larger array,
+//! with the body, a header name or a header value placed inside the buffer, across one of
+//! its edges, right next to it, or elsewhere. A case that `trips` must stop the process on
+//! an assertion (before the child allocator is touched, for the allocator), or, for a
+//! submitted execute, on the real type's placeholder panic; a control case makes a call
+//! its target allows and must finish normally.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -111,6 +114,45 @@ pub const RealCall = enum(u8) {
     send_queue_full,
 };
 
+/// A call to the response writer (`cc.live.http_response.write`) on a buffer the harness
+/// cuts from the middle of a larger array. Each response has status 200, one header field
+/// and a four-byte body (empty in one control). A `_refused` case adds a field the writer
+/// refuses (Connection, which it sets itself), so a missing check would return
+/// HeaderReserved instead of tripping. A field or body placed inside holds the same bytes
+/// it would hold outside, so only the overlap checks can tell the cases from the controls.
+pub const ResponseCall = enum(u8) {
+    /// The body points into the buffer. Either of two checks can stop it: the one at the
+    /// top of `write`, or the copy's own check when the body is appended.
+    body_inside,
+    /// The same for a HEAD response, whose body is never copied: only the check at the top
+    /// of `write` can stop it.
+    body_inside_head,
+    /// The body starts one byte before the buffer and ends inside it.
+    body_straddles_start,
+    /// The header name points into the buffer. The field check or the copy's check.
+    name_inside,
+    /// The header name starts on the buffer's last byte and runs past its end.
+    name_straddles_end,
+    /// The header value points into the buffer. The field check or the copy's check.
+    value_inside,
+    /// The name inside, then a refused field: `write` returns HeaderReserved before it
+    /// copies anything, so only the field check can stop it.
+    name_inside_refused,
+    /// The value inside, then a refused field: only the field check can stop it.
+    value_inside_refused,
+    /// A field wholly outside, then one whose value is inside, then a refused field: the
+    /// field check must look at every field, not only the first.
+    value_inside_second_refused,
+    // Controls.
+    /// Body, name and value all outside the buffer, in the program's constant data.
+    outside,
+    /// The value and then the name end exactly where the buffer begins, and the body begins
+    /// exactly where it ends: touching is not sharing a byte.
+    adjacent,
+    /// An empty body that points into the buffer: an empty slice shares no byte.
+    empty_body_inside,
+};
+
 /// How a tripping case must stop: on a failed assertion, or on the real type's panic for a
 /// submitted execute. A control case doesn't stop, and carries `.assertion` unused.
 pub const Panic = enum(u8) { assertion, execute_placeholder };
@@ -156,6 +198,7 @@ pub const Target = union(enum) {
     startup_allocator: struct { phase: Phase, call: AllocatorCall },
     connection_table: TableCall,
     real_io: RealCall,
+    http_response: ResponseCall,
 };
 
 pub const Case = struct {
@@ -201,6 +244,13 @@ fn onReal(name: []const u8, call: RealCall, outcome: Outcome) Case {
     };
 }
 
+fn onResponse(name: []const u8, call: ResponseCall, outcome: Outcome) Case {
+    assert(name.len > 0);
+    // Response-writer case names start with "response_", so the build log groups them.
+    assert(std.mem.startsWith(u8, name, "response_"));
+    return .{ .name = name, .target = .{ .http_response = call }, .trips = outcome == .trips };
+}
+
 pub const exit_finished: u8 = 0;
 pub const exit_tripped: u8 = 42;
 /// The arguments named no case. A bad argument must end the run with this code, never
@@ -213,7 +263,7 @@ pub fn expectedExit(case: Case) u8 {
     return if (case.trips) exit_tripped else exit_finished;
 }
 
-pub const cases_max: u32 = 64;
+pub const cases_max: u32 = 80;
 
 pub const cases = [_]Case{
     // Every call the running phase forbids.
@@ -287,6 +337,23 @@ pub const cases = [_]Case{
     onReal("real_now_fresh", .now_fresh, .finishes),
     onReal("real_send_peer", .send_peer, .finishes),
     onReal("real_send_queue_full", .send_queue_full, .finishes),
+    // The response writer: the body, a header name or a header value that shares a byte
+    // with the buffer being written would be read while it is overwritten. The `_head` and
+    // `_refused` cases pin the earliest check, which no later copy backs up.
+    onResponse("response_body_inside", .body_inside, .trips),
+    onResponse("response_body_inside_head", .body_inside_head, .trips),
+    onResponse("response_body_straddles_start", .body_straddles_start, .trips),
+    onResponse("response_name_inside", .name_inside, .trips),
+    onResponse("response_name_straddles_end", .name_straddles_end, .trips),
+    onResponse("response_value_inside", .value_inside, .trips),
+    onResponse("response_name_inside_refused", .name_inside_refused, .trips),
+    onResponse("response_value_inside_refused", .value_inside_refused, .trips),
+    onResponse("response_value_inside_second_refused", .value_inside_second_refused, .trips),
+    // Controls: all three outside, all three touching the buffer's edges from outside, and
+    // an empty body inside it. Each must write the exact response and nothing else.
+    onResponse("response_outside", .outside, .finishes),
+    onResponse("response_adjacent", .adjacent, .finishes),
+    onResponse("response_empty_body_inside", .empty_body_inside, .finishes),
 };
 
 /// The index of the case with exactly this name, or null.
@@ -353,7 +420,7 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .connection_table => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .real_io => {},
+            .startup_allocator, .real_io, .http_response => {},
         };
         assert(found == 1);
     }
@@ -362,14 +429,23 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .real_io => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .connection_table => {},
+            .startup_allocator, .connection_table, .http_response => {},
+        };
+        assert(found == 1);
+    }
+    // Every response-writer call has exactly one case.
+    for (std.enums.values(ResponseCall)) |call| {
+        var found: u32 = 0;
+        for (cases) |case| switch (case.target) {
+            .http_response => |case_call| found += @intFromBool(case_call == call),
+            .startup_allocator, .connection_table, .real_io => {},
         };
         assert(found == 1);
     }
     // Only real-I/O cases expect a panic other than an assertion.
     for (cases) |case| switch (case.target) {
         .real_io => {},
-        .startup_allocator, .connection_table => assert(case.panic == .assertion),
+        .startup_allocator, .connection_table, .http_response => assert(case.panic == .assertion),
     };
 }
 
