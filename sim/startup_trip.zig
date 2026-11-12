@@ -2,7 +2,9 @@
 //! a phase that forbids the call, before the child allocator is touched, that the
 //! connection table stops it when code releases, reads or moves an entry not in use, and
 //! that the real I/O type stops it when its clock steps back, when it is handed an execute,
-//! when a send names a peer not in the table, and when it is set up after startup.
+//! when a send names a peer not in the table, and when it is set up after startup. It also
+//! proves the response writer stops the process when the body, a header name or a header
+//! value shares a byte with the buffer it writes into.
 //!
 //! The guard is an assertion, and a tripped assertion panics, which ends the process. A
 //! test block can't catch that, so `zig build test` builds this file once, in ReleaseSafe,
@@ -54,6 +56,17 @@
 //! tripping. Every real-I/O case but `real_init_running` sets up a ring first; where the
 //! kernel refuses one, they fail with the setup code, never pass. `real_init_running` trips
 //! before the ring is set up, so it runs either way.
+//!
+//! For the response writer, the buffer is cut from the middle of a larger array, so a field
+//! can sit inside it, across one of its edges, right next to it, or in neither. `write`
+//! checks the body and each header field before writing anything, and its copy checks
+//! every source again, so a plain inside case passes as long as either check is there. The
+//! `_head` case (whose body is never copied) and the `_refused` cases (which return an
+//! error before the first copy) can only be stopped by the first check, so each pins one
+//! assertion on its own. The copy's check has no case of its own: every source `write`
+//! hands it was checked first, so through `write` it can't be the only check left.
+//! As for every assertion case, a pass shows that some assertion fired during the call,
+//! not which one; nothing else in `write` can fire on these inputs today.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -94,6 +107,7 @@ comptime {
         },
         .connection_table => |call| assert(c.trips != tableCallAllowed(call)),
         .real_io => |call| assert(c.trips != realCallAllowed(call)),
+        .http_response => |call| assert(c.trips != responseCallAllowed(call)),
     };
 }
 
@@ -226,6 +240,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         .startup_allocator => |on| runAllocatorCase(&startup, &fixed, on.phase, on.call, case),
         .connection_table => |call| runTableCase(&startup, call, case),
         .real_io => |call| runRealCase(&startup, call, case),
+        .http_response => |call| runResponseCase(&startup, call, case),
     }
 }
 
@@ -1066,4 +1081,199 @@ fn drain(real: *Real, completions: []cc.io.Completion) u32 {
     assert(count <= completions.len);
     assert(empty <= poll_attempts_max);
     return count;
+}
+
+const http_response = cc.live.http_response;
+
+/// The buffer the writer writes into, and the bytes kept on each side of it in one array,
+/// so a field can sit right next to the buffer without being in it.
+const response_buffer_len: u32 = 96;
+const response_margin: u32 = 16;
+const response_storage_len: u32 = response_margin + response_buffer_len + response_margin;
+/// Where in the buffer an inside field or body is placed: past the whole head a control
+/// writes, so where a mutation leaves only the copy's check, the field is still intact
+/// when its own copy comes and the copy's check, not a garbled field, stops the call.
+const response_inside_at: u32 = 64;
+/// What every byte of the array holds before a case places its fields.
+const response_fill: u8 = '~';
+/// The most header fields a case sends.
+const response_headers_len: u32 = 3;
+const response_name = "X-Case";
+const response_value = "trip";
+const response_body = "body";
+/// What a control must write, spelled out by hand rather than built by the writer.
+const response_expected = "HTTP/1.1 200 OK\r\nX-Case: trip\r\nContent-Length: 4\r\n\r\nbody";
+const response_expected_empty = "HTTP/1.1 200 OK\r\nX-Case: trip\r\nContent-Length: 0\r\n\r\n";
+
+comptime {
+    assert(response_buffer_len <= cc.constants.http_response_size_max);
+    // An inside field fits the buffer after the place it starts, and starts past the head.
+    assert(response_inside_at >= response_expected_empty.len);
+    assert(response_inside_at + response_name.len <= response_buffer_len);
+    assert(response_inside_at + response_value.len <= response_buffer_len);
+    assert(response_inside_at + response_body.len <= response_buffer_len);
+    // The adjacent control's value and name fit before the buffer, and its body after it;
+    // the straddling name has room past the buffer's end.
+    assert(response_value.len + response_name.len <= response_margin);
+    assert(response_body.len <= response_margin);
+    assert(response_name.len - 1 <= response_margin);
+    // Both controls' responses fit the buffer, with room to spare after them, so a write
+    // past the response's end would show.
+    assert(response_expected.len < response_buffer_len);
+    assert(response_expected_empty.len < response_buffer_len);
+    // The fill byte is in none of the bytes a case places, so a moved field would show.
+    assert(std.mem.findScalar(u8, response_name ++ response_value ++ response_body, response_fill) == null);
+}
+
+/// Whether the writer allows `call`: the controls. The cases file says the same through
+/// each case's outcome, and the comptime block at the top checks the two agree.
+fn responseCallAllowed(call: trip.ResponseCall) bool {
+    const allowed = switch (call) {
+        .outside, .adjacent, .empty_body_inside => true,
+        .body_inside,
+        .body_inside_head,
+        .body_straddles_start,
+        .name_inside,
+        .name_straddles_end,
+        .value_inside,
+        .name_inside_refused,
+        .value_inside_refused,
+        .value_inside_second_refused,
+        => false,
+    };
+    // A control writes one plain GET response with one field: a refused field or an
+    // omitted body would make its exact-output check test something other than placement.
+    assert(!allowed or responseHeaderCount(call) == 1);
+    assert(!allowed or call != .body_inside_head);
+    return allowed;
+}
+
+/// The header fields a case sends: one, or for a `_refused` case the field (or fields) it
+/// places and then the refused one.
+fn responseHeaderCount(call: trip.ResponseCall) u32 {
+    const count: u32 = switch (call) {
+        .name_inside_refused, .value_inside_refused => 2,
+        .value_inside_second_refused => 3,
+        else => 1,
+    };
+    // A refused field ends the list, so it comes after a field the case placed.
+    const refused = std.mem.endsWith(u8, @tagName(call), "_refused");
+    assert(refused == (count > 1));
+    assert(count <= response_headers_len);
+    return count;
+}
+
+/// Places the case's body, name and value in `storage` (inside the buffer, across an edge,
+/// next to it, or not at all) and returns the response that names them. `headers` holds
+/// the fields.
+fn responseFor(
+    call: trip.ResponseCall,
+    storage: *[response_storage_len]u8,
+    headers: *[response_headers_len]http_response.Header,
+) http_response.Response {
+    assert(!armed);
+    const buffer_end = response_margin + response_buffer_len;
+    const inside: []u8 = storage[response_margin + response_inside_at .. buffer_end];
+    const placed: u32 = if (call == .value_inside_second_refused) 1 else 0;
+    headers.* = @splat(.{ .name = response_name, .value = response_value });
+    const count = responseHeaderCount(call);
+    // Refused: the writer sets Connection itself.
+    if (count > 1) headers[count - 1] = .{ .name = "Connection", .value = "close" };
+    var body: []const u8 = response_body;
+    switch (call) {
+        .body_inside, .body_inside_head => body = place(inside, response_body),
+        // If the checks miss it, the head overwrites the body's bytes inside the buffer
+        // before the body is copied; nothing checks a body's bytes, so the write returns.
+        .body_straddles_start => body = place(storage[response_margin - 1 ..], response_body),
+        .name_inside, .name_inside_refused => headers[0].name = place(inside, response_name),
+        // On the buffer's last byte, far past the head, so the name is intact when its
+        // copy comes: a straddle at the start would be garbled into a non-token by the
+        // status line, and the token assertion, not an overlap check, would stop it.
+        .name_straddles_end => headers[0].name = place(storage[buffer_end - 1 ..], response_name),
+        .value_inside, .value_inside_refused, .value_inside_second_refused => {
+            headers[placed].value = place(inside, response_value);
+        },
+        .outside => {},
+        .adjacent => {
+            const start = response_margin - response_name.len;
+            headers[0].name = place(storage[start..], response_name);
+            headers[0].value = place(storage[start - response_value.len ..], response_value);
+            body = place(storage[buffer_end..], response_body);
+        },
+        .empty_body_inside => body = inside[0..0],
+    }
+    // Wherever they sit, the fields hold the same bytes, so only their place differs.
+    assert(std.mem.eql(u8, headers[placed].name, response_name));
+    assert(std.mem.eql(u8, headers[placed].value, response_value));
+    assert(body.len == 0 or std.mem.eql(u8, body, response_body));
+    return .{
+        .status = .ok,
+        .headers = headers[0..count],
+        .body = body,
+        .omit_body = call == .body_inside_head,
+    };
+}
+
+/// Copies `bytes` to the start of `at` and returns the copy.
+fn place(at: []u8, bytes: []const u8) []const u8 {
+    assert(bytes.len > 0);
+    assert(bytes.len <= at.len);
+    @memcpy(at[0..bytes.len], bytes);
+    return at[0..bytes.len];
+}
+
+/// Ends startup (the writer runs after it, and never allocates), places the case's fields,
+/// and writes one response into the buffer in the middle of the array.
+fn runResponseCase(startup: *cc.StartupAllocator, call: trip.ResponseCall, case: trip.Case) noreturn {
+    assert(startup.bytes_live == 0);
+    assert(startup.phase == .startup);
+    startup.finishStartup();
+
+    var storage: [response_storage_len]u8 = @splat(response_fill);
+    var headers: [response_headers_len]http_response.Header = undefined;
+    const response = responseFor(call, &storage, &headers);
+    const buffer: []u8 = storage[response_margin..][0..response_buffer_len];
+    const before: [response_storage_len]u8 = storage;
+
+    child_calls_armed = child_calls;
+    armed = true;
+    const result = http_response.write(buffer, response);
+    armed = false;
+
+    if (case.trips) {
+        std.debug.print("startup_trip: {s} returned without tripping: the check is missing\n", .{case.name});
+        std.process.exit(exit_not_tripped);
+    }
+    if (!responseControlHeld(&storage, &before, call, result)) {
+        std.debug.print("startup_trip: {s} control failed: result={any} child calls={d}\n", .{
+            case.name, result, child_calls - child_calls_armed,
+        });
+        std.process.exit(exit_control_failed);
+    }
+    std.process.exit(trip.exit_finished);
+}
+
+/// A control's write must touch no allocator, return the exact response's length, put
+/// exactly that response at the buffer's start, and leave every other byte of the array as
+/// it was: nothing past the response's end, nothing outside the buffer, no field moved.
+fn responseControlHeld(
+    storage: *const [response_storage_len]u8,
+    before: *const [response_storage_len]u8,
+    call: trip.ResponseCall,
+    result: http_response.Error!u32,
+) bool {
+    assert(!armed);
+    assert(responseCallAllowed(call));
+    if (child_calls != child_calls_armed) return false;
+    const expected: []const u8 = switch (call) {
+        .outside, .adjacent => response_expected,
+        .empty_body_inside => response_expected_empty,
+        else => unreachable, // responseCallAllowed: the comptime block admits only these.
+    };
+    const written = result catch return false;
+    if (written != expected.len) return false;
+    const end = response_margin + written;
+    if (!std.mem.eql(u8, storage[response_margin..end], expected)) return false;
+    if (!std.mem.eql(u8, storage[0..response_margin], before[0..response_margin])) return false;
+    return std.mem.eql(u8, storage[end..], before[end..]);
 }
