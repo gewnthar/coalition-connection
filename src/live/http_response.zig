@@ -19,7 +19,7 @@
 //!
 //! Not covered yet: statuses without a body (1xx, 204, 304) and the websocket upgrade (101,
 //! which needs "Connection: Upgrade"). A comptime check below refuses those codes until the
-//! writer handles them. The router, which picks a handler for each request, is a later slice.
+//! writer handles them. The router (`router.zig`) picks the response for each request.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -33,6 +33,8 @@ const headers_max = constants.http_response_headers_max;
 pub const Status = enum(u16) {
     ok = 200,
     bad_request = 400,
+    not_found = 404,
+    method_not_allowed = 405,
     content_too_large = 413,
     request_header_fields_too_large = 431,
     not_implemented = 501,
@@ -47,6 +49,8 @@ pub fn statusLine(status: Status) []const u8 {
     const result: []const u8 = switch (status) {
         .ok => "HTTP/1.1 200 OK\r\n",
         .bad_request => "HTTP/1.1 400 Bad Request\r\n",
+        .not_found => "HTTP/1.1 404 Not Found\r\n",
+        .method_not_allowed => "HTTP/1.1 405 Method Not Allowed\r\n",
         .content_too_large => "HTTP/1.1 413 Content Too Large\r\n",
         .request_header_fields_too_large => "HTTP/1.1 431 Request Header Fields Too Large\r\n",
         .not_implemented => "HTTP/1.1 501 Not Implemented\r\n",
@@ -382,6 +386,8 @@ test "http_response: every status writes its code and reason" {
     const cases = [_]struct { status: Status, line: []const u8 }{
         .{ .status = .ok, .line = "HTTP/1.1 200 OK\r\n" },
         .{ .status = .bad_request, .line = "HTTP/1.1 400 Bad Request\r\n" },
+        .{ .status = .not_found, .line = "HTTP/1.1 404 Not Found\r\n" },
+        .{ .status = .method_not_allowed, .line = "HTTP/1.1 405 Method Not Allowed\r\n" },
         .{ .status = .content_too_large, .line = "HTTP/1.1 413 Content Too Large\r\n" },
         .{
             .status = .request_header_fields_too_large,

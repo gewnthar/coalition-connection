@@ -53,9 +53,9 @@ whose choice is written down, with the date it was made.
 
 Releases 0.1 to 0.6; the release plan above says which slices go in each.
 
-Built so far: core 2, core 4, core 5 and core 8, the response writer of core 6, and the sends
-and accepts of core 3. Next for 0.1: core 3's reads and cancel, the router of core 6, the
-local listener (core 51) and the loop that joins them, then the deployment slices.
+Built so far: core 2, core 4, core 5, core 6 and core 8, and the sends and accepts of core 3.
+Next for 0.1: core 3's reads and cancel, the local listener (core 51) and the loop that joins
+them, then the deployment slices.
 
 ### Foundations
 

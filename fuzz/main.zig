@@ -133,6 +133,8 @@ const HttpLimit = enum {
     content_length_digits_over,
     /// A valid request with two or more X-Real-IP fields, in any case.
     real_ip_duplicate,
+    /// A target whose path nginx would rewrite: "//", a dot segment, a bad escape.
+    target_refused,
 };
 
 /// A limit case: the bytes written, the error the parser must return (null for success)
@@ -156,6 +158,7 @@ const HttpCounts = struct {
     content_length_over_max: u32 = 0,
     content_length_digits_over: u32 = 0,
     real_ip_duplicate: u32 = 0,
+    target_refused: u32 = 0,
 
     fn add(self: *HttpCounts, limit: HttpLimit) void {
         const before = self.total();
@@ -173,6 +176,7 @@ const HttpCounts = struct {
             .content_length_over_max => self.content_length_over_max += 1,
             .content_length_digits_over => self.content_length_digits_over += 1,
             .real_ip_duplicate => self.real_ip_duplicate += 1,
+            .target_refused => self.target_refused += 1,
         }
         const expected: u32 = if (limit == .none) before else before + 1;
         assert(self.total() == expected);
@@ -193,6 +197,7 @@ const HttpCounts = struct {
         sum += self.content_length_over_max;
         sum += self.content_length_digits_over;
         sum += self.real_ip_duplicate;
+        sum += self.target_refused;
         assert(sum <= cc.constants.fuzz_iterations_max);
         return sum;
     }
@@ -206,7 +211,7 @@ const HttpCounts = struct {
             self.buffer_full > 0 and self.buffer_one_short > 0 and
             self.content_length_exact_fit > 0 and self.content_length_one_over > 0 and
             self.content_length_over_max > 0 and self.content_length_digits_over > 0 and
-            self.real_ip_duplicate > 0;
+            self.real_ip_duplicate > 0 and self.target_refused > 0;
     }
 
     fn print(self: *const HttpCounts, seed: u64) void {
@@ -225,7 +230,10 @@ const HttpCounts = struct {
             "  content_length_exact_fit={d} content_length_one_over={d} content_length_over_max={d} content_length_digits_over={d}\n",
             .{ self.content_length_exact_fit, self.content_length_one_over, self.content_length_over_max, self.content_length_digits_over },
         );
-        std.debug.print("  real_ip_duplicate={d}\n", .{self.real_ip_duplicate});
+        std.debug.print(
+            "  real_ip_duplicate={d} target_refused={d}\n",
+            .{ self.real_ip_duplicate, self.target_refused },
+        );
     }
 };
 
@@ -566,6 +574,7 @@ fn httpCheckAlways(input: []const u8, request: *const http.Request) FuzzError!vo
     if (end[0] != '\r' or end[1] != '\n' or end[2] != '\r' or end[3] != '\n') return error.Mismatch;
     if (request.head_len + request.content_length > cc.constants.http_request_size_max) return error.Mismatch;
     if (request.target.len == 0) return error.Mismatch;
+    if (httpPathRefused(request.target)) return error.Mismatch;
     for (request.headers[0..request.header_count]) |field| {
         if (field.name.len == 0) return error.Mismatch;
         for (field.value) |byte| {
@@ -574,14 +583,75 @@ fn httpCheckAlways(input: []const u8, request: *const http.Request) FuzzError!vo
     }
 }
 
+/// The parser's target rule, written a second way: whether `target` holds a '#', or its
+/// path (before any '?') holds a form nginx would rewrite, found by searching for each one.
+fn httpPathRefused(target: []const u8) bool {
+    assert(target.len > 0);
+    assert(target.len <= http_buffer_size);
+    if (std.mem.findScalar(u8, target, '#') != null) return true;
+    const end = std.mem.findScalar(u8, target, '?') orelse target.len;
+    const path = target[0..end];
+    const forms = [_][]const u8{ "//", "/./", "/../", "%", "\\" };
+    for (forms) |form| {
+        if (std.mem.find(u8, path, form) != null) return true;
+    }
+    if (std.mem.endsWith(u8, path, "/.") or std.mem.endsWith(u8, path, "/..")) return true;
+    // What's left is a path nginx leaves alone; "*" is OPTIONS's own target.
+    assert(path[0] == '/' or std.mem.eql(u8, target, "*"));
+    assert(path.len == target.len or target[path.len] == '?');
+    return false;
+}
+
+/// Bytes a generated target is drawn from: enough to spell every refused form and the
+/// ordinary paths around them.
+const http_target_alphabet = "/./.%%2eE5cC0fFa?#\\";
+
+/// Writes a GET whose target is "/" and then 0 to 11 bytes from `http_target_alphabet`, and
+/// checks that the parser refuses it with `error.TargetInvalid` exactly when the model does.
+fn httpCheckTarget(random: std.Random, buffer: *[http_buffer_size]u8, counts: *HttpCounts) FuzzError!void {
+    const tail_max: u32 = 11;
+    comptime assert(" HTTP/1.1\r\nHost: a\r\n\r\n".len + "GET /".len + tail_max < http_buffer_size);
+    var len: u32 = append(buffer, 0, "GET /");
+    const tail = random.uintLessThan(u32, tail_max + 1);
+    var index: u32 = 0;
+    while (index < tail) : (index += 1) {
+        buffer[len] = http_target_alphabet[random.uintLessThan(u32, http_target_alphabet.len)];
+        len += 1;
+    }
+    assert(index == tail);
+    const target = buffer["GET ".len..len];
+    const refused = httpPathRefused(target);
+    len = append(buffer, len, " HTTP/1.1\r\nHost: a\r\n\r\n");
+    const input = buffer[0..len];
+    const whole = httpParseWhole(input);
+    try httpCheckSplit(random, input, whole);
+    const request = whole catch |err| {
+        if (refused and err == error.TargetInvalid) return counts.add(.target_refused);
+        std.debug.print("fuzz http_request: target {s} got {s}\n", .{ target, @errorName(err) });
+        return error.Mismatch;
+    };
+    if (refused) {
+        std.debug.print("fuzz http_request: target {s} parsed, but nginx would rewrite it\n", .{target});
+        return error.Mismatch;
+    }
+    try httpCheckAlways(input, &request);
+    if (!std.mem.eql(u8, request.target, target)) return error.Mismatch;
+    // The router serves the page for "/" and its queries only, and 404 for every other path.
+    const response = cc.live.router.route(&request);
+    const root = target.len == 1 or target[1] == '?';
+    if ((response.status == .ok) != root) return error.Mismatch;
+    if (!root and response.status != .not_found) return error.Mismatch;
+}
+
 fn httpStep(random: std.Random, buffer: *[http_buffer_size]u8, counts: *HttpCounts) FuzzError!void {
-    // One step in 16 each writes a field-count case, a long head, a head that never ends
-    // or a long body.
+    // One step in 16 each writes a field-count case, a long head, a head that never ends,
+    // a long body or a drawn target.
     switch (random.uintLessThan(u32, 16)) {
         0 => return httpCheckCase(random, httpGenerateFields(random, buffer), buffer, counts),
         1 => return httpCheckCase(random, httpGenerateLong(random, buffer), buffer, counts),
         2 => return httpCheckCase(random, httpGenerateOverflow(random, buffer), buffer, counts),
         3 => return httpCheckCase(random, httpGenerateBody(random, buffer), buffer, counts),
+        4 => return httpCheckTarget(random, buffer, counts),
         else => {},
     }
     const model = httpGenerate(random, buffer);

@@ -90,6 +90,8 @@ pub const Error = error{
     MethodInvalid,
     /// A well-formed method the server does not answer (501).
     MethodUnsupported,
+    /// Not origin form ("*" only for OPTIONS), a byte outside visible ASCII or a '#', or a
+    /// path nginx would rewrite before matching it (see `isPathNormal`).
     TargetInvalid,
     /// Not of the form "HTTP/d.d".
     VersionInvalid,
@@ -256,7 +258,11 @@ fn parseVersion(text: []const u8) Error!Version {
     return error.VersionUnsupported;
 }
 
-/// Origin form only, since the server sits behind a proxy; "*" only for OPTIONS.
+/// Origin form only, since the server sits behind a proxy; "*" only for OPTIONS. No '#'
+/// anywhere: a fragment is never part of a request target (RFC 9112, section 3.2), and nginx
+/// ends the path at one. The path, the part before any '?', must be one nginx leaves as it
+/// is (see `isPathNormal`). The rest of the query isn't checked: nginx doesn't normalize it,
+/// and the router never matches on it.
 fn isTargetValid(target: []const u8, method: Method) bool {
     assert(target.len < size_max);
     if (target.len == 0) return false;
@@ -264,10 +270,50 @@ fn isTargetValid(target: []const u8, method: Method) bool {
     if (target[0] != '/') return false;
     for (target) |byte| {
         // Visible ASCII only; anything else must arrive percent-encoded.
-        if (byte < 0x21 or byte > 0x7e) return false;
+        if (byte < 0x21 or byte > 0x7e or byte == '#') return false;
     }
-    assert(target[0] == '/');
+    const path_len = findByte(target, 0, '?') orelse @as(u32, @intCast(target.len));
+    // The path ends at the first '?' or at the end of the target.
+    assert(path_len == target.len or target[path_len] == '?');
+    assert(findByte(target[0..path_len], 0, '?') == null);
+    return isPathNormal(target[0..path_len]);
+}
+
+/// Whether nginx would match its location rules against `path` exactly as it is, so nginx
+/// and the router agree on which path was asked for. Before it matches, nginx merges "//",
+/// resolves "." and ".." segments and decodes every percent-escape; the server does none of
+/// that, so it refuses every path one of those would change: an empty segment ("//"), a "."
+/// or ".." segment, and any '%'. A backslash is refused too, as a path separator on some
+/// systems. A trailing slash ("/a/") is an ordinary path. Escapes in the query are fine.
+fn isPathNormal(path: []const u8) bool {
+    assert(path.len >= 1 and path.len < size_max);
+    assert(path[0] == '/');
+    const len: u32 = @intCast(path.len);
+    var segment_start: u32 = 1;
+    var index: u32 = 1;
+    while (index < len) : (index += 1) {
+        switch (path[index]) {
+            '/' => {
+                const segment = path[segment_start..index];
+                if (segment.len == 0 or isDotSegment(segment)) return false;
+                segment_start = index + 1;
+            },
+            '%', '\\' => return false,
+            else => {},
+        }
+    }
+    assert(index == len);
+    if (isDotSegment(path[segment_start..])) return false;
+    // Each '/' after the first closed a non-empty segment, so none follows another.
+    assert(std.mem.find(u8, path, "//") == null);
     return true;
+}
+
+fn isDotSegment(segment: []const u8) bool {
+    assert(segment.len < size_max);
+    // The caller splits at every '/', so a segment never holds one.
+    assert(findByte(segment, 0, '/') == null);
+    return equalBytes(segment, ".") or equalBytes(segment, "..");
 }
 
 /// Parses header lines from `start` up to and including the empty line that ends the head.
@@ -667,6 +713,89 @@ fn buildHead(buffer: *[size_max]u8, count: u32) []const u8 {
     len += 2;
     assert(len == request_line.len + count * field.len + 2);
     return buffer[0..len];
+}
+
+/// A GET for `target`, as a whole head.
+fn targetRequest(comptime target: []const u8) []const u8 {
+    return "GET " ++ target ++ " HTTP/1.1\r\nHost: a\r\n\r\n";
+}
+
+test "http_request: paths nginx would rewrite are refused" {
+    const targets = [_][]const u8{
+        // Empty segments, which nginx merges.
+        targetRequest("//"),
+        targetRequest("//a"),
+        targetRequest("/a//b"),
+        targetRequest("/a//"),
+        // Dot segments, which nginx resolves, inside the path and at its end.
+        targetRequest("/./a"),
+        targetRequest("/a/./b"),
+        targetRequest("/../a"),
+        targetRequest("/a/../b"),
+        targetRequest("/."),
+        targetRequest("/.."),
+        targetRequest("/a/."),
+        targetRequest("/a/.."),
+        targetRequest("/..?q=1"),
+        // Escapes, which nginx decodes, and a raw backslash.
+        targetRequest("/%2e"),
+        targetRequest("/%2E%2E/a"),
+        targetRequest("/a%2fb"),
+        targetRequest("/a%5Cb"),
+        targetRequest("/a%00"),
+        targetRequest("/%61dmin"),
+        targetRequest("/a%20b"),
+        targetRequest("/%"),
+        targetRequest("/a%2?q"),
+        targetRequest("/a\\b"),
+        // A fragment, which nginx cuts off the path, in the path or the query.
+        targetRequest("/#"),
+        targetRequest("/a#b"),
+        targetRequest("/a/.#"),
+        targetRequest("/?q#f"),
+    };
+    for (targets) |text| {
+        try testing.expectError(error.TargetInvalid, parseWhole(text));
+        try expectSameWhenSplit(text);
+    }
+}
+
+test "http_request: ordinary paths and queries still parse" {
+    const cases = [_]struct { text: []const u8, target: []const u8 }{
+        .{ .text = targetRequest("/"), .target = "/" },
+        .{ .text = targetRequest("/a/b/"), .target = "/a/b/" },
+        .{ .text = targetRequest("/.well-known/x"), .target = "/.well-known/x" },
+        .{ .text = targetRequest("/a.b/..c/.../d."), .target = "/a.b/..c/.../d." },
+        // The query is the client's own business: nginx passes it through unchanged.
+        .{ .text = targetRequest("/?next=//a/../b"), .target = "/?next=//a/../b" },
+        .{ .text = targetRequest("/sso?state=%2F%2e%00%5c%"), .target = "/sso?state=%2F%2e%00%5c%" },
+        .{ .text = targetRequest("/a?"), .target = "/a?" },
+        .{ .text = "OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n", .target = "*" },
+    };
+    for (cases) |case| {
+        try expectSameWhenSplit(case.text);
+        const request = try parseWhole(case.text);
+        try testing.expectEqualStrings(case.target, request.target);
+    }
+}
+
+test "http_request: every escape is refused in the path and accepted in the query" {
+    const in_path = comptime targetRequest("/%00");
+    const in_query = comptime targetRequest("/?%00");
+    const digits = "0123456789abcdef";
+    var value: u32 = 0;
+    while (value <= 0xff) : (value += 1) {
+        var path_text: [in_path.len]u8 = in_path[0..in_path.len].*;
+        path_text["GET /%".len] = digits[value >> 4];
+        path_text["GET /%".len + 1] = digits[value & 0xf];
+        try testing.expectError(error.TargetInvalid, parseWhole(&path_text));
+        var query_text: [in_query.len]u8 = in_query[0..in_query.len].*;
+        query_text["GET /?%".len] = digits[value >> 4];
+        query_text["GET /?%".len + 1] = digits[value & 0xf];
+        const request = try parseWhole(&query_text);
+        try testing.expectEqualStrings(query_text["GET ".len..][0.."/?%00".len], request.target);
+    }
+    try testing.expectEqual(@as(u32, 0x100), value);
 }
 
 test "http_request: header count at and past http_headers_max" {

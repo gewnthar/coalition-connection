@@ -164,6 +164,8 @@ fn modelStatusLine(status: writer.Status) []const u8 {
     const line: []const u8 = switch (status) {
         .ok => "HTTP/1.1 200 OK\r\n",
         .bad_request => "HTTP/1.1 400 Bad Request\r\n",
+        .not_found => "HTTP/1.1 404 Not Found\r\n",
+        .method_not_allowed => "HTTP/1.1 405 Method Not Allowed\r\n",
         .content_too_large => "HTTP/1.1 413 Content Too Large\r\n",
         .request_header_fields_too_large => "HTTP/1.1 431 Request Header Fields Too Large\r\n",
         .not_implemented => "HTTP/1.1 501 Not Implemented\r\n",
