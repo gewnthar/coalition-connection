@@ -85,6 +85,8 @@ pub const ParseError = error{
     /// The socket path is longer than `config_socket_path_max`.
     SocketPathTooLong,
     /// The socket path doesn't start with `/`, so it would depend on the working directory.
+    /// A network address (`0.0.0.0:8080`) or an abstract socket name lands here too: the
+    /// server listens only on a local socket file.
     SocketPathNotAbsolute,
     /// The path holds a NUL byte, which would cut it short at the kernel.
     SocketPathHasNul,
@@ -544,6 +546,20 @@ test "config: each bad value has its own error" {
         },
     };
     for (cases) |case| try testing.expectError(case.expected, parseTest(case.source));
+}
+
+test "config: a network address in place of the socket path is SocketPathNotAbsolute" {
+    // The server listens only on a local socket, so the field takes a path and nothing else.
+    const sources = [_][:0]const u8{
+        ".{ .socket_path = \"0.0.0.0:8080\", .connections_max = 1 }",
+        ".{ .socket_path = \"127.0.0.1:8080\", .connections_max = 1 }",
+        ".{ .socket_path = \"[::]:443\", .connections_max = 1 }",
+        ".{ .socket_path = \"localhost:8080\", .connections_max = 1 }",
+        ".{ .socket_path = \"tcp://0.0.0.0:80\", .connections_max = 1 }",
+        ".{ .socket_path = \"unix:/run/app.sock\", .connections_max = 1 }",
+        ".{ .socket_path = \"\\x00app\", .connections_max = 1 }",
+    };
+    for (sources) |source| try testing.expectError(error.SocketPathNotAbsolute, parseTest(source));
 }
 
 test "config: bad syntax, missing, unknown and mistyped fields are syntax errors" {

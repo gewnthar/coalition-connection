@@ -75,6 +75,7 @@ const constants = @import("../constants.zig");
 const connections = @import("../live/connections.zig");
 const StartupAllocator = @import("../startup_allocator.zig").StartupAllocator;
 const io = @import("root.zig");
+const listener = @import("listener.zig");
 
 const ns_per_s: u64 = std.time.ns_per_s;
 
@@ -1283,6 +1284,50 @@ test "real: an accept over a loopback listener takes a table entry for the conne
 
     // The entry's socket is the accepted end: bytes from the client arrive on it.
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.write(loopback.client, "hi", 2)));
+    var received: [4]u8 = undefined;
+    const rc = linux.read(socket, &received, received.len);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try testing.expectEqualStrings("hi", received[0..rc]);
+}
+
+test "real: an accept on the local listener takes the client connecting through its path" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    // A fresh 0700 directory under a random name, so runs sharing /tmp never meet.
+    var random: [8]u8 = undefined;
+    try testing.expectEqual(random.len, linux.getrandom(&random, random.len, 0));
+    var dir_bytes: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrintSentinel(&dir_bytes, "/tmp/cc-real-{x}", .{std.mem.readInt(u64, &random, .little)}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(dir, 0o700)));
+    defer _ = linux.rmdir(dir);
+    var path_bytes: [constants.config_socket_path_max + 1]u8 = undefined;
+    const socket_path = try std.fmt.bufPrintSentinel(&path_bytes, "{s}/app.sock", .{dir}, 0);
+    var lock_bytes: [constants.config_socket_path_max + 8]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintSentinel(&lock_bytes, "{s}.lock", .{socket_path}, 0);
+    // Runs after close below: the lock file is all close leaves.
+    defer _ = linux.unlink(lock_path);
+    var local = try listener.open(socket_path);
+    defer local.close();
+
+    try fixture.real.submit(.{ .id = 11, .operation = .{ .accept = .{ .listener = local.socket } } });
+    const client = try socketOpen(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC);
+    defer _ = linux.close(client);
+    const address_len: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + socket_path.len + 1);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.connect(client, &local.address, address_len)));
+    var completions: [2]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(io.OperationId, 11), completions[0].id);
+    const peer = try completions[0].result.accept;
+    const socket = fixture.table.get(peer).socket;
+    assert(fixture.table.get(peer).sends_in_flight == 0);
+    defer _ = linux.close(fixture.table.release(peer) catch |err| switch (err) {
+        error.SendsInFlight => unreachable,
+    });
+    try testing.expectEqual(@as(u32, 2), fixture.table.count());
+
+    // The entry's socket is the accepted end of the client's connection.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.write(client, "hi", 2)));
     var received: [4]u8 = undefined;
     const rc = linux.read(socket, &received, received.len);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));

@@ -54,8 +54,9 @@
 //! every new one against it.
 //!
 //! Status: the contract, the simulator, and the real type for Linux (`real.zig`), which
-//! meets the contract with an io_uring ring for sends and accepts. The contract grows
-//! (receive, cancel, connect, timers) slice by slice.
+//! meets the contract with an io_uring ring for sends and accepts. `listener.zig` opens
+//! the one socket accepts are taken on: a Unix socket at the config's path, never a network
+//! address. The contract grows (receive, cancel, connect, timers) slice by slice.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -63,6 +64,7 @@ const assert = std.debug.assert;
 
 pub const sim = @import("sim.zig");
 pub const real = @import("real.zig");
+pub const listener = @import("listener.zig");
 
 /// Nanoseconds on a monotonic clock. Never wall-clock time.
 pub const Instant = u64;
@@ -469,5 +471,8 @@ test "io: a type with several problems is blamed for the first, in contract orde
 test {
     _ = sim;
     // The real type is Linux only; on another target its tests aren't analyzed at all.
-    if (builtin.target.os.tag == .linux) _ = real;
+    if (builtin.target.os.tag == .linux) {
+        _ = real;
+        _ = listener;
+    }
 }
