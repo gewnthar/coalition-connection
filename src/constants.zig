@@ -225,6 +225,25 @@ pub const io_random_bytes_max: u32 = 64;
 /// a retry, and the bound stops a signal storm from spinning the event loop.
 pub const io_random_attempts_max: u32 = 8;
 
+/// Connections the kernel queues on the local listener before the server accepts them.
+/// Reason: nginx is the only client and opens a few connections per worker, so a queue of
+/// 512 rides out a burst between two accepts; Linux caps it at `net.core.somaxconn`
+/// (4,096 by default), so asking for more than that buys nothing. Provisional: the server
+/// loop (roadmap core 3) confirms it under load.
+pub const listener_backlog: u32 = 512;
+
+/// bind calls opening the local listener may take. Reason: the first bind finds the path
+/// free, or finds a socket a server that stopped left behind; the second runs after that
+/// stale socket is removed. A path still taken after that is a process binding it without
+/// the path's lock, and startup refuses rather than retrying.
+pub const listener_bind_attempts_max: u32 = 2;
+
+/// Permission bits of the local listener's socket file. Reason: connecting to a Unix socket
+/// needs write permission on the file, so the server's user and its group may connect and
+/// nobody else; nginx connects through the group the pod's units give it. Set explicitly,
+/// not left to the umask. Provisional: the nginx unit (roadmap core 48) confirms it.
+pub const listener_socket_mode: u32 = 0o660;
+
 // ---- Memory --------------------------------------------------------------------------
 
 /// Total memory the process may take at startup. Reason: fits a small virtual server
