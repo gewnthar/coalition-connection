@@ -244,6 +244,35 @@ pub const listener_bind_attempts_max: u32 = 2;
 /// not left to the umask. Provisional: the nginx unit (roadmap core 48) confirms it.
 pub const listener_socket_mode: u32 = 0o660;
 
+// ---- Open files ----------------------------------------------------------------------
+
+/// Accepts the server keeps in flight at once. Reason: each accept's completion already
+/// holds a new socket the kernel opened, before the table is asked for an entry, so every
+/// accept in flight needs a descriptor of its own; one at a time is enough for nginx, the
+/// only client. Provisional: the server loop keeps to it.
+pub const accepts_in_flight_max: u32 = 1;
+
+/// File descriptors the server holds open besides its connections' sockets, at most, at
+/// any one moment:
+///   3  standard input, output and error (startup closes every other inherited one);
+///   1  the config file, open only while it is read;
+///   1  the io_uring ring;
+///   1  the local listener's socket;
+///   1  the listener's lock file, held until the listener closes;
+///   `accepts_in_flight_max`  the new socket each accept in flight completes with, which a
+///      full connection table closes at once.
+/// A released connection's socket is closed before the next accept is submitted, so it
+/// needs no line of its own. Reason: the server refuses to start unless the open-file
+/// limit covers every connection the config allows plus these, so an accept never fails
+/// for want of a descriptor while the table has room. A component that holds descriptors
+/// of its own (Postgres, Valkey, ESI) adds its line here in the change that opens them.
+pub const descriptors_besides_connections: u32 = 3 + 1 + 1 + 1 + 1 + accepts_in_flight_max;
+
+/// The open-file limit the largest config needs: one descriptor for each of
+/// `http_connections_max` connections, plus `descriptors_besides_connections`. Startup
+/// works out the need from the config's own connection limit, which is at most this.
+pub const descriptors_needed_max: u64 = @as(u64, http_connections_max) + descriptors_besides_connections;
+
 // ---- Memory --------------------------------------------------------------------------
 
 /// Total memory the process may take at startup. Reason: fits a small virtual server
@@ -403,6 +432,10 @@ comptime {
     assert(io_operations_in_flight_max <= 32_768);
     assert(io_random_bytes_max >= 32);
     assert(io_random_attempts_max >= 2);
+    assert(accepts_in_flight_max > 0 and accepts_in_flight_max <= io_operations_in_flight_max);
+    // fs.nr_open defaults to 1,048,576, and no hard open-file limit can pass it unless an
+    // administrator raises that sysctl, so the largest config must fit below it.
+    assert(descriptors_needed_max <= 1024 * 1024);
     // A simulated run must leave room to drain every delayed completion.
     assert(sim_completion_delay_ticks_max < sim_ticks_max);
 }
