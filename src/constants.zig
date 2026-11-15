@@ -71,10 +71,11 @@ pub const http_connections_max: u32 = 4_096;
 /// request head scan and count of sends in flight) plus its slot on the free-index stack.
 /// Reason: the table is sized once at startup and counted in the memory table;
 /// `src/live/connections.zig` checks at compile time that its entry fits. The entry and its
-/// slot take 18 of the 20 bytes on every target: 13 bytes of fields, padded to 16 by the
-/// socket's 4-byte alignment, plus a 2-byte slot. Three more bytes of fields still fit in
-/// the padding; anything past that means raising this number in review.
-pub const http_connection_entry_size_max: u32 = 20;
+/// slot take at most all 26 bytes: 17 bytes of fields (19 as stored, since the 48-bit
+/// generation takes 8), padded to 24 by that generation's 8-byte alignment (to 20 where it aligns to 4, as on 32-bit x86), plus a
+/// 2-byte slot. Five more bytes of fields still fit in the padding; anything past that
+/// means raising this number in review.
+pub const http_connection_entry_size_max: u32 = 26;
 
 /// Largest HTTP request head plus body. Reason: forms are small; anything larger is
 /// rejected before parsing.

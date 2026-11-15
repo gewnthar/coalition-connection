@@ -422,9 +422,11 @@ fn tableCallAllowed(call: trip.TableCall) bool {
         .get_out_of_range,
         .set_state_out_of_range,
         .lookup_out_of_range,
+        .lookup_index_max,
         .release_stale,
         .get_stale,
         .set_state_stale,
+        .get_stale_top_bit,
         => false,
     };
     // Every allowed call names an entry in use under its live generation; every forbidden
@@ -446,11 +448,13 @@ fn tableCallIndex(call: trip.TableCall) u32 {
         .release_free_stale_socket, .get_free_stale_socket => trip.free_id,
         .release_out_of_range, .get_out_of_range, .set_state_out_of_range => trip.table_size,
         .lookup_out_of_range => trip.table_size,
+        .lookup_index_max => std.math.maxInt(connections.Index),
         .release_reading, .get_reading, .set_state_to_writing, .set_state_to_free => trip.reading_id,
-        .release_stale, .get_stale, .set_state_stale => trip.reading_id,
+        .release_stale, .get_stale, .set_state_stale, .get_stale_top_bit => trip.reading_id,
         .release_writing, .get_writing, .set_state_to_reading => trip.writing_id,
     };
-    assert(index <= trip.table_size);
+    assert(index <= trip.table_size or
+        (call == .lookup_index_max and index == std.math.maxInt(connections.Index)));
     assert(index != trip.free_id or call != .set_state_to_free);
     return index;
 }
@@ -460,13 +464,21 @@ fn tableCallIndex(call: trip.TableCall) u32 {
 /// generation check and only the state check can stop it.
 const free_generation: connections.Generation = live_generation +% 1;
 
+/// The generation's top bit: an id that differs from a live one only there must be stale.
+const generation_top_bit: connections.Generation =
+    @as(connections.Generation, 1) << (@bitSizeOf(connections.Generation) - 1);
+
 /// The id the call names: its entry's index under that entry's current generation, except
-/// for the stale cases, which carry the generation before it (wrapping), one no live id
-/// holds, so only the generation check can stop them.
+/// for the stale cases, which carry the generation before it (wrapping), or the live one
+/// with only its top bit flipped; no live id holds either, so only the generation check
+/// can stop them, and it must compare every bit.
 fn tableCallId(call: trip.TableCall) connections.PeerId {
-    const stale = call == .release_stale or call == .get_stale or call == .set_state_stale;
+    const stale = call == .release_stale or call == .get_stale or call == .set_state_stale or
+        call == .get_stale_top_bit;
     const index = tableCallIndex(call);
-    const generation: connections.Generation = if (stale)
+    const generation: connections.Generation = if (call == .get_stale_top_bit)
+        live_generation ^ generation_top_bit
+    else if (stale)
         live_generation -% 1
     else if (index == trip.free_id)
         free_generation
@@ -565,6 +577,7 @@ fn callTable(table: *connections.Table, call: trip.TableCall) connections.Socket
         .get_free_stale_socket,
         .get_out_of_range,
         .get_stale,
+        .get_stale_top_bit,
         .get_reading,
         .get_writing,
         => table.get(id).socket,
@@ -580,7 +593,7 @@ fn callTable(table: *connections.Table, call: trip.TableCall) connections.Socket
             table.setState(id, .reading);
             break :state -1;
         },
-        .lookup_out_of_range => lookup: {
+        .lookup_out_of_range, .lookup_index_max => lookup: {
             _ = table.lookup(id);
             break :lookup -1;
         },
