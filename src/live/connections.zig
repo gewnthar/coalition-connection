@@ -29,17 +29,22 @@
 //! `release` empties it again, so a free entry never holds scan state and a reused entry
 //! never inherits the last connection's.
 //!
-//! A `PeerId` names an entry and a generation of it: the low 16 bits are the entry's index
-//! and the high 16 bits the entry's generation, which `release` advances, wrapping. An id
-//! handed out before a release is stale afterwards, so an I/O completion that still names
-//! the old connection can't reach the next connection on that entry: completions find
-//! their entry through `lookup`, which returns null for a stale id. `get`, `headScan`,
-//! `setState` and `release` are for callers holding a live id, and assert it is live.
+//! A `PeerId` names an entry and a generation of it: the low 16 bits of the 64 are the
+//! entry's index and the high 48 bits the entry's generation, which `release` advances,
+//! wrapping. An id handed out before a release is stale afterwards, so an I/O completion
+//! that still names the old connection can't reach the next connection on that entry:
+//! completions find their entry through `lookup`, which returns null for a stale id.
+//! `get`, `headScan`, `setState` and `release` are for callers holding a live id, and
+//! assert it is live.
 //!
-//! The limit: after 65,536 releases of one entry its generation is back where it started,
-//! so an id stays distinct from every later one for 65,535 reuses of its entry. The free
-//! stack hands the same entry out again first, so work in flight on a connection must not
-//! outlast that many reuses of its entry.
+//! The limit: after 2^48 releases of one entry its generation is back where it started.
+//! The free stack hands the same entry out again first, so a peer that keeps connecting
+//! and closing gets the same entry back each time, as fast as the server can accept. Even at one release every
+//! microsecond, far past what accept sustains, 2^48 releases take more than eight years,
+//! which `generation_wrap_years_min` checks at compile time. No send or timer is meant to
+//! hold an id for years, so a stale id doesn't match a later connection's in practice. At that rate a
+//! 16-bit generation would wrap in under a tenth of a second and a 20-bit one in about a
+//! second, which a timer or a slow client's write could easily outlast.
 //!
 //! Sends in flight: the I/O type captures a send's socket number when the send is
 //! submitted, and the kernel may take the send later. If the entry were released and its
@@ -59,19 +64,29 @@ const http_request = @import("http_request.zig");
 
 pub const PeerId = io.PeerId;
 
-/// The position of an entry in the table: the low half of a `PeerId`.
+/// The position of an entry in the table: the low 16 bits of a `PeerId`.
 pub const Index = u16;
 
-/// How many times an entry has been released, wrapping: the high half of a `PeerId`.
-pub const Generation = u16;
+/// How many times an entry has been released, wrapping: the high 48 bits of a `PeerId`.
+pub const Generation = u48;
 
-/// A `PeerId` split into its halves. A packed struct lays its fields out from the least
+/// A `PeerId` split into its parts. A packed struct lays its fields out from the least
 /// significant bit, so `@bitCast` between the two puts `index` in the low 16 bits and does
-/// no arithmetic that could overflow.
+/// no arithmetic that could overflow. Every bit of the id belongs to one of the two
+/// fields, so every id the table hands out round-trips through `@bitCast` unchanged.
 pub const IdParts = packed struct(PeerId) {
     index: Index,
     generation: Generation,
 };
+
+/// The fewest years one entry's generation takes to wrap, released once every microsecond
+/// with no pause. A release follows an accept and a close, so the real rate is far lower.
+pub const generation_wrap_years_min: u64 = 8;
+
+/// Releases per second the wrap check assumes for one entry: one every microsecond.
+const releases_per_second_max: u64 = 1_000_000;
+
+const seconds_per_year: u64 = 365 * 24 * 60 * 60;
 
 /// A Linux file descriptor, as the I/O boundary defines it.
 pub const Socket = io.Socket;
@@ -120,10 +135,20 @@ pub const entry_bytes: u32 = @sizeOf(Entry) + @sizeOf(Index);
 comptime {
     assert(entry_bytes <= constants.http_connection_entry_size_max);
     assert(constants.http_connections_max > 0);
-    // Every entry's index fits the low half of a PeerId.
+    // Every entry's index fits the low 16 bits of a PeerId.
     assert(constants.http_connections_max - 1 <= std.math.maxInt(Index));
-    // The layout the docs promise: index in the low half, generation in the high half.
+    // The layout the docs promise: index in the low 16 bits, generation in the high 48.
     assert(@as(PeerId, @bitCast(IdParts{ .index = 1, .generation = 2 })) == 0x0002_0001);
+    const generation_only: PeerId = @bitCast(IdParts{
+        .index = 0,
+        .generation = std.math.maxInt(Generation),
+    });
+    assert(generation_only == 0xffff_ffff_ffff_0000);
+    // One entry, released as fast as releases_per_second_max allows, takes at least
+    // generation_wrap_years_min years to bring its generation back to an id it handed out.
+    const releases_per_wrap: u64 = std.math.maxInt(Generation) + 1;
+    const releases_per_year: u64 = releases_per_second_max * seconds_per_year;
+    assert(releases_per_wrap / releases_per_year >= generation_wrap_years_min);
     // Every operation in flight could be a send on one connection; its count still fits.
     assert(constants.io_operations_in_flight_max <= std.math.maxInt(SendCount));
 }
@@ -644,7 +669,7 @@ const SeededModel = struct {
         };
         const parts: IdParts = @bitCast(id);
         try testing.expectEqual(@as(Socket, -1), model.sockets[parts.index]);
-        const generation: Generation = @truncate(model.releases[parts.index]);
+        const generation: Generation = model.releases[parts.index];
         try testing.expectEqual(generation, parts.generation);
         try testing.expectEqual(@as(u32, 0), table.get(id).scan.resume_at);
         // Leave some scans part way, so releases mid-scan are exercised too.
@@ -785,9 +810,9 @@ test "connections: lookup finds a live id and refuses a free entry's id" {
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);
 }
 
-test "connections: a generation wraps to zero, and only the newest id is live" {
-    // One entry, released and acquired again until its generation wraps past its largest
-    // value back to zero. At every step only the newest id is live.
+test "connections: an entry's first id stays stale across 65,536 reuses" {
+    // One entry, so the free stack hands it back on every acquire. 65,536 reuses wrapped a 16-bit generation back to the first id; the 48-bit one
+    // must leave that id stale at every step, and the newest id live.
     var startup = StartupAllocator.init(testing.allocator, entry_bytes);
     const gpa = startup.allocator();
     var table = try Table.init(gpa, 1);
@@ -795,25 +820,102 @@ test "connections: a generation wraps to zero, and only the newest id is live" {
 
     const first = try table.acquire(10);
     try testing.expectEqual(@as(Generation, 0), @as(IdParts, @bitCast(first)).generation);
-    const cycles: u32 = std.math.maxInt(Generation) + 1;
+    const cycles: u32 = std.math.maxInt(u16) + 1;
     var id = first;
     var cycle: u32 = 0;
     while (cycle < cycles) : (cycle += 1) {
         const socket: Socket = @intCast(11 + cycle % 1000);
         try testing.expectEqual(table.get(id).socket, try table.release(id));
         const next = try table.acquire(socket);
+        try testing.expect(next != first);
+        try testing.expectEqual(@as(?*const Entry, null), table.lookup(first));
         try testing.expectEqual(@as(?*const Entry, null), table.lookup(id));
         try testing.expectEqual(socket, table.lookup(next).?.socket);
         id = next;
     }
     try testing.expectEqual(cycles, cycle);
-    // After 65,536 releases the generation is back at zero: the first id names the live
-    // connection again. A completion would have to wait out that many reuses of its entry
-    // to be misrouted.
-    try testing.expectEqual(first, id);
+    // The generation counted every release: none was lost to a narrower field.
+    const parts: IdParts = @bitCast(id);
+    try testing.expectEqual(@as(Index, 0), parts.index);
+    try testing.expectEqual(@as(Generation, cycles), parts.generation);
+    // The low 32 bits are the id a 16-bit generation would give, which had wrapped back to
+    // the first id; the full id differs from it, and the first id stays stale.
+    const narrow_now: u32 = @truncate(id);
+    const narrow_first: u32 = @truncate(first);
+    try testing.expectEqual(narrow_first, narrow_now);
+    try testing.expect(id != first);
+    try testing.expectEqual(@as(?*const Entry, null), table.lookup(first));
+
+    _ = try table.release(id);
+    startup.beginShutdown();
+    table.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "connections: an id differing from the live one in any single generation bit is stale" {
+    // Every one of the generation's 48 bits takes part in the check: an id that matches the
+    // live id but for one bit, from the lowest to the top one, finds nothing.
+    var startup = StartupAllocator.init(testing.allocator, 2 * entry_bytes);
+    const gpa = startup.allocator();
+    var table = try Table.init(gpa, 2);
+    startup.finishStartup();
+
+    _ = try table.acquire(10);
+    const live = try table.acquire(11);
+    try testing.expectEqual(@as(Index, 1), @as(IdParts, @bitCast(live)).index);
+    const bits: u32 = @bitSizeOf(Generation);
+    var bit: u32 = 0;
+    while (bit < bits) : (bit += 1) {
+        const flip: Generation = @as(Generation, 1) << @intCast(bit);
+        const other: PeerId = @bitCast(IdParts{ .index = 1, .generation = flip });
+        try testing.expect(other != live);
+        try testing.expectEqual(@as(?*const Entry, null), table.lookup(other));
+    }
+    try testing.expectEqual(bits, bit);
+    try testing.expectEqual(@as(Socket, 11), table.lookup(live).?.socket);
+
+    _ = try table.release(live);
+    _ = try table.release(@bitCast(IdParts{ .index = 0, .generation = 0 }));
+    startup.beginShutdown();
+    table.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "connections: a generation wraps to zero, and only the newest id is live" {
+    // 2^48 releases can't run in a test, so the entry starts free just below its largest
+    // generation, as if released that many times, and the last few releases wrap it.
+    var startup = StartupAllocator.init(testing.allocator, entry_bytes);
+    const gpa = startup.allocator();
+    var table = try Table.init(gpa, 1);
+    startup.finishStartup();
+
     const generation_max = std.math.maxInt(Generation);
+    const steps: u32 = 4;
+    table.entries[0].generation = generation_max - @as(Generation, steps - 2);
+    table.assertInvariants();
+    var id = try table.acquire(10);
+    const before_wrap = id;
+    var step: u32 = 0;
+    while (step < steps) : (step += 1) {
+        const socket: Socket = @intCast(11 + step);
+        try testing.expectEqual(table.get(id).socket, try table.release(id));
+        const next = try table.acquire(socket);
+        try testing.expectEqual(@as(?*const Entry, null), table.lookup(id));
+        try testing.expectEqual(socket, table.lookup(next).?.socket);
+        const generation_was = @as(IdParts, @bitCast(id)).generation;
+        const generation_now = @as(IdParts, @bitCast(next)).generation;
+        try testing.expectEqual(generation_was +% 1, generation_now);
+        id = next;
+    }
+    try testing.expectEqual(steps, step);
+    // The wrap went through the largest generation to zero and on, never carrying into
+    // the index.
+    const parts: IdParts = @bitCast(id);
+    try testing.expectEqual(@as(Index, 0), parts.index);
+    try testing.expectEqual(@as(Generation, 1), parts.generation);
     const last_stale: PeerId = @bitCast(IdParts{ .index = 0, .generation = generation_max });
     try testing.expectEqual(@as(?*const Entry, null), table.lookup(last_stale));
+    try testing.expectEqual(@as(?*const Entry, null), table.lookup(before_wrap));
 
     _ = try table.release(id);
     startup.beginShutdown();

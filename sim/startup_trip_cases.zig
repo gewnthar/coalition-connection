@@ -62,12 +62,18 @@ pub const TableCall = enum(u8) {
     // lookup, which completions use, returns null for a stale id, but an index past the
     // table is still a bug and must trip on the id check.
     lookup_out_of_range,
+    // lookup on the largest index a PeerId can carry, far past the table: the index field's
+    // whole range must still meet the id check, not an out-of-bounds read.
+    lookup_index_max,
     // The same three calls through a stale id for the reading entry: its index is in use,
     // but the id carries another generation, as an id kept past its connection's release
     // would. The generation check alone must stop these.
     release_stale,
     get_stale,
     set_state_stale,
+    // get through the reading entry's live id with only the generation's top bit flipped:
+    // a check that compared fewer than all 48 bits would let it through.
+    get_stale_top_bit,
     // Controls on the reading entry: release, get, and a move to writing.
     release_reading,
     get_reading,
@@ -313,9 +319,11 @@ pub const cases = [_]Case{
     onTable("table_get_out_of_range", .get_out_of_range, .trips),
     onTable("table_set_state_out_of_range", .set_state_out_of_range, .trips),
     onTable("table_lookup_out_of_range", .lookup_out_of_range, .trips),
+    onTable("table_lookup_index_max", .lookup_index_max, .trips),
     onTable("table_release_stale", .release_stale, .trips),
     onTable("table_get_stale", .get_stale, .trips),
     onTable("table_set_state_stale", .set_state_stale, .trips),
+    onTable("table_get_stale_top_bit", .get_stale_top_bit, .trips),
     // Controls: the same calls on entries in use, reading and writing.
     onTable("table_release_reading", .release_reading, .finishes),
     onTable("table_get_reading", .get_reading, .finishes),

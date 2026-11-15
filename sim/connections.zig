@@ -96,7 +96,8 @@ const Model = struct {
     free_indices: [capacity]Index,
     free_count: u32,
     /// How many times each entry was handed out. Every hand-out but the newest was
-    /// released, so for an entry in use this is one more than its generation, wrapping.
+    /// released, so for an entry in use this is one more than its generation. A run
+    /// hands out far fewer than 2^32 entries, so the count never reaches the 48-bit wrap.
     acquired: [capacity]u32,
     next_socket: Socket,
 
@@ -157,7 +158,7 @@ fn arrive(w: *Workload) Error!void {
     if (index != model.free_indices[model.free_count]) return error.InvariantBroken;
     if (model.sockets[index] != -1) return error.InvariantBroken;
     // Each earlier hand-out of this entry was released once, advancing its generation.
-    const generation: connections.Generation = @truncate(model.acquired[index]);
+    const generation: connections.Generation = model.acquired[index];
     if (parts.generation != generation) return error.InvariantBroken;
     model.sockets[index] = socket;
     model.states[index] = .reading;
