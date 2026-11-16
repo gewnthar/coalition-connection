@@ -4,11 +4,19 @@
 //! caller-owned buffer, and choose the status for each request the parser refuses.
 //! Never allocates: the caller lends a buffer, normally one of the shared response buffers.
 //!
+//! Two entry points. `write` copies a body from outside the buffer after the head. A page
+//! rendered in place goes through `writeInPlace` instead: its body is already in the
+//! buffer, after `http_response_head_room` bytes kept for the head, and the writer puts the
+//! head in that room so it ends where the body starts. The response then goes out as one
+//! slice, and the body is never copied.
+//!
 //! Inputs: a `Response` (status, the handler's header fields, the body, and whether the
-//! connection closes after it) and a buffer of at most `http_response_size_max` bytes.
-//! Outputs: the number of bytes written, or a named error. On an error the buffer holds
-//! partial output that must not be sent.
-//! Limits: `http_response_size_max` and `http_response_headers_max`.
+//! connection closes after it), or an `InPlace` (the same, with the body's offset and
+//! length in the buffer), and a buffer of at most `http_response_size_max` bytes.
+//! Outputs: the number of bytes written, or the response's slice of the buffer, or a named
+//! error. On an error the buffer holds partial output that must not be sent.
+//! Limits: `http_response_size_max`, `http_response_headers_max` and
+//! `http_response_head_room`.
 //!
 //! Strict by design, like the parser. The writer adds Content-Length itself, so the length
 //! on the wire is always the body's, and it refuses header fields that would contradict it
@@ -28,6 +36,8 @@ const http_request = @import("http_request.zig");
 
 const size_max = constants.http_response_size_max;
 const headers_max = constants.http_response_headers_max;
+/// The room a page leaves for its head before its body (see `InPlace`).
+pub const head_room = constants.http_response_head_room;
 
 /// The statuses the server sends. The integer value is the status code on the wire.
 pub const Status = enum(u16) {
@@ -78,8 +88,10 @@ comptime {
         assert(line.len > "HTTP/1.1 000 \r\n".len);
         assert(value >= 200 and value <= 599 and value != 204 and value != 304);
     }
-    // A refusal (status line, Connection and Content-Length, no fields) fits a buffer.
+    // A refusal (status line, Connection and Content-Length, no fields) fits a buffer, and
+    // the head of a page with no fields fits the room kept for it.
     assert(status_line_size_max + tail_size_max <= size_max);
+    assert(status_line_size_max + tail_size_max <= head_room);
 }
 
 /// The status for a request the parser refused, or null for `error.Incomplete`, which is
@@ -153,8 +165,28 @@ pub const Response = struct {
     close: bool = false,
 };
 
+/// A response whose body was rendered into the buffer it is written into.
+pub const InPlace = struct {
+    status: Status,
+    /// At most `http_response_headers_max`, written in order. Must not point into the
+    /// buffer, the rendered body included.
+    headers: []const Header = &.{},
+    /// Where the body starts in the buffer. The bytes before it are the room for the head,
+    /// at most `head_room` (asserted). Pages keep the default, so every page leaves the
+    /// same room; a smaller offset is for tests and for bodies known to need less.
+    body_offset: u32 = head_room,
+    /// The body's length. The body must fit in the buffer after `body_offset`.
+    body_len: u32,
+    /// As in `Response`: Content-Length states `body_len`, and the slice ends at the head.
+    omit_body: bool = false,
+    /// As in `Response`: adds "Connection: close".
+    close: bool = false,
+};
+
 pub const Error = error{
-    /// The response is longer than the buffer (an exact fit is fine).
+    /// The response is longer than the buffer, an in-place head is longer than the room
+    /// before the body (an exact fit is fine either way), or a header field is longer than
+    /// any response.
     ResponseTooLarge,
     /// More than `http_response_headers_max` header fields.
     HeadersTooMany,
@@ -180,20 +212,43 @@ pub fn write(buffer: []u8, response: Response) Error!u32 {
     const body_len: u32 = @intCast(response.body.len);
 
     var out: Cursor = .{ .buffer = buffer };
-    try out.append(statusLine(response.status));
-    for (response.headers) |field| {
-        try out.appendHeader(field.name, field.value);
-    }
-    if (response.close) try out.appendHeader("Connection", "close");
-    try out.append("Content-Length: ");
-    try out.appendDecimal(body_len);
-    try out.append("\r\n\r\n");
+    try out.appendHead(response.status, response.headers, response.close, body_len);
     const head_len = out.len;
     if (!response.omit_body) try out.append(response.body);
 
     assert(std.mem.startsWith(u8, buffer[0..head_len], "HTTP/1.1 "));
-    assert(std.mem.endsWith(u8, buffer[0..head_len], "\r\n\r\n"));
+    // The body, if sent, ends the response: its last byte is the response's last.
+    assert(sent_len == 0 or buffer[out.len - 1] == response.body[response.body.len - 1]);
     return out.len;
+}
+
+/// Writes the head of a response whose body is already in `buffer` at `body_offset`, so
+/// that the head ends where the body starts, and returns the response as one slice of
+/// `buffer`: the head and the body, or the head alone for `omit_body`. Checks every header
+/// field before writing anything. The body itself is never read or written. On an error
+/// the bytes before the body may have changed; the body and the bytes after it have not.
+pub fn writeInPlace(buffer: []u8, response: InPlace) Error![]const u8 {
+    assert(buffer.len <= size_max);
+    // The caller rendered the body after the room, so it fits by construction, and the
+    // room is never larger than the fixed one.
+    assert(response.body_offset <= head_room);
+    assert(response.body_offset <= buffer.len);
+    assert(response.body_len <= buffer.len - response.body_offset);
+    try checkHeaders(buffer, response.headers);
+
+    // The head's length is known only once it is written, so write it at the front of the
+    // room, then move it up against the body. The two ranges may overlap: @memmove.
+    const room = buffer[0..response.body_offset];
+    var out: Cursor = .{ .buffer = room };
+    try out.appendHead(response.status, response.headers, response.close, response.body_len);
+    const head_start: u32 = response.body_offset - out.len;
+    @memmove(buffer[head_start..response.body_offset], room[0..out.len]);
+
+    const sent_len: u32 = if (response.omit_body) 0 else response.body_len;
+    const result = buffer[head_start .. response.body_offset + sent_len];
+    assert(std.mem.startsWith(u8, result, "HTTP/1.1 "));
+    assert(std.mem.endsWith(u8, buffer[head_start..response.body_offset], "\r\n\r\n"));
+    return result;
 }
 
 /// Checks the handler's header fields: their count, lengths, names and values.
@@ -229,6 +284,29 @@ const Cursor = struct {
         const count: u32 = @intCast(bytes.len);
         @memcpy(self.buffer[self.len..][0..count], bytes);
         self.len += count;
+    }
+
+    /// The status line, the handler's fields, Connection, Content-Length and the blank
+    /// line. The handler's fields were checked by `checkHeaders`.
+    fn appendHead(
+        self: *Cursor,
+        status: Status,
+        headers: []const Header,
+        close: bool,
+        body_len: u32,
+    ) Error!void {
+        assert(self.buffer.len <= size_max);
+        const start = self.len;
+        try self.append(statusLine(status));
+        for (headers) |field| {
+            try self.appendHeader(field.name, field.value);
+        }
+        if (close) try self.appendHeader("Connection", "close");
+        try self.append("Content-Length: ");
+        try self.appendDecimal(body_len);
+        try self.append("\r\n\r\n");
+        // The bytes written match a count made apart from the writing.
+        assert(self.len - start == headLength(status, headers, close, body_len));
     }
 
     fn appendHeader(self: *Cursor, name: []const u8, value: []const u8) Error!void {
@@ -278,6 +356,18 @@ fn decimalLength(value: u32) u32 {
     while (rest > 0 and length < decimal_digits_max) : (length += 1) rest /= 10;
     assert(rest == 0);
     assert(length == 1 or value >= 10);
+    return length;
+}
+
+/// The length of a head written by `Cursor.appendHead`, counted apart from it. A u64, so
+/// no sum of checked fields can overflow.
+fn headLength(status: Status, headers: []const Header, close: bool, body_len: u32) u64 {
+    assert(headers.len <= headers_max);
+    var length: u64 = statusLine(status).len;
+    for (headers) |field| length += field.name.len + ": ".len + field.value.len + "\r\n".len;
+    if (close) length += "Connection: close\r\n".len;
+    length += "Content-Length: ".len + decimalLength(body_len) + "\r\n\r\n".len;
+    assert(length >= "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".len);
     return length;
 }
 
@@ -671,4 +761,104 @@ test "http_response: refused requests from the parser become complete responses"
         try testing.expect(std.mem.startsWith(u8, buffer[0..len], case.response));
         try testing.expect(std.mem.endsWith(u8, buffer[0..len], tail));
     }
+}
+
+test "http_response: in place gives write's bytes as one slice that ends with the body" {
+    const headers = [_]Header{
+        .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+        .{ .name = "Cache-Control", .value = "no-store" },
+    };
+    const long: [1000]u8 = @splat('7');
+    const bodies = [_][]const u8{ "", "x", "<p>hi</p>", &long };
+    var buffer: [head_room + 1024]u8 = undefined;
+    var copy: [1200]u8 = undefined;
+    for (bodies) |body| {
+        for ([_]bool{ false, true }) |close| {
+            for ([_]bool{ false, true }) |omit_body| {
+                @memset(&buffer, 0xaa);
+                @memcpy(buffer[head_room..][0..body.len], body);
+                // The default offset is the room every page keeps.
+                const slice = try writeInPlace(&buffer, .{
+                    .status = .ok,
+                    .headers = &headers,
+                    .body_len = @intCast(body.len),
+                    .omit_body = omit_body,
+                    .close = close,
+                });
+                const len = try write(&copy, .{
+                    .status = .ok,
+                    .headers = &headers,
+                    .body = body,
+                    .omit_body = omit_body,
+                    .close = close,
+                });
+                try testing.expectEqualStrings(copy[0..len], slice);
+                // One slice of the buffer, ending where the body ends (the head, for a HEAD).
+                const end: usize = head_room + if (omit_body) 0 else body.len;
+                try testing.expectEqual(@intFromPtr(&buffer) + end, @intFromPtr(slice.ptr) + slice.len);
+                // The body and every byte after it are untouched.
+                try testing.expectEqualStrings(body, buffer[head_room..][0..body.len]);
+                for (buffer[head_room + body.len ..]) |byte| try testing.expectEqual(@as(u8, 0xaa), byte);
+            }
+        }
+    }
+}
+
+test "http_response: an in-place head fits its room exactly, and any smaller room is refused" {
+    const head = "HTTP/1.1 404 Not Found\r\nX-A: b\r\nConnection: close\r\nContent-Length: 4\r\n\r\n";
+    const response: InPlace = .{
+        .status = .not_found,
+        .headers = &.{.{ .name = "X-A", .value = "b" }},
+        .body_offset = head.len,
+        .body_len = 4,
+        .close = true,
+    };
+    var buffer: [head.len + 4]u8 = undefined;
+    @memcpy(buffer[head.len..], "body");
+    const slice = try writeInPlace(&buffer, response);
+    try testing.expectEqualStrings(head ++ "body", slice);
+    try testing.expectEqual(@intFromPtr(&buffer), @intFromPtr(slice.ptr));
+    // Every room shorter than the head is refused, and the body is left as it was.
+    var room: u32 = 0;
+    while (room < head.len) : (room += 1) {
+        @memcpy(buffer[room..][0..4], "body");
+        var short = response;
+        short.body_offset = room;
+        try testing.expectError(error.ResponseTooLarge, writeInPlace(buffer[0 .. room + 4], short));
+        try testing.expectEqualStrings("body", buffer[room..][0..4]);
+    }
+    try testing.expectEqual(@as(u32, head.len), room);
+}
+
+test "http_response: in place refuses bad fields as write does, before writing anything" {
+    var fields: [headers_max + 1]Header = undefined;
+    @memset(&fields, .{ .name = "X-A", .value = "b" });
+    @memset(&full_body, 'y');
+    const cases = [_]struct { headers: []const Header, expected: Error }{
+        .{ .headers = &fields, .expected = error.HeadersTooMany },
+        .{ .headers = &.{.{ .name = "Bad Name", .value = "v" }}, .expected = error.HeaderNameInvalid },
+        .{ .headers = &.{.{ .name = "Content-Length", .value = "5" }}, .expected = error.HeaderReserved },
+        .{ .headers = &.{.{ .name = "X-A", .value = "a\r\nb" }}, .expected = error.HeaderValueInvalid },
+        .{ .headers = &.{.{ .name = "X-A", .value = &full_body }}, .expected = error.ResponseTooLarge },
+    };
+    for (cases) |case| {
+        var buffer: [head_room + 8]u8 = @splat(0xaa);
+        const response: InPlace = .{ .status = .ok, .headers = case.headers, .body_len = 8 };
+        try testing.expectError(case.expected, writeInPlace(&buffer, response));
+        try testing.expectEqualSlices(u8, &@as([head_room + 8]u8, @splat(0xaa)), &buffer);
+        var copy: [64]u8 = undefined;
+        try testing.expectError(case.expected, write(&copy, .{ .status = .ok, .headers = case.headers }));
+    }
+}
+
+test "http_response: an in-place body may fill a whole response buffer after the room" {
+    const head = "HTTP/1.1 200 OK\r\nContent-Length: 1044480\r\n\r\n";
+    const body_len: u32 = size_max - head_room;
+    try testing.expectEqual(@as(u32, 1044480), body_len);
+    @memset(full_buffer[head_room..], 'z');
+    const slice = try writeInPlace(&full_buffer, .{ .status = .ok, .body_len = body_len });
+    try testing.expectEqual(head.len + body_len, slice.len);
+    try testing.expectEqualStrings(head, slice[0..head.len]);
+    try testing.expectEqual(@intFromPtr(&full_buffer) + size_max, @intFromPtr(slice.ptr) + slice.len);
+    try testing.expect(std.mem.allEqual(u8, slice[head.len..], 'z'));
 }

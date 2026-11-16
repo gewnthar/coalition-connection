@@ -19,6 +19,7 @@
 //!   http_headers_max
 //!   http_response_size_max
 //!   http_response_headers_max
+//!   http_response_head_room
 //!   http_response_buffers_max
 //!   websocket_connections_max
 //!   websocket_message_size_max
