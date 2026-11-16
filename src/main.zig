@@ -630,6 +630,8 @@ fn childStartRaisesLimitAndClosesInherited() u8 {
     if (linux.errno(memory_rc) != .SUCCESS) return child_setup_failed;
     const written = linux.write(@intCast(memory_rc), child_config, child_config.len);
     if (linux.errno(written) != .SUCCESS or written != child_config.len) return child_setup_failed;
+    // A memfd starts 0777, and the config refuses a file others may write.
+    if (linux.errno(linux.fchmod(@intCast(memory_rc), 0o600)) != .SUCCESS) return child_setup_failed;
     if (linux.errno(linux.dup2(@intCast(memory_rc), linux.STDIN_FILENO)) != .SUCCESS) return child_setup_failed;
     // memory_rc itself stays open: one more inherited descriptor startup must close.
     const inherited: linux.fd_t = @intCast(memory_rc);

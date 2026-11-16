@@ -76,7 +76,7 @@ const server_refusals = [_]ServerRefusal{
 };
 
 /// The server program, installed by the default step. `zig build test` runs its tests, then
-/// starts it with docs/config.example.zon, where it must print its version line and
+/// starts it with a 0600 copy of docs/config.example.zon (tools/private_copy.zig), where it must print its version line and
 /// nothing else, and with each command line in `server_refusals`.
 fn addServer(
     b: *std.Build,
@@ -109,7 +109,7 @@ fn addServer(
     const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = module }));
     test_step.dependOn(&run_tests.step);
     const run = b.addRunArtifact(exe);
-    run.addFileArg(b.path("docs/config.example.zon"));
+    run.addFileArg(privateCopy(b, "docs/config.example.zon"));
     run.expectExitCode(0);
     run.expectStdOutEqual("coalition-connection " ++ package.version ++ "\n");
     // Checking stderr also captures it: a clean start logs nothing.
@@ -131,6 +131,27 @@ fn addServer(
         test_step.dependOn(&refused.step);
     }
     assert(test_step.dependencies.items.len == dependencies_before + 2 + server_refusals.len);
+}
+
+/// A copy of the file at `path`, mode 0600, made by tools/private_copy.zig when the build
+/// runs. The server refuses a config its group or others may write, and a checkout under
+/// umask 002 leaves a file 0664, so a start test reads a private copy instead.
+fn privateCopy(b: *std.Build, path: []const u8) std.Build.LazyPath {
+    assert(path.len > 0);
+    assert(std.mem.endsWith(u8, path, ".zon"));
+    const tool = b.addExecutable(.{
+        .name = "private_copy",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/private_copy.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
+    });
+    const copy = b.addRunArtifact(tool);
+    copy.addFileArg(b.path(path));
+    const copied = copy.addOutputFileArg(std.fs.path.basename(path));
+    copy.expectExitCode(0);
+    return copied;
 }
 
 const Runner = struct {

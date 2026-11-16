@@ -84,7 +84,7 @@ is not accepted.
 Install the Zig version CI pins, then run what CI runs, from the repository root:
 
 ```sh
-zig fmt --check build.zig src fuzz sim   # formatting (zig fmt ... without --check fixes it)
+zig fmt --check build.zig src fuzz sim tools   # formatting (zig fmt ... without --check fixes it)
 zig build --release=safe                 # ReleaseSafe build, zero warnings
 zig build test                           # unit tests in Debug
 zig build test --release=safe            # unit tests in ReleaseSafe
