@@ -94,6 +94,15 @@ pub const http_response_size_max: u32 = 1024 * 1024;
 /// caching, cookies, security headers); 32 bounds the writer's loop with room to spare.
 pub const http_response_headers_max: u32 = 32;
 
+/// Bytes kept at the front of a response buffer for the head of a page rendered in place:
+/// the page's body starts this far in, and the response writer writes the head so that it
+/// ends where the body starts, with no copy of the body. Reason: the status line and the
+/// writer's own fields take at most 113 bytes, and a page's fields (type, caching, a
+/// cookie and security headers such as a Content-Security-Policy) run to about 1 KiB, so
+/// 4 KiB leaves headroom at 0.4% of a buffer. A head longer than this is refused with a
+/// named error, never truncated. Provisional.
+pub const http_response_head_room: u32 = 4 * 1024;
+
 /// Response buffers, each `http_response_size_max` bytes, shared by all connections.
 /// Reason: a connection holds one only while it renders a page and writes it to nginx on
 /// the local socket, and nginx buffers responses for slow clients, so a buffer is back in
@@ -418,6 +427,9 @@ comptime {
     assert(http_headers_max * 4 < http_request_size_max);
     assert(websocket_message_size_max <= http_response_size_max);
     assert(http_response_headers_max > 0);
+    // The head room is a small part of a buffer, so a page keeps nearly all of it.
+    assert(http_response_head_room > 0);
+    assert(http_response_head_room <= http_response_size_max / 64);
     assert(esi_error_limit_floor > 0);
     assert(esi_retries_max > 0);
     assert(sim_fault_percent_max < 100);

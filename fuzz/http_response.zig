@@ -1,7 +1,10 @@
-//! Fuzz target for the HTTP response writer (`cc.live.http_response.write`).
+//! Fuzz target for the HTTP response writer's two entry points
+//! (`cc.live.http_response.write` and `writeInPlace`).
 //!
 //! Each iteration generates a response (status, header fields, body, `omit_body`, `close`)
-//! and a buffer length, then checks `write` against a model kept here. The token and value
+//! and a buffer length, then checks `write` against a model kept here. It then renders the
+//! same body into a buffer after a room for the head and checks `writeInPlace` against the
+//! same model. The token and value
 //! grammar and the decimal formatting (std.fmt) are written apart from the writer's. The
 //! status table and the reserved-name list are a second copy of RFC 9110 (sections 15 and
 //! 7.6.1), checked by hand against it: a mistake shared with the writer's copy would not be
@@ -18,11 +21,18 @@
 //! The bytes after the buffer are also checked, as defence in depth: `write` gets a slice,
 //! so in a safe build a write past it panics first.
 //!
+//! What a pass proves for `writeInPlace`, every iteration: the outcome is the model's (the
+//! same field checks in the same order, then the head against the room before the body);
+//! the body and every byte after it never change; a field error changes nothing at all; and
+//! a success returns one slice of the buffer holding exactly the model's bytes, ending
+//! where the body ends (where the head ends, for `omit_body`).
+//!
 //! The run fails with `error.LimitMissed` unless every outcome, every pair of name and value
 //! faults deciding an outcome, every Content-Length digit count from 1 to 7, and every limit
 //! came up: exactly `http_response_headers_max` fields and one more, a buffer of the exact
 //! length and one byte short, a response filling a whole response buffer and one byte over,
-//! and a HEAD response whose body is larger than the buffer.
+//! and a HEAD response whose body is larger than the buffer; and, in place, every outcome,
+//! a room of exactly the head's length, one byte short, and the default room.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -116,6 +126,15 @@ const Limit = enum(u8) {
     omit_body_larger_than_buffer,
 };
 
+/// What `writeInPlace` returned.
+const InPlaceOutcome = enum(u8) { success, field_error, head_too_large };
+
+/// The room an in-place case leaves before its body.
+const Room = enum(u8) { exact, one_short, slack, default };
+
+/// Extra bytes a slack room may have past the head's length.
+const room_slack_max: u32 = 64;
+
 /// The model's prediction for one case.
 const Prediction = struct {
     outcome: Outcome,
@@ -132,6 +151,15 @@ const Counts = struct {
     pairs: [name_faults.len][value_faults.len]u32 = @splat(@splat(0)),
     /// Successes by Content-Length digit count, 1 to `digits_max`.
     digits: [digits_max]u32 = @splat(0),
+    /// `writeInPlace` outcomes, and [room][outcome] for the cases whose fields passed.
+    in_place: [std.enums.values(InPlaceOutcome).len]u32 = @splat(0),
+    /// [room][fits] for the in-place cases whose fields passed: fits is 1 for a success,
+    /// 0 for a head too large for its room.
+    rooms: [std.enums.values(Room).len][2]u32 = @splat(@splat(0)),
+    /// In-place successes whose body ends exactly at the buffer's end, and those that
+    /// fill a whole response buffer.
+    body_at_end: u32 = 0,
+    full_buffer: u32 = 0,
 
     fn total(self: *const Counts) u64 {
         var sum: u64 = 0;
@@ -149,6 +177,12 @@ const Counts = struct {
         for (self.outcomes) |count| if (count == 0) return false;
         for (self.limits[1..]) |count| if (count == 0) return false;
         for (self.digits) |count| if (count == 0) return false;
+        for (self.in_place) |count| if (count == 0) return false;
+        // An exact room that fits, one byte less that doesn't, and the default room.
+        if (self.rooms[@backingInt(Room.exact)][1] == 0) return false;
+        if (self.rooms[@backingInt(Room.one_short)][0] == 0) return false;
+        if (self.rooms[@backingInt(Room.default)][1] == 0) return false;
+        if (self.body_at_end == 0 or self.full_buffer == 0) return false;
         for (self.pairs, 0..) |row, name| {
             for (row) |count| if (count == 0) return false;
             assert(name < name_faults.len);
@@ -232,6 +266,16 @@ fn modelIsReserved(name: []const u8) bool {
 fn modelEarly(response: writer.Response, buffer_len: u32) ?Prediction {
     assert(buffer_len <= size_max);
     assert(response.headers.len <= fields_generated_max);
+    if (modelFields(response)) |prediction| return prediction;
+    const sent_len: u64 = if (response.omit_body) 0 else response.body.len;
+    if (response.body.len > size_max or sent_len > buffer_len) return .{ .outcome = .body_too_large };
+    return null;
+}
+
+/// The outcome of the field checks both entry points make first, or null if they pass.
+fn modelFields(response: writer.Response) ?Prediction {
+    assert(response.headers.len <= fields_generated_max);
+    assert(response.body.len <= size_max + 1);
     if (response.headers.len > fields_max) return .{ .outcome = .fields_too_many };
     for (response.headers, 0..) |field, index| {
         const at: u32 = @intCast(index);
@@ -242,8 +286,6 @@ fn modelEarly(response: writer.Response, buffer_len: u32) ?Prediction {
         if (modelIsReserved(field.name)) return .{ .outcome = .reserved, .field = at };
         if (!modelIsValue(field.value)) return .{ .outcome = .value_invalid, .field = at };
     }
-    const sent_len: u64 = if (response.omit_body) 0 else response.body.len;
-    if (response.body.len > size_max or sent_len > buffer_len) return .{ .outcome = .body_too_large };
     return null;
 }
 
@@ -652,6 +694,102 @@ fn check(random: std.Random, case: *const Case, counts: *Counts) Error!void {
     counts.limits[@backingInt(limitOf(case, prediction))] += 1;
 }
 
+/// The room before the body, the body's length and the buffer's length for an in-place
+/// case: the room the head needs, one byte less, a little more, or the default; the body
+/// cut short if it would not fit after the room.
+const InPlaceShape = struct { room: Room, offset: u32, body_len: u32, buffer_len: u32 };
+
+fn inPlaceShape(random: std.Random, response: writer.Response, fields_pass: bool) InPlaceShape {
+    assert(response.body.len <= size_max + 1);
+    assert(fields_pass == (modelFields(response) == null));
+    const room = std.enums.values(Room)[random.uintLessThan(u32, std.enums.values(Room).len)];
+    // The head's length; for fields that fail, any room will do.
+    const head: u64 = if (fields_pass) modelLength(.{
+        .status = response.status,
+        .headers = response.headers,
+        .body = response.body,
+        .omit_body = true,
+        .close = response.close,
+    }) else 1 + random.uintLessThan(u32, writer.head_room);
+    // Every head the generator builds fits the default room, which the writer requires.
+    assert(head <= writer.head_room);
+    const offset: u32 = @intCast(@min(size_max, switch (room) {
+        .exact => head,
+        .one_short => head - 1,
+        .slack => @min(writer.head_room, head + random.uintLessThan(u32, room_slack_max + 1)),
+        .default => writer.head_room,
+    }));
+    const body_len: u32 = @intCast(@min(response.body.len, size_max - offset));
+    // A body is cut only to end a whole buffer, and the cut keeps its digit count, so the
+    // head counted from the uncut body is the head written.
+    assert(body_len == response.body.len or offset + body_len == size_max);
+    assert(digitCount(body_len) == digitCount(response.body.len));
+    // No slack in one case of four, so a body often ends exactly at the buffer's end.
+    const slack = if (random.uintLessThan(u32, 4) == 0) 0 else random.uintLessThan(u32, buffer_slack_max + 1);
+    const buffer_len: u32 = @min(size_max, offset + body_len + slack);
+    return .{ .room = room, .offset = offset, .body_len = body_len, .buffer_len = buffer_len };
+}
+
+/// Runs `writeInPlace` on the case's response, its body rendered after a room for the
+/// head, and compares it with the model.
+fn checkInPlace(random: std.Random, case: *const Case, counts: *Counts) Error!void {
+    assert(case.response.headers.len <= fields_generated_max);
+    assert(case.response.body.len <= size_max + 1);
+    const field_check = modelFields(case.response);
+    const fields_pass = field_check == null;
+    const shape = inPlaceShape(random, case.response, fields_pass);
+    var response = case.response;
+    response.body = response.body[0..shape.body_len];
+    const seed = random.int(u8);
+    const end = shape.buffer_len + guard_bytes;
+    for (out_backing[0..end], 0..) |*byte, index| byte.* = pattern(seed, @intCast(index));
+    @memcpy(out_backing[shape.offset..][0..shape.body_len], response.body);
+
+    const result = writer.writeInPlace(out_backing[0..shape.buffer_len], .{
+        .status = response.status,
+        .headers = response.headers,
+        .body_offset = shape.offset,
+        .body_len = shape.body_len,
+        .omit_body = response.omit_body,
+        .close = response.close,
+    });
+    const body_end = shape.offset + shape.body_len;
+    if (!std.mem.eql(u8, out_backing[shape.offset..body_end], response.body)) return error.Mismatch;
+    if (!holdsPattern(seed, body_end, end)) return error.Mismatch;
+    const head_len: u64 = if (fields_pass) modelLength(response) - (if (response.omit_body) 0 else shape.body_len) else 0;
+    const expected: InPlaceOutcome = if (!fields_pass) .field_error else if (head_len <= shape.offset) .success else .head_too_large;
+    const outcome: InPlaceOutcome = if (result) |_| .success else |err| switch (err) {
+        error.ResponseTooLarge => if (fields_pass) .head_too_large else .field_error,
+        error.HeadersTooMany, error.HeaderNameInvalid, error.HeaderValueInvalid, error.HeaderReserved => .field_error,
+    };
+    if (outcome != expected) return error.Mismatch;
+    if (result) |slice| {
+        try checkInPlaceSlice(slice, response, shape, @intCast(head_len));
+        counts.body_at_end += @intFromBool(body_end == shape.buffer_len);
+        counts.full_buffer += @intFromBool(body_end == size_max);
+    } else |err| {
+        if (field_check) |prediction| {
+            // The same field gives the same error as in `write`, before anything is written.
+            if (outcomeOf(err, prediction) != prediction.outcome) return error.Mismatch;
+            if (!holdsPattern(seed, 0, shape.offset)) return error.Mismatch;
+        }
+    }
+    counts.in_place[@backingInt(outcome)] += 1;
+    if (fields_pass) counts.rooms[@backingInt(shape.room)][@intFromBool(outcome == .success)] += 1;
+}
+
+/// A successful in-place slice: the model's bytes, starting where the head must start
+/// and ending where the body (or, for `omit_body`, the head) ends.
+fn checkInPlaceSlice(slice: []const u8, response: writer.Response, shape: InPlaceShape, head_len: u32) Error!void {
+    assert(head_len <= shape.offset);
+    assert(shape.offset + shape.body_len <= shape.buffer_len);
+    const length: u32 = @intCast(modelLength(response));
+    const start = @intFromPtr(&out_backing) + shape.offset - head_len;
+    if (@intFromPtr(slice.ptr) != start or slice.len != length) return error.Mismatch;
+    modelWrite(response, length);
+    if (!std.mem.eql(u8, slice, model_bytes[0..length])) return error.Mismatch;
+}
+
 fn report(counts: *const Counts, seed: u64) void {
     const total = counts.total();
     assert(total == cc.constants.fuzz_iterations_max);
@@ -665,6 +803,11 @@ fn report(counts: *const Counts, seed: u64) void {
         for (row) |count| pairs_min = @min(pairs_min, count);
     }
     std.debug.print("  fewest cases for one name and value fault pair: {d}\n", .{pairs_min});
+    std.debug.print("  in place:", .{});
+    for (std.enums.values(InPlaceOutcome), counts.in_place) |outcome, count| std.debug.print("  {t}={d}", .{ outcome, count });
+    std.debug.print("\n  in-place rooms [head_too_large, success]:", .{});
+    for (std.enums.values(Room), counts.rooms) |room, row| std.debug.print("  {t}={any}", .{ room, row });
+    std.debug.print("\n  in place, body at the buffer's end={d} whole buffer={d}\n", .{ counts.body_at_end, counts.full_buffer });
     assert(pairs_min <= total);
 }
 
@@ -702,11 +845,15 @@ pub fn run(seed: u64) Error!void {
             std.debug.print("fuzz http_response: seed={d} failed at iteration {d}\n", .{ seed, iteration });
             return err;
         };
+        checkInPlace(random, &case, &counts) catch |err| {
+            std.debug.print("fuzz http_response: seed={d} writeInPlace failed at iteration {d}\n", .{ seed, iteration });
+            return err;
+        };
         assert(counts.total() == iteration + 1);
     }
     report(&counts, seed);
     if (!counts.reachedAll()) {
-        std.debug.print("fuzz http_response: seed={d} missed an outcome, fault pair, digit count or limit\n", .{seed});
+        std.debug.print("fuzz http_response: seed={d} missed an outcome, fault pair, digit count, limit or room\n", .{seed});
         return error.LimitMissed;
     }
     std.debug.print("fuzz http_response: seed={d} iterations={d} ok\n", .{ seed, iteration });
