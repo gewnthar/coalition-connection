@@ -250,8 +250,9 @@ pub const listener_bind_attempts_max: u32 = 2;
 
 /// Permission bits of the local listener's socket file. Reason: connecting to a Unix socket
 /// needs write permission on the file, so the server's user and its group may connect and
-/// nobody else; nginx connects through the group the pod's units give it. Set explicitly,
-/// not left to the umask. Provisional: the nginx unit (roadmap core 48) confirms it.
+/// nobody else; nginx connects through the group the pod's units give it. The socket file
+/// is created with exactly these bits, whatever the process umask, and refused if it ends
+/// up with any other. Provisional: the nginx unit (roadmap core 48) confirms it.
 pub const listener_socket_mode: u32 = 0o660;
 
 // ---- Open files ----------------------------------------------------------------------
