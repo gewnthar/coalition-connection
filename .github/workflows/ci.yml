@@ -63,7 +63,7 @@ jobs:
         run: test "$(zig version)" = "$ZIG_VERSION"
 
       - name: zig fmt
-        run: zig fmt --check build.zig src fuzz sim
+        run: zig fmt --check build.zig src fuzz sim tools
 
       - name: ReleaseSafe build
         run: zig build --release=safe
