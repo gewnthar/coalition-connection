@@ -57,6 +57,18 @@
 //! kernel refuses one, they fail with the setup code, never pass. `real_init_running` trips
 //! before the ring is set up, so it runs either way.
 //!
+//! For the simulator, the table is attached as the server's loop will attach it, and each
+//! case makes one send. The sends a case must refuse are the ones the real type refuses,
+//! by the same table checks: the reused entry's first id (in use, but under the next
+//! generation), the free entry under its current generation, and an index past the table
+//! but far below the simulator's own index limit. The stale send is also tried with every
+//! slot in use, where the peer must be checked before the queue, or the call returns
+//! QueueFull instead of tripping. A send on a simulator with no table attached must trip
+//! too, or a send could skip every one of those checks, and so must a send whose id is
+//! already in flight, even with every slot in use. On the completion side, a send whose
+//! entry was released under it (the harness clears the count by hand to get there) must
+//! stop when it completes. The controls send to the entry in use.
+//!
 //! For the response writer, the buffer is cut from the middle of a larger array, so a field
 //! can sit inside it, across one of its edges, right next to it, or in neither. `write`
 //! checks the body and each header field before writing anything, and its copy checks
@@ -74,6 +86,10 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const cc = @import("coalition_connection");
 const trip = @import("startup_trip_cases.zig");
+
+/// Lets the simulator cases use `io.sim.Sim`; see src/io/sim.zig. This harness is a test
+/// program, built only by `zig build test`, never installed.
+pub const io_simulation = true;
 
 const exit_early_panic: u8 = 1;
 const exit_not_tripped: u8 = 2;
@@ -107,6 +123,7 @@ comptime {
         },
         .connection_table => |call| assert(c.trips != tableCallAllowed(call)),
         .real_io => |call| assert(c.trips != realCallAllowed(call)),
+        .sim_io => |call| assert(c.trips != simCallAllowed(call)),
         .http_response => |call| assert(c.trips != responseCallAllowed(call)),
     };
 }
@@ -215,6 +232,7 @@ comptime {
     assert(2 * setup_len <= budget_bytes);
     assert(trip.table_size * cc.live.connections.entry_bytes <= budget_bytes);
     assert(trip.real_table_size * cc.live.connections.entry_bytes <= budget_bytes);
+    assert(trip.sim_table_size * cc.live.connections.entry_bytes <= budget_bytes);
     assert(budget_bytes + 2 * @alignOf(cc.live.connections.Entry) <= backing_len);
     assert(@TypeOf(trip.socket_base) == cc.live.connections.Socket);
 }
@@ -240,6 +258,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         .startup_allocator => |on| runAllocatorCase(&startup, &fixed, on.phase, on.call, case),
         .connection_table => |call| runTableCase(&startup, call, case),
         .real_io => |call| runRealCase(&startup, call, case),
+        .sim_io => |call| runSimCase(&startup, call, case),
         .http_response => |call| runResponseCase(&startup, call, case),
     }
 }
@@ -427,6 +446,9 @@ fn tableCallAllowed(call: trip.TableCall) bool {
         .get_stale,
         .set_state_stale,
         .get_stale_top_bit,
+        .send_completed_stale,
+        .send_completed_free,
+        .send_completed_uncounted,
         => false,
     };
     // Every allowed call names an entry in use under its live generation; every forbidden
@@ -434,7 +456,7 @@ fn tableCallAllowed(call: trip.TableCall) bool {
     const parts: connections.IdParts = @bitCast(tableCallId(call));
     const live = parts.index < trip.table_size and parts.index != trip.free_id and
         parts.generation == live_generation;
-    assert(allowed == (live and call != .set_state_to_free));
+    assert(allowed == (live and call != .set_state_to_free and call != .send_completed_uncounted));
     return allowed;
 }
 
@@ -444,7 +466,8 @@ const live_generation: connections.Generation = 0;
 /// The entry index the call names.
 fn tableCallIndex(call: trip.TableCall) u32 {
     const index: u32 = switch (call) {
-        .release_free, .get_free, .set_state_free => trip.free_id,
+        .release_free, .get_free, .set_state_free, .send_completed_free => trip.free_id,
+        .send_completed_stale, .send_completed_uncounted => trip.reading_id,
         .release_free_stale_socket, .get_free_stale_socket => trip.free_id,
         .release_out_of_range, .get_out_of_range, .set_state_out_of_range => trip.table_size,
         .lookup_out_of_range => trip.table_size,
@@ -474,7 +497,7 @@ const generation_top_bit: connections.Generation =
 /// can stop them, and it must compare every bit.
 fn tableCallId(call: trip.TableCall) connections.PeerId {
     const stale = call == .release_stale or call == .get_stale or call == .set_state_stale or
-        call == .get_stale_top_bit;
+        call == .get_stale_top_bit or call == .send_completed_stale;
     const index = tableCallIndex(call);
     const generation: connections.Generation = if (call == .get_stale_top_bit)
         live_generation ^ generation_top_bit
@@ -534,6 +557,11 @@ fn runTableCase(startup: *cc.StartupAllocator, call: trip.TableCall, case: trip.
         // A valid-looking socket in a free entry, as a stale field would leave.
         table.entries[trip.free_id].socket = socketOf(trip.free_id);
     }
+    if (call == .send_completed_stale or call == .send_completed_free) {
+        // A send counted on the entry the id names, so the count check passes and only the
+        // id checks can stop the call.
+        table.entries[tableCallIndex(call)].sends_in_flight = 1;
+    }
     var before: [trip.table_size]Entry = undefined;
     @memcpy(&before, table.entries);
 
@@ -592,6 +620,10 @@ fn callTable(table: *connections.Table, call: trip.TableCall) connections.Socket
         .set_state_to_reading => state: {
             table.setState(id, .reading);
             break :state -1;
+        },
+        .send_completed_stale, .send_completed_free, .send_completed_uncounted => completed: {
+            table.sendCompleted(id);
+            break :completed -1;
         },
         .lookup_out_of_range, .lookup_index_max => lookup: {
             _ = table.lookup(id);
@@ -1289,4 +1321,295 @@ fn responseControlHeld(
     if (!std.mem.eql(u8, storage[response_margin..end], expected)) return false;
     if (!std.mem.eql(u8, storage[0..response_margin], before[0..response_margin])) return false;
     return std.mem.eql(u8, storage[end..], before[end..]);
+}
+
+const Sim = cc.io.sim.Sim;
+/// Any seed works: the simulator cases run at a zero fault rate, so every send completes
+/// in full whatever the seed draws.
+const sim_seed: u64 = 0x5eed;
+/// The bytes the simulator's send control sends.
+const sim_send_bytes = "startup_trip sim";
+
+/// Whether the simulator allows `call`: the controls, the two sends to the entry in use.
+/// The cases file says the same through each case's outcome, and the comptime block at the
+/// top checks the two agree.
+fn simCallAllowed(call: trip.SimCall) bool {
+    const allowed = switch (call) {
+        .send_peer, .send_queue_full => true,
+        .send_stale,
+        .send_free,
+        .send_out_of_range,
+        .send_stale_queue_full,
+        .send_no_table,
+        .send_duplicate_id_queue_full,
+        .complete_released,
+        => false,
+    };
+    // A case that names a dead peer is never allowed; the controls name the entry in use.
+    assert(!allowed or simCallPeer(call) == trip.sim_peer_index);
+    // Of the cases that fill every slot, only the queue-full control is allowed.
+    assert(!allowed or !simCallFillsSlots(call) or call == .send_queue_full);
+    return allowed;
+}
+
+/// The peer each case's send names. Every entry was handed out first under generation 0;
+/// the reused entry was released once and taken again, so its first id is stale, and the
+/// free entry was released once, so the id the next acquire would hand out carries
+/// generation 1.
+fn simCallPeer(call: trip.SimCall) cc.io.PeerId {
+    const peer: cc.io.PeerId = switch (call) {
+        .send_stale, .send_stale_queue_full => @bitCast(connections.IdParts{
+            .index = trip.sim_reused_index,
+            .generation = 0,
+        }),
+        .send_free => @bitCast(connections.IdParts{ .index = trip.sim_free_index, .generation = 1 }),
+        .send_out_of_range => trip.sim_table_size,
+        .send_peer,
+        .send_queue_full,
+        .send_no_table,
+        .send_duplicate_id_queue_full,
+        .complete_released,
+        => trip.sim_peer_index,
+    };
+    const parts: connections.IdParts = @bitCast(peer);
+    assert(parts.index <= trip.sim_table_size);
+    // Far below the simulator's own limit, so only the table's check can refuse it.
+    assert(parts.index < cc.constants.http_connections_max);
+    return peer;
+}
+
+/// Whether the case fills every slot before its call: one trip case and one control, which
+/// differ only in the peer they name.
+fn simCallFillsSlots(call: trip.SimCall) bool {
+    const fills = call == .send_stale_queue_full or call == .send_queue_full or
+        call == .send_duplicate_id_queue_full;
+    // Each filling case's send is a send, so the fill's slots are what it meets.
+    assert(!fills or call != .complete_released);
+    assert(!fills or simCallPeer(call) <= trip.sim_table_size);
+    return fills;
+}
+
+/// The fake socket each simulator entry holds. The simulator never touches a socket, so
+/// any distinct numbers do.
+fn simSocket(index: u32) connections.Socket {
+    assert(index < trip.sim_table_size);
+    return 10 + @as(connections.Socket, @intCast(index));
+}
+
+/// The state a simulator control's call must leave as it was, or change as it says.
+const SimBefore = struct {
+    entries: [trip.sim_table_size]Entry,
+    in_flight: u32,
+    submitted: u64,
+};
+
+/// Builds the `sim_table_size`-entry table during startup, ends startup, attaches the table
+/// to a simulator, prepares what the case needs (every slot filled, or an entry released
+/// under a send), and makes the case's one call.
+fn runSimCase(startup: *cc.StartupAllocator, call: trip.SimCall, case: trip.Case) noreturn {
+    assert(startup.bytes_live == 0);
+    assert(startup.phase == .startup);
+    var table = simTable(startup, case);
+    startup.finishStartup();
+    table.assertInvariants();
+    assert(table.count() == trip.sim_table_size - 1);
+    assert(table.entries[trip.sim_free_index].state == .free);
+
+    var sim = Sim.init(sim_seed, 0);
+    if (call != .send_no_table) sim.attachTable(&table);
+    if (simCallFillsSlots(call)) fillSim(&sim, case);
+    if (call == .complete_released) releaseUnderSend(&sim, &table, case);
+
+    var before: SimBefore = undefined;
+    @memcpy(&before.entries, table.entries);
+    before.in_flight = sim.in_flight;
+    before.submitted = sim.submitted;
+
+    child_calls_armed = child_calls;
+    armed = true;
+    const queue_full = callSim(&sim, call);
+    armed = false;
+
+    if (case.trips) {
+        std.debug.print("startup_trip: {s} returned without tripping: the check is missing\n", .{case.name});
+        std.process.exit(exit_not_tripped);
+    }
+    if (!simControlHeld(&sim, &table, &before, call, queue_full)) {
+        std.debug.print("startup_trip: {s} control failed: in flight={d} submitted={d} child calls={d}\n", .{
+            case.name, sim.in_flight, sim.submitted, child_calls - child_calls_armed,
+        });
+        std.process.exit(exit_control_failed);
+    }
+    std.process.exit(trip.exit_finished);
+}
+
+/// The simulator cases' table: every entry handed out under generation 0, then the reused
+/// entry released and taken straight back (the free stack hands back the entry released
+/// last) under generation 1, then the free entry released.
+fn simTable(startup: *cc.StartupAllocator, case: trip.Case) connections.Table {
+    assert(startup.phase == .startup);
+    var table = connections.Table.init(startup.allocator(), trip.sim_table_size) catch |err| switch (err) {
+        error.OutOfMemory => setupFailed(case, "could not allocate the table"),
+    };
+    var index: u32 = 0;
+    while (index < trip.sim_table_size) : (index += 1) {
+        const id = table.acquire(simSocket(index)) catch |err| switch (err) {
+            error.TableFull => setupFailed(case, "found the table full"),
+        };
+        assert(id == index);
+    }
+    assert(index == trip.sim_table_size);
+    // Nothing has been sent yet, so nothing holds either release back.
+    _ = table.release(trip.sim_reused_index) catch |err| switch (err) {
+        error.SendsInFlight => setupFailed(case, "found a send counted on the entry to reuse"),
+    };
+    const again = table.acquire(simSocket(trip.sim_reused_index)) catch |err| switch (err) {
+        error.TableFull => setupFailed(case, "found the table full on reuse"),
+    };
+    const parts: connections.IdParts = @bitCast(again);
+    assert(parts.index == trip.sim_reused_index and parts.generation == 1);
+    _ = table.release(trip.sim_free_index) catch |err| switch (err) {
+        error.SendsInFlight => setupFailed(case, "found a send counted on the entry to free"),
+    };
+    assert(table.count() == trip.sim_table_size - 1);
+    return table;
+}
+
+/// Puts a one-byte send to the entry in use in every slot, before the call.
+fn fillSim(sim: *Sim, case: trip.Case) void {
+    assert(!armed);
+    assert(sim.in_flight == 0);
+    var filled: u32 = 0;
+    while (filled < slots_max) : (filled += 1) {
+        const send: cc.io.Send = .{ .peer = trip.sim_peer_index, .bytes = &.{fill_byte} };
+        sim.submit(.{ .id = filled + 1, .operation = .{ .send = send } }) catch |err| switch (err) {
+            error.QueueFull => setupFailed(case, "the simulator filled early"),
+        };
+    }
+    assert(sim.in_flight == slots_max);
+}
+
+/// Sends to the entry in use, then clears the entry's count by hand and releases it, as a
+/// table that forgot the send would, and ticks until the send is due. The poll the case
+/// makes then completes a send whose entry is gone.
+fn releaseUnderSend(sim: *Sim, table: *connections.Table, case: trip.Case) void {
+    assert(!armed);
+    assert(sim.in_flight == 0);
+    const send: cc.io.Send = .{ .peer = trip.sim_peer_index, .bytes = sim_send_bytes };
+    sim.submit(.{ .id = send_peer_id, .operation = .{ .send = send } }) catch |err| switch (err) {
+        error.QueueFull => setupFailed(case, "the simulator was full"),
+    };
+    table.entries[trip.sim_peer_index].sends_in_flight = 0;
+    _ = table.release(trip.sim_peer_index) catch |err| switch (err) {
+        error.SendsInFlight => setupFailed(case, "the cleared entry still refused to release"),
+    };
+    var ticks: u32 = 0;
+    while (ticks <= cc.constants.sim_completion_delay_ticks_max) : (ticks += 1) sim.tick();
+    assert(sim.in_flight == 1);
+    assert(table.lookup(trip.sim_peer_index) == null);
+}
+
+/// Makes the case's one call, a send or (for `complete_released`) a poll; nothing else
+/// runs while `armed` is set. Returns whether the simulator refused a send with QueueFull.
+fn callSim(sim: *Sim, call: trip.SimCall) bool {
+    assert(armed);
+    assert(child_calls == child_calls_armed);
+    if (call == .complete_released) {
+        var completions: [1]cc.io.Completion = undefined;
+        _ = sim.poll(&completions);
+        return false;
+    }
+    // The duplicate case reuses the first fill send's id, which is still in flight.
+    const id: cc.io.OperationId = if (call == .send_duplicate_id_queue_full) 1 else send_peer_id;
+    const send: cc.io.Send = .{ .peer = simCallPeer(call), .bytes = sim_send_bytes };
+    sim.submit(.{ .id = id, .operation = .{ .send = send } }) catch |err| switch (err) {
+        error.QueueFull => return true,
+    };
+    return false;
+}
+
+/// A control's send must touch no allocator and change no entry but its peer's count. The
+/// send control's send is counted, the entry refuses to release meanwhile and changes
+/// nothing, and the send completes under its id with every byte, uncounted. The queue-full
+/// control returns QueueFull with nothing changed, and every send already in flight still
+/// completes once, under its id, with its byte.
+fn simControlHeld(
+    sim: *Sim,
+    table: *connections.Table,
+    before: *const SimBefore,
+    call: trip.SimCall,
+    queue_full: bool,
+) bool {
+    assert(!armed);
+    assert(simCallAllowed(call));
+    if (child_calls != child_calls_armed) return false;
+    const peer = simCallPeer(call);
+    for (table.entries, before.entries, 0..) |entry, entry_before, index| {
+        var expected = entry_before;
+        if (call == .send_peer and index == trip.sim_peer_index) expected.sends_in_flight += 1;
+        if (!std.meta.eql(entry, expected)) return false;
+    }
+    switch (call) {
+        .send_peer => {
+            if (queue_full) return false;
+            if (sim.submitted != before.submitted + 1 or sim.in_flight != 1) return false;
+            const held = table.get(peer).*;
+            if (table.release(peer)) |_| return false else |err| switch (err) {
+                error.SendsInFlight => {},
+            }
+            if (!std.meta.eql(held, table.get(peer).*)) return false;
+            var completions: [1]cc.io.Completion = undefined;
+            if (drainSim(sim, &completions) != 1) return false;
+            if (completions[0].id != send_peer_id) return false;
+            const sent = switch (completions[0].result) {
+                .send => |sent| sent catch return false,
+                .execute, .accept => return false,
+            };
+            if (sent != sim_send_bytes.len) return false;
+        },
+        .send_queue_full => {
+            if (!queue_full) return false;
+            if (sim.in_flight != before.in_flight or sim.submitted != before.submitted) return false;
+            var completions: [slots_max]cc.io.Completion = undefined;
+            if (drainSim(sim, &completions) != slots_max) return false;
+            var seen: [slots_max]bool = @splat(false);
+            for (completions) |completion| {
+                if (completion.id == 0 or completion.id > slots_max) return false;
+                const index: u32 = @intCast(completion.id - 1);
+                if (seen[index]) return false;
+                seen[index] = true;
+                const sent = switch (completion.result) {
+                    .send => |sent| sent catch return false,
+                    .execute, .accept => return false,
+                };
+                if (sent != 1) return false;
+            }
+        },
+        .send_stale,
+        .send_free,
+        .send_out_of_range,
+        .send_stale_queue_full,
+        .send_no_table,
+        .send_duplicate_id_queue_full,
+        .complete_released,
+        => unreachable, // Asserted allowed above.
+    }
+    // Every send has completed and been uncounted on its entry.
+    if (table.get(peer).sends_in_flight != 0) return false;
+    return sim.in_flight == 0 and sim.completed == sim.submitted;
+}
+
+/// Ticks past the longest delay, taking each tick's completions, so everything in flight
+/// arrives. Returns how many came back.
+fn drainSim(sim: *Sim, completions: []cc.io.Completion) u32 {
+    assert(!armed);
+    assert(sim.in_flight <= completions.len);
+    var count: u32 = 0;
+    var ticks: u32 = 0;
+    while (ticks <= cc.constants.sim_completion_delay_ticks_max) : (ticks += 1) {
+        sim.tick();
+        if (count < completions.len) count += sim.poll(completions[count..]);
+    }
+    assert(count <= completions.len);
+    return count;
 }
