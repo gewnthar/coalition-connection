@@ -754,7 +754,7 @@ const ConfigCounts = struct {
 
 comptime {
     // A generated file is the path, a limit of at most ten digits and under 64 bytes of
-    // ZON around them, so it always fits: configGenerate's bufPrint can't fail.
+    // ZON around them, so it always fits: configGenerate's print can't fail.
     assert(cc.constants.config_socket_path_max + 10 + 64 < config_file_size_max);
 }
 
@@ -769,7 +769,7 @@ fn configGenerate(random: std.Random, buffer: *[config_file_size_max:0]u8, model
     }
     model.connections_max = random.intRangeAtMost(u32, 1, cc.constants.http_connections_max);
     const path = model.socket_path[0..model.socket_path_len];
-    const written = std.fmt.bufPrint(buffer, ".{{\n    .socket_path = \"{s}\",\n    .connections_max = {d},\n}}\n", .{
+    const written = std.mem.print(buffer, ".{{\n    .socket_path = \"{s}\",\n    .connections_max = {d},\n}}\n", .{
         path, model.connections_max,
     }) catch unreachable; // The comptime block above proves it fits.
     assert(written.len < config_file_size_max);
@@ -777,7 +777,10 @@ fn configGenerate(random: std.Random, buffer: *[config_file_size_max:0]u8, model
     return @intCast(written.len);
 }
 
-/// Changes, inserts or deletes up to eight bytes, or appends a run of one byte.
+/// Changes, inserts or deletes up to eight bytes, or appends a run of one byte. An insert
+/// or a delete shifts the bytes after `at` up or down one within the buffer; each shift is
+/// checked against a copy of those bytes taken before it, and the bytes before `at`
+/// against a hash taken before it.
 fn configMutate(random: std.Random, buffer: *[config_file_size_max:0]u8, len: u32) u32 {
     assert(len > 0 and len <= config_file_size_max);
     var new_len = len;
@@ -788,12 +791,31 @@ fn configMutate(random: std.Random, buffer: *[config_file_size_max:0]u8, len: u3
         switch (random.uintLessThan(u8, 4)) {
             0 => buffer[at] = random.int(u8),
             1 => if (new_len < config_file_size_max) {
-                std.mem.copyBackwards(u8, buffer[at + 1 .. new_len + 1], buffer[at..new_len]);
+                // The bytes the shift moves, and the ones before them, as they were.
+                var moved: [config_file_size_max]u8 = undefined;
+                const tail = new_len - at;
+                @memcpy(moved[0..tail], buffer[at..new_len]);
+                const kept = std.hash.Wyhash.hash(0, buffer[0..at]);
+                @memmove(buffer[at + 1 .. new_len + 1], buffer[at..new_len]);
+                // Every byte from `at` on moved up one, unchanged: the old last byte is now
+                // at `new_len`, and the bytes before `at` didn't move.
+                assert(std.mem.eql(u8, buffer[at + 1 .. new_len + 1], moved[0..tail]));
+                assert(buffer[new_len] == moved[tail - 1]);
+                assert(std.hash.Wyhash.hash(0, buffer[0..at]) == kept);
                 buffer[at] = random.int(u8);
                 new_len += 1;
             },
             2 => if (new_len > 1) {
-                std.mem.copyForwards(u8, buffer[at .. new_len - 1], buffer[at + 1 .. new_len]);
+                // The bytes the shift moves, and the ones before them, as they were.
+                var moved: [config_file_size_max]u8 = undefined;
+                const tail = new_len - at - 1;
+                @memcpy(moved[0..tail], buffer[at + 1 .. new_len]);
+                const kept = std.hash.Wyhash.hash(0, buffer[0..at]);
+                @memmove(buffer[at .. new_len - 1], buffer[at + 1 .. new_len]);
+                // Every byte after `at` moved down one, unchanged, over the deleted byte, and
+                // the bytes before `at` didn't move.
+                assert(std.mem.eql(u8, buffer[at .. new_len - 1], moved[0..tail]));
+                assert(std.hash.Wyhash.hash(0, buffer[0..at]) == kept);
                 new_len -= 1;
             },
             else => {
@@ -847,7 +869,7 @@ fn configManyFields(random: std.Random, buffer: *[config_file_size_max:0]u8, fie
     var len: u32 = 2;
     var field: u32 = 0;
     while (field < fields.*) : (field += 1) {
-        const written = std.fmt.bufPrint(buffer[len..], " .f{d} = {d},", .{ field, field }) catch unreachable; // The comptime assert above bounds it.
+        const written = std.mem.print(buffer[len..], " .f{d} = {d},", .{ field, field }) catch unreachable; // The comptime assert above bounds it.
         len += @intCast(written.len);
     }
     assert(field == fields.*);
