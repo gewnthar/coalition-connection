@@ -106,7 +106,7 @@ pub const RealCall = enum(u8) {
     send_out_of_range,
     /// A send naming the free entry, with the stale descriptor written back as above and
     /// every slot a send may take in use: the peer is checked before the queue, so the call
-    /// trips instead of returning QueueFull.
+    /// trips instead of returning SendSlotsFull.
     send_free_queue_full,
     /// `Real.init` after startup has finished.
     init_running,
@@ -116,8 +116,8 @@ pub const RealCall = enum(u8) {
     /// A send to the entry in use: completes with its byte count, and the far end of the
     /// socketpair reads the same bytes.
     send_peer,
-    /// A send to the entry in use with every slot a send may take in use: QueueFull, and
-    /// nothing changes.
+    /// A send to the entry in use with every slot a send may take in use: SendSlotsFull,
+    /// and nothing changes.
     send_queue_full,
 };
 

@@ -52,10 +52,10 @@
 //! socket checks in `get` and `socketFor` as well as the state check; with the live
 //! descriptor written back into it, where only the table's state check can stop the call
 //! (without it, the call returns); and the same with every slot of the ring a send may
-//! take in use, where the peer must be checked before the queue, or the call returns QueueFull instead of
-//! tripping. Every real-I/O case but `real_init_running` sets up a ring first; where the
-//! kernel refuses one, they fail with the setup code, never pass. `real_init_running` trips
-//! before the ring is set up, so it runs either way.
+//! take in use, where the peer must be checked before the queue, or the call returns
+//! SendSlotsFull instead of tripping. Every real-I/O case but `real_init_running` sets up a
+//! ring first; where the kernel refuses one, they fail with the setup code, never pass.
+//! `real_init_running` trips before the ring is set up, so it runs either way.
 //!
 //! For the response writer, the buffer is cut from the middle of a larger array, so a field
 //! can sit inside it, across one of its edges, right next to it, or in neither. `write`
@@ -679,7 +679,7 @@ fn tableAgrees(table: *const connections.Table) bool {
 const Real = cc.io.real.Real;
 /// The real type's ring depth: operations it holds in flight before QueueFull.
 const slots_max: u32 = cc.constants.io_operations_in_flight_max;
-/// Sends the real type holds in flight before it refuses the next with QueueFull; the
+/// Sends the real type holds in flight before it refuses the next with SendSlotsFull; the
 /// rest of the ring is kept for accepts.
 const send_slots_max: u32 = cc.constants.io_sends_in_flight_max;
 /// Empty polls `drain` allows, 1 ms apart. Reason: a socketpair send completes during the
@@ -753,6 +753,8 @@ const RealResult = struct {
     clock_after: cc.io.Instant = 0,
     /// Whether a submit returned QueueFull.
     queue_full: bool = false,
+    /// Whether a send returned SendSlotsFull.
+    send_slots_full: bool = false,
 };
 
 /// The state a real-I/O control's call must leave as it was, or change as it says.
@@ -887,7 +889,7 @@ fn fillRing(real: *Real, case: trip.Case) void {
     while (filled < send_slots_max) : (filled += 1) {
         const send: cc.io.Send = .{ .peer = trip.real_peer_id, .bytes = &.{fill_byte} };
         real.submit(.{ .id = filled + 1, .operation = .{ .send = send } }) catch |err| switch (err) {
-            error.QueueFull => setupFailed(case, "the ring filled early"),
+            error.QueueFull, error.SendSlotsFull => setupFailed(case, "the ring filled early"),
         };
     }
     assert(real.inFlight() == send_slots_max);
@@ -909,6 +911,7 @@ fn callReal(
         real.submit(.{ .id = id, .operation = .{ .send = .{ .peer = peer, .bytes = bytes } } }) catch |err| {
             switch (err) {
                 error.QueueFull => return .{ .queue_full = true },
+                error.SendSlotsFull => return .{ .send_slots_full = true },
             }
         };
         return .{};
@@ -923,6 +926,7 @@ fn callReal(
             const execute: cc.io.Execute = .{ .statement = "select 1" };
             real.submit(.{ .id = send_peer_id, .operation = .{ .execute = execute } }) catch |err| switch (err) {
                 error.QueueFull => return .{ .queue_full = true },
+                error.SendSlotsFull => return .{ .send_slots_full = true },
             };
             return .{};
         },
@@ -949,7 +953,7 @@ fn callReal(
 /// A control's call must touch no allocator and leave the table as it was. The clock
 /// control's reading is at or after the last and becomes the last. The send control's
 /// completion comes back with its byte count and the far end reads the same bytes. The
-/// queue-full control returns QueueFull with nothing changed, and every send already on
+/// queue-full control returns SendSlotsFull with nothing changed, and every send already on
 /// the ring still completes with its byte. Both send controls end with the ring empty and
 /// closed, as `deinit` requires.
 fn realControlHeld(
@@ -1002,7 +1006,7 @@ fn realControlHeld(
 fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
     assert(!armed);
     assert(before.in_flight == 0);
-    if (result.queue_full) return false;
+    if (result.queue_full or result.send_slots_full) return false;
     if (real.submitted != before.submitted + 1) return false;
     if (real.last != before.last) return false;
     // `submit` hands the send to the kernel at once, unless the kernel refused for a moment.
@@ -1024,13 +1028,13 @@ fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remo
     return std.mem.eql(u8, received[0..rc], trip.real_send_bytes);
 }
 
-/// The queue-full control: QueueFull with the counts, the free slots, the submission queue
+/// The queue-full control: SendSlotsFull with the counts, the free slots, the submission queue
 /// and the clock unchanged; then every send already on the ring completes once, under the
 /// id it was given, with its one byte, and the far end reads exactly those bytes.
 fn queueFullHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
     assert(!armed);
     assert(before.in_flight == send_slots_max);
-    if (!result.queue_full) return false;
+    if (!result.send_slots_full or result.queue_full) return false;
     if (real.inFlight() != before.in_flight or real.free_count != before.free_count) return false;
     if (real.submitted != before.submitted or real.completed != before.completed) return false;
     if (real.ring.sq.sqe_tail != before.sqe_tail or real.last != before.last) return false;

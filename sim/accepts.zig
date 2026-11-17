@@ -114,8 +114,8 @@ fn topUp(w: *Workload) Error!void {
         if (entry.*) return error.InvariantBroken; // The window is too small.
         const submission: io.Submission = .{ .id = w.next_id, .operation = .{ .accept = .{ .listener = listener } } };
         w.sim.submit(submission) catch |err| switch (err) {
-            // Fewer than the ring's depth are ever in flight here.
-            error.QueueFull => return error.InvariantBroken,
+            // Fewer than the ring's depth are ever in flight here, and none is a send.
+            error.QueueFull, error.SendSlotsFull => return error.InvariantBroken,
         };
         entry.* = true;
         w.next_id += 1;

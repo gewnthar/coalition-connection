@@ -68,7 +68,7 @@ fn submitPair(run: *Run) SimError!void {
         const entry = &run.outstanding[windowIndex(submission.id)];
         if (entry.*) return error.InvariantBroken; // The window is too small.
         run.sim.submit(submission) catch |err| switch (err) {
-            error.QueueFull => {
+            error.QueueFull, error.SendSlotsFull => {
                 run.queue_full += 1; // Counted; the operation never completes.
                 continue;
             },
