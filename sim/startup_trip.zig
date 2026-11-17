@@ -51,8 +51,8 @@
 //! free entry is tried three ways: as it is, where its socket field of -1 can trip the
 //! socket checks in `get` and `socketFor` as well as the state check; with the live
 //! descriptor written back into it, where only the table's state check can stop the call
-//! (without it, the call returns); and the same with every slot of the ring in use, where
-//! the peer must be checked before the queue, or the call returns QueueFull instead of
+//! (without it, the call returns); and the same with every slot of the ring a send may
+//! take in use, where the peer must be checked before the queue, or the call returns QueueFull instead of
 //! tripping. Every real-I/O case but `real_init_running` sets up a ring first; where the
 //! kernel refuses one, they fail with the setup code, never pass. `real_init_running` trips
 //! before the ring is set up, so it runs either way.
@@ -679,6 +679,9 @@ fn tableAgrees(table: *const connections.Table) bool {
 const Real = cc.io.real.Real;
 /// The real type's ring depth: operations it holds in flight before QueueFull.
 const slots_max: u32 = cc.constants.io_operations_in_flight_max;
+/// Sends the real type holds in flight before it refuses the next with QueueFull; the
+/// rest of the ring is kept for accepts.
+const send_slots_max: u32 = cc.constants.io_sends_in_flight_max;
 /// Empty polls `drain` allows, 1 ms apart. Reason: a socketpair send completes during the
 /// submitting system call; a second is ample even on a loaded CI machine.
 const poll_attempts_max: u32 = 1_000;
@@ -731,7 +734,7 @@ fn realCallPeer(call: trip.RealCall) ?cc.io.PeerId {
     return peer;
 }
 
-/// Whether the case fills every slot of the ring before its call.
+/// Whether the case fills every slot of the ring a send may take before its call.
 fn realCallFillsRing(call: trip.RealCall) bool {
     const fills = call == .send_free_queue_full or call == .send_queue_full;
     // One trip case and one control, which differ only in the peer they name.
@@ -875,19 +878,20 @@ fn realTable(startup: *cc.StartupAllocator, case: trip.Case, local: linux.fd_t) 
     return table;
 }
 
-/// Puts a one-byte send to the entry in use in every slot of the ring, before the call.
+/// Puts a one-byte send to the entry in use in every slot of the ring a send may take,
+/// before the call. Only the slots kept for accepts stay free.
 fn fillRing(real: *Real, case: trip.Case) void {
     assert(!armed);
     assert(real.inFlight() == 0);
     var filled: u32 = 0;
-    while (filled < slots_max) : (filled += 1) {
+    while (filled < send_slots_max) : (filled += 1) {
         const send: cc.io.Send = .{ .peer = trip.real_peer_id, .bytes = &.{fill_byte} };
         real.submit(.{ .id = filled + 1, .operation = .{ .send = send } }) catch |err| switch (err) {
             error.QueueFull => setupFailed(case, "the ring filled early"),
         };
     }
-    assert(real.inFlight() == slots_max);
-    assert(real.free_count == 0);
+    assert(real.inFlight() == send_slots_max);
+    assert(real.free_count == slots_max - send_slots_max);
 }
 
 /// Makes the case's one call on the real type; nothing else runs while `armed` is set.
@@ -1025,16 +1029,16 @@ fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remo
 /// id it was given, with its one byte, and the far end reads exactly those bytes.
 fn queueFullHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
     assert(!armed);
-    assert(before.in_flight == slots_max);
+    assert(before.in_flight == send_slots_max);
     if (!result.queue_full) return false;
     if (real.inFlight() != before.in_flight or real.free_count != before.free_count) return false;
     if (real.submitted != before.submitted or real.completed != before.completed) return false;
     if (real.ring.sq.sqe_tail != before.sqe_tail or real.last != before.last) return false;
-    var completions: [slots_max]cc.io.Completion = undefined;
-    if (drain(real, &completions) != slots_max) return false;
-    var seen: [slots_max]bool = @splat(false);
+    var completions: [send_slots_max]cc.io.Completion = undefined;
+    if (drain(real, &completions) != send_slots_max) return false;
+    var seen: [send_slots_max]bool = @splat(false);
     for (completions) |completion| {
-        if (completion.id == 0 or completion.id > slots_max) return false;
+        if (completion.id == 0 or completion.id > send_slots_max) return false;
         const index: u32 = @intCast(completion.id - 1);
         if (seen[index]) return false;
         seen[index] = true;
@@ -1044,7 +1048,7 @@ fn queueFullHeld(real: *Real, before: *const RealBefore, result: RealResult, rem
         };
         if (sent != 1) return false;
     }
-    return farEndHolds(remote, slots_max);
+    return farEndHolds(remote, send_slots_max);
 }
 
 /// Whether the far end holds exactly `count` fill bytes. One read of a buffer with room for
