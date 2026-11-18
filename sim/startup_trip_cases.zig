@@ -113,8 +113,12 @@ pub const RealCall = enum(u8) {
     /// an out-of-bounds index.
     send_out_of_range,
     /// A send naming the free entry, with the stale descriptor written back as above and
-    /// every slot a send may take in use: the peer is checked before the queue, so the call
-    /// trips instead of returning SendSlotsFull.
+    /// every slot a send may take in use: the peer is checked before the sends' share, so
+    /// the call trips instead of returning SendSlotsFull.
+    send_free_slots_full,
+    /// The same with an accept in the slot kept for accepts as well, so the whole ring is
+    /// in use: the peer is checked before the queue, so the call trips instead of
+    /// returning QueueFull.
     send_free_queue_full,
     /// `Real.init` after startup has finished.
     init_running,
@@ -126,7 +130,7 @@ pub const RealCall = enum(u8) {
     send_peer,
     /// A send to the entry in use with every slot a send may take in use: SendSlotsFull,
     /// and nothing changes.
-    send_queue_full,
+    send_slots_full,
 };
 
 /// A send through the simulator (`cc.io.sim.Sim`) with a table of `sim_table_size`
@@ -408,13 +412,14 @@ pub const cases = [_]Case{
     onReal("real_send_free", .send_free, .trips),
     onReal("real_send_free_stale_socket", .send_free_stale_socket, .trips),
     onReal("real_send_out_of_range", .send_out_of_range, .trips),
+    onReal("real_send_free_slots_full", .send_free_slots_full, .trips),
     onReal("real_send_free_queue_full", .send_free_queue_full, .trips),
     onReal("real_init_running", .init_running, .trips),
     // Controls: the clock read once, a send to the entry in use, and that send on a full
     // ring.
     onReal("real_now_fresh", .now_fresh, .finishes),
     onReal("real_send_peer", .send_peer, .finishes),
-    onReal("real_send_queue_full", .send_queue_full, .finishes),
+    onReal("real_send_slots_full", .send_slots_full, .finishes),
     // The simulator: a send must name a live entry, checked through the table before the
     // queue, as on the real type: a stale id, the free entry, or an index past the table;
     // a send needs a table to check it against; an id in flight is refused before the

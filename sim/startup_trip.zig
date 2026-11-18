@@ -52,8 +52,10 @@
 //! socket checks in `get` and `socketFor` as well as the state check; with the live
 //! descriptor written back into it, where only the table's state check can stop the call
 //! (without it, the call returns); and the same with every slot of the ring a send may
-//! take in use, where the peer must be checked before the queue, or the call returns
-//! SendSlotsFull instead of tripping. Every real-I/O case but `real_init_running` sets up a
+//! take in use, where the peer must be checked before the sends' share, or the call
+//! returns SendSlotsFull instead of tripping, and again with an accept in the slot kept for
+//! accepts too, where the peer must be checked before the queue, or the call returns
+//! QueueFull. Every real-I/O case but `real_init_running` sets up a
 //! ring first; where the kernel refuses one, they fail with the setup code, never pass.
 //! `real_init_running` trips before the ring is set up, so it runs either way.
 //!
@@ -62,9 +64,10 @@
 //! by the same table checks: the reused entry's first id (in use, but under the next
 //! generation), the free entry under its current generation, and an index past the table
 //! but far below the simulator's own index limit. The stale send is also tried with every
-//! slot in use (sends in all a send may take, a statement in the rest), where the peer
-//! must be checked before the queue, or the call returns QueueFull instead of tripping. A send on a simulator with no table attached must trip
-//! too, or a send could skip every one of those checks, and so must a send whose id is
+//! slot in use (a send in each slot a send may take, a statement in the slot kept back),
+//! where the peer must be checked before the queue, or the call returns QueueFull instead
+//! of tripping. A send on a simulator with no table attached must trip too, or a send
+//! could skip every one of those checks, and so must a send whose id is
 //! already in flight, even with every slot in use. On the completion side, a send whose
 //! entry was released under it (the harness clears the count by hand to get there) must
 //! stop when it completes. The controls send to the entry in use.
@@ -729,12 +732,13 @@ const fill_statement = "select 1";
 /// each case's outcome, and the comptime block at the top checks the two agree.
 fn realCallAllowed(call: trip.RealCall) bool {
     const allowed = switch (call) {
-        .now_fresh, .send_peer, .send_queue_full => true,
+        .now_fresh, .send_peer, .send_slots_full => true,
         .now_after_max,
         .submit_execute,
         .send_free,
         .send_free_stale_socket,
         .send_out_of_range,
+        .send_free_slots_full,
         .send_free_queue_full,
         .init_running,
         => false,
@@ -755,25 +759,36 @@ fn realCallPeer(call: trip.RealCall) ?cc.io.PeerId {
         .generation = free_generation,
     });
     const peer: ?cc.io.PeerId = switch (call) {
-        .send_free, .send_free_stale_socket, .send_free_queue_full => free_peer,
+        .send_free, .send_free_stale_socket, .send_free_slots_full, .send_free_queue_full => free_peer,
         .send_out_of_range => trip.real_table_size,
-        .send_peer, .send_queue_full => trip.real_peer_id,
+        .send_peer, .send_slots_full => trip.real_peer_id,
         .now_after_max, .submit_execute, .init_running, .now_fresh => null,
     };
     // Only the two send controls name the entry in use; the forbidden sends name the free
     // entry or an id past the table.
     const index: ?connections.Index = if (peer) |id| @as(connections.IdParts, @bitCast(id)).index else null;
     assert(index == null or index.? <= trip.real_table_size);
-    assert((peer == trip.real_peer_id) == (call == .send_peer or call == .send_queue_full));
+    assert((peer == trip.real_peer_id) == (call == .send_peer or call == .send_slots_full));
     return peer;
 }
 
 /// Whether the case fills every slot of the ring a send may take before its call.
 fn realCallFillsRing(call: trip.RealCall) bool {
-    const fills = call == .send_free_queue_full or call == .send_queue_full;
-    // One trip case and one control, which differ only in the peer they name.
-    assert(!fills or (call == .send_queue_full) == (realCallPeer(call) == trip.real_peer_id));
+    const fills = call == .send_free_slots_full or call == .send_slots_full or
+        call == .send_free_queue_full;
+    // Sends that meet a full share, or a full ring; only `send_slots_full` is a control.
+    assert(!fills or (call == .send_slots_full) == (realCallPeer(call) == trip.real_peer_id));
     assert(!fills or realCallPeer(call) != null);
+    return fills;
+}
+
+/// Whether the case also puts an accept in the slot kept for accepts, so the whole ring is
+/// in use and the next submission of any kind meets QueueFull.
+fn realCallFillsAccept(call: trip.RealCall) bool {
+    const fills = call == .send_free_queue_full;
+    // Only a ring already holding every send it may take has the accepts' slot to fill.
+    assert(!fills or realCallFillsRing(call));
+    assert(!fills or !realCallAllowed(call));
     return fills;
 }
 
@@ -840,10 +855,15 @@ fn runRealCase(startup: *cc.StartupAllocator, call: trip.RealCall, case: trip.Ca
         .now_after_max => real.last = std.math.maxInt(cc.io.Instant),
         // The descriptor the entry held before it was released, as a stale field keeps it,
         // so only the state check can stop the send.
-        .send_free_stale_socket, .send_free_queue_full => table.entries[trip.real_free_id].socket = local,
+        .send_free_stale_socket,
+        .send_free_slots_full,
+        .send_free_queue_full,
+        => table.entries[trip.real_free_id].socket = local,
         else => {},
     }
     if (realCallFillsRing(call)) fillRing(&real, case);
+    // The accept waits on a listener nobody connects to; the case trips before it matters.
+    if (realCallFillsAccept(call)) fillAccept(&real, case);
 
     var before: RealBefore = undefined;
     @memcpy(&before.entries, table.entries);
@@ -930,6 +950,30 @@ fn fillRing(real: *Real, case: trip.Case) void {
     assert(real.free_count == slots_max - send_slots_max);
 }
 
+/// Puts an accept, on a fresh loopback listener nobody connects to, in the slot kept for
+/// accepts after `fillRing`, so every slot of the ring is in use. The listener is never
+/// closed: the case trips while the accept still waits on it, and the process ends.
+fn fillAccept(real: *Real, case: trip.Case) void {
+    assert(!armed);
+    assert(real.inFlight() == send_slots_max);
+    const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+    const opened = linux.socket(linux.AF.INET, flags, 0);
+    if (linux.errno(opened) != .SUCCESS) setupFailed(case, "no listener socket");
+    const listener: linux.fd_t = @intCast(opened);
+    // Port 0: the kernel picks a free one, so cases running at once never clash.
+    const address: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+    if (linux.errno(linux.bind(listener, @ptrCast(&address), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        setupFailed(case, "could not bind the listener");
+    }
+    if (linux.errno(linux.listen(listener, 1)) != .SUCCESS) setupFailed(case, "could not listen");
+    const accept: cc.io.Operation = .{ .accept = .{ .listener = listener } };
+    real.submit(.{ .id = slots_max, .operation = accept }) catch |err| switch (err) {
+        error.QueueFull, error.SendSlotsFull => setupFailed(case, "the accepts' slot was taken"),
+    };
+    assert(real.inFlight() == slots_max);
+    assert(real.free_count == 0);
+}
+
 /// Makes the case's one call on the real type; nothing else runs while `armed` is set.
 fn callReal(
     real: *Real,
@@ -977,9 +1021,10 @@ fn callReal(
         .send_free,
         .send_free_stale_socket,
         .send_out_of_range,
+        .send_free_slots_full,
         .send_free_queue_full,
         .send_peer,
-        .send_queue_full,
+        .send_slots_full,
         => unreachable, // realCallPeer named a peer for each of these.
     }
 }
@@ -987,7 +1032,7 @@ fn callReal(
 /// A control's call must touch no allocator and leave the table as it was. The clock
 /// control's reading is at or after the last and becomes the last. The send control's
 /// completion comes back with its byte count and the far end reads the same bytes. The
-/// queue-full control returns SendSlotsFull with nothing changed, and every send already on
+/// send-share control returns SendSlotsFull with nothing changed, and every send already on
 /// the ring still completes with its byte. Both send controls end with the ring empty and
 /// closed, as `deinit` requires.
 fn realControlHeld(
@@ -1020,12 +1065,13 @@ fn realControlHeld(
             return real.inFlight() == 0 and real.submitted == 0;
         },
         .send_peer => if (!sendPeerHeld(real, before, result, remote)) return false,
-        .send_queue_full => if (!queueFullHeld(real, before, result, remote)) return false,
+        .send_slots_full => if (!slotsFullHeld(real, before, result, remote)) return false,
         .now_after_max,
         .submit_execute,
         .send_free,
         .send_free_stale_socket,
         .send_out_of_range,
+        .send_free_slots_full,
         .send_free_queue_full,
         .init_running,
         => unreachable, // Asserted allowed above.
@@ -1062,10 +1108,10 @@ fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remo
     return std.mem.eql(u8, received[0..rc], trip.real_send_bytes);
 }
 
-/// The queue-full control: SendSlotsFull with the counts, the free slots, the submission queue
+/// The send-share control: SendSlotsFull with the counts, the free slots, the submission queue
 /// and the clock unchanged; then every send already on the ring completes once, under the
 /// id it was given, with its one byte, and the far end reads exactly those bytes.
-fn queueFullHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
+fn slotsFullHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
     assert(!armed);
     assert(before.in_flight == send_slots_max);
     if (!result.send_slots_full or result.queue_full) return false;

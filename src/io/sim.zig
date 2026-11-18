@@ -198,7 +198,9 @@ pub const Sim = struct {
         assert(self.sends_in_flight <= send_slots_max);
         if (self.in_flight == slots_count) return error.QueueFull;
         // The operations past send_slots_max are kept for accepts.
-        if (submission.operation == .send and self.sends_in_flight == send_slots_max) return error.SendSlotsFull;
+        if (submission.operation == .send and self.sends_in_flight == send_slots_max) {
+            return error.SendSlotsFull;
+        }
 
         const index = self.freeSlot();
         const delay_max = constants.sim_completion_delay_ticks_max;

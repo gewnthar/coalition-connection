@@ -268,7 +268,7 @@ pub const accepts_in_flight_max: u32 = 1;
 /// connection is dropped, and enough such clients could otherwise hold every slot, so that
 /// no accept could be submitted for anyone. With `accepts_in_flight_max` slots kept back,
 /// the server still accepts while every send slot is stuck. The real I/O type refuses a
-/// send past this with `error.QueueFull`.
+/// send past this with `error.SendSlotsFull`, and so does the simulator.
 pub const io_sends_in_flight_max: u32 = io_operations_in_flight_max - accepts_in_flight_max;
 
 /// File descriptors the server holds open besides its connections' sockets, at most, at

@@ -286,8 +286,9 @@ pub const Real = struct {
     /// counted on its connection's entry until its completion, and the table refuses to
     /// release that entry meanwhile, so the number can't be closed and reused under it.
     /// With every slot in use, returns `error.QueueFull`, and for a send when sends hold
-    /// every slot they may (`send_slots_max`), `error.SendSlotsFull`; either changes nothing. An id already in
-    /// flight breaks the contract and stops the process, full ring or not.
+    /// every slot they may (`send_slots_max`), `error.SendSlotsFull`; either changes
+    /// nothing, and a full ring wins when both hold. An id already in flight breaks the
+    /// contract and stops the process, full ring or not.
     pub fn submit(self: *Real, submission: io.Submission) io.SubmitError!void {
         comptime assertLinux();
         const submitted_before = self.submitted;
@@ -308,7 +309,9 @@ pub const Real = struct {
         assert(self.sends_in_flight <= send_slots_max);
         if (self.free_count == 0) return error.QueueFull;
         // The slots past send_slots_max are kept for accepts.
-        if (submission.operation == .send and self.sends_in_flight == send_slots_max) return error.SendSlotsFull;
+        if (submission.operation == .send and self.sends_in_flight == send_slots_max) {
+            return error.SendSlotsFull;
+        }
         const sends_before = self.sendsCounted(submission.operation);
 
         // Each queued entry belongs to an operation in flight, and fewer than slots_count
@@ -1384,6 +1387,8 @@ test "real: with every send slot held by a stuck send, an accept still goes in a
     try testing.expectEqual(@as(u32, 0), fixture.real.free_count);
     const slots_before = fixture.real.slots;
     try testing.expectError(error.QueueFull, fixture.real.submit(.{ .id = 1001, .operation = accept }));
+    // A send meets both limits now; the full ring is the one it reports, as on the simulator.
+    try testing.expectError(error.QueueFull, fixture.send(1001, "w"));
     try testing.expectEqualSlices(Slot, &slots_before, &fixture.real.slots);
     try loopback.connect();
     var completions: [slots_count]io.Completion = undefined;
