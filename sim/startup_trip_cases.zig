@@ -6,7 +6,9 @@
 //! allocator in a phase first; a connection-table case builds a small table with one free
 //! entry and the rest in use, then ends startup; a real-I/O case builds a two-entry table
 //! whose entry in use holds one end of a socketpair, sets up the real I/O type on it (except
-//! for the case that sets it up too late), then ends startup; a response-writer case ends
+//! for the case that sets it up too late), then ends startup; a simulator case builds a
+//! three-entry table with one entry in use, one taken again under a new generation and one
+//! free, ends startup, then attaches the table to a simulator; a response-writer case ends
 //! startup, then writes one response into a buffer cut from the middle of a larger array,
 //! with the body, a header name or a header value placed inside the buffer, across one of
 //! its edges, right next to it, or elsewhere. A case that `trips` must stop the process on
@@ -74,6 +76,12 @@ pub const TableCall = enum(u8) {
     // get through the reading entry's live id with only the generation's top bit flipped:
     // a check that compared fewer than all 48 bits would let it through.
     get_stale_top_bit,
+    // sendCompleted, which a completion calls: through the reading entry's stale id and
+    // through the free entry, each with a send counted on the entry by hand so only the
+    // id checks can stop it; and through the reading entry's live id with no send counted.
+    send_completed_stale,
+    send_completed_free,
+    send_completed_uncounted,
     // Controls on the reading entry: release, get, and a move to writing.
     release_reading,
     get_reading,
@@ -118,6 +126,43 @@ pub const RealCall = enum(u8) {
     send_peer,
     /// A send to the entry in use with every slot a send may take in use: SendSlotsFull,
     /// and nothing changes.
+    send_queue_full,
+};
+
+/// A send through the simulator (`cc.io.sim.Sim`) with a table of `sim_table_size`
+/// entries attached: `sim_peer_index` in use, `sim_reused_index` released once and taken
+/// again (so the id it was first handed out under is stale), and `sim_free_index` released
+/// once. The simulator must refuse each send the real type refuses, through the same table
+/// checks, so code that sends on a dead id fails in simulation too.
+pub const SimCall = enum(u8) {
+    /// A send naming the reused entry under the id it first had: the entry is in use, but
+    /// under the next generation, so only the generation check can stop it.
+    send_stale,
+    /// A send naming the free entry under its current generation (the id the next acquire
+    /// would hand out), so the generation check passes and only the state check stops it.
+    send_free,
+    /// A send naming an id one past the table's last entry, far below the simulator's own
+    /// limit on indices: only the table's index check can stop it.
+    send_out_of_range,
+    /// The stale send with every slot in use: the peer is checked before the queue, as on
+    /// the real type, so the call trips instead of returning QueueFull.
+    send_stale_queue_full,
+    /// A send to the entry in use on a simulator with no table attached: a send that
+    /// skipped the table would skip every check above, so the simulator must refuse it.
+    send_no_table,
+    /// A send to the entry in use whose id is already in flight, with every slot in use:
+    /// the distinct-id check comes before the queue, as on the real type, so the call trips
+    /// instead of returning QueueFull.
+    send_duplicate_id_queue_full,
+    /// A poll that completes a send whose entry was released while it was in flight (the
+    /// harness clears the entry's count first, so the release goes through): the
+    /// completion must stop on the table's live-id check, not uncount a dead entry quietly.
+    complete_released,
+    // Controls.
+    /// A send to the entry in use: counted on the entry, which then refuses to release,
+    /// and uncounted when it completes with every byte sent.
+    send_peer,
+    /// A send to the entry in use with every slot in use: QueueFull, and nothing changes.
     send_queue_full,
 };
 
@@ -170,6 +215,19 @@ pub const message_assertion = "reached unreachable code";
 /// it doesn't break the case, but replacing the panic with an assertion does.
 pub const message_execute_head = "io.real: execute is a simulator placeholder;";
 
+pub const sim_table_size: u32 = 3;
+pub const sim_peer_index: u32 = 0;
+pub const sim_reused_index: u32 = 1;
+pub const sim_free_index: u32 = 2;
+
+comptime {
+    assert(sim_peer_index < sim_table_size);
+    assert(sim_reused_index < sim_table_size);
+    assert(sim_free_index < sim_table_size);
+    assert(sim_peer_index != sim_reused_index and sim_peer_index != sim_free_index);
+    assert(sim_reused_index != sim_free_index);
+}
+
 pub const real_table_size: u32 = 2;
 pub const real_peer_id: u32 = 0;
 pub const real_free_id: u32 = 1;
@@ -205,6 +263,7 @@ pub const Target = union(enum) {
     startup_allocator: struct { phase: Phase, call: AllocatorCall },
     connection_table: TableCall,
     real_io: RealCall,
+    sim_io: SimCall,
     http_response: ResponseCall,
 };
 
@@ -251,6 +310,13 @@ fn onReal(name: []const u8, call: RealCall, outcome: Outcome) Case {
     };
 }
 
+fn onSim(name: []const u8, call: SimCall, outcome: Outcome) Case {
+    assert(name.len > 0);
+    // Simulator case names start with "sim_", so the build log groups them.
+    assert(std.mem.startsWith(u8, name, "sim_"));
+    return .{ .name = name, .target = .{ .sim_io = call }, .trips = outcome == .trips };
+}
+
 fn onResponse(name: []const u8, call: ResponseCall, outcome: Outcome) Case {
     assert(name.len > 0);
     // Response-writer case names start with "response_", so the build log groups them.
@@ -270,7 +336,7 @@ pub fn expectedExit(case: Case) u8 {
     return if (case.trips) exit_tripped else exit_finished;
 }
 
-pub const cases_max: u32 = 80;
+pub const cases_max: u32 = 96;
 
 pub const cases = [_]Case{
     // Every call the running phase forbids.
@@ -325,6 +391,9 @@ pub const cases = [_]Case{
     onTable("table_get_stale", .get_stale, .trips),
     onTable("table_set_state_stale", .set_state_stale, .trips),
     onTable("table_get_stale_top_bit", .get_stale_top_bit, .trips),
+    onTable("table_send_completed_stale", .send_completed_stale, .trips),
+    onTable("table_send_completed_free", .send_completed_free, .trips),
+    onTable("table_send_completed_uncounted", .send_completed_uncounted, .trips),
     // Controls: the same calls on entries in use, reading and writing.
     onTable("table_release_reading", .release_reading, .finishes),
     onTable("table_get_reading", .get_reading, .finishes),
@@ -346,6 +415,20 @@ pub const cases = [_]Case{
     onReal("real_now_fresh", .now_fresh, .finishes),
     onReal("real_send_peer", .send_peer, .finishes),
     onReal("real_send_queue_full", .send_queue_full, .finishes),
+    // The simulator: a send must name a live entry, checked through the table before the
+    // queue, as on the real type: a stale id, the free entry, or an index past the table;
+    // a send needs a table to check it against; an id in flight is refused before the
+    // queue; and a send that outlived its entry stops when it completes.
+    onSim("sim_send_stale", .send_stale, .trips),
+    onSim("sim_send_free", .send_free, .trips),
+    onSim("sim_send_out_of_range", .send_out_of_range, .trips),
+    onSim("sim_send_stale_queue_full", .send_stale_queue_full, .trips),
+    onSim("sim_send_no_table", .send_no_table, .trips),
+    onSim("sim_send_duplicate_id_queue_full", .send_duplicate_id_queue_full, .trips),
+    onSim("sim_complete_released", .complete_released, .trips),
+    // Controls: a send to the entry in use, and that send with every slot in use.
+    onSim("sim_send_peer", .send_peer, .finishes),
+    onSim("sim_send_queue_full", .send_queue_full, .finishes),
     // The response writer: the body, a header name or a header value that shares a byte
     // with the buffer being written would be read while it is overwritten. The `_head` and
     // `_refused` cases pin the earliest check, which no later copy backs up.
@@ -429,7 +512,7 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .connection_table => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .real_io, .http_response => {},
+            .startup_allocator, .real_io, .sim_io, .http_response => {},
         };
         assert(found == 1);
     }
@@ -438,7 +521,16 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .real_io => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .connection_table, .http_response => {},
+            .startup_allocator, .connection_table, .sim_io, .http_response => {},
+        };
+        assert(found == 1);
+    }
+    // Every simulator call has exactly one case.
+    for (std.enums.values(SimCall)) |call| {
+        var found: u32 = 0;
+        for (cases) |case| switch (case.target) {
+            .sim_io => |case_call| found += @intFromBool(case_call == call),
+            .startup_allocator, .connection_table, .real_io, .http_response => {},
         };
         assert(found == 1);
     }
@@ -447,14 +539,14 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .http_response => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .connection_table, .real_io => {},
+            .startup_allocator, .connection_table, .real_io, .sim_io => {},
         };
         assert(found == 1);
     }
     // Only real-I/O cases expect a panic other than an assertion.
     for (cases) |case| switch (case.target) {
         .real_io => {},
-        .startup_allocator, .connection_table, .http_response => assert(case.panic == .assertion),
+        .startup_allocator, .connection_table, .sim_io, .http_response => assert(case.panic == .assertion),
     };
 }
 

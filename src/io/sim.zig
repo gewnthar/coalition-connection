@@ -20,8 +20,15 @@
 //! arrives is drawn at submit, like every other outcome, so the same seed refuses the same
 //! arrivals in the same order.
 //!
+//! Sends: a send goes through the attached table with the same calls the real type makes.
+//! Its peer is looked up at submit, before the queue is checked, so a free, stale or
+//! out-of-range peer crashes as it does on the real type; the send is counted on its entry
+//! (`Table.sendSubmitted`) until its completion uncounts it (`Table.sendCompleted`), so the
+//! table refuses to release that entry with `error.SendsInFlight` meanwhile. Code that
+//! releases early or sends on a stale id fails in simulation, not first on the real type.
+//!
 //! Inputs: a seed, a fault rate in percent (at most `constants.sim_fault_percent_max`) and,
-//! for accepts, a connection table.
+//! for sends and accepts, a connection table.
 //! Outputs: the same contract as io/root.zig, plus counters a test can assert on.
 //! Limits: at most `constants.sim_ticks_max` ticks per run, at most
 //! `constants.io_operations_in_flight_max` operations in flight, and delays of at most
@@ -147,8 +154,9 @@ pub const Sim = struct {
         return result;
     }
 
-    /// Gives arrivals a connection table to take their entries in. Call it once, before the
-    /// first accept; the table is the caller's and must outlive every accept.
+    /// Gives sends the connection table their peers live in, and arrivals the table to take
+    /// their entries in. Call it once, before the first send or accept; the table is the
+    /// caller's and must outlive every send and accept.
     pub fn attachTable(self: *Sim, table: *connections.Table) void {
         assert(self.table == null);
         assert(self.accepted + self.refused == 0);
@@ -180,8 +188,12 @@ pub const Sim = struct {
         comptime assertSimulationAllowed();
         assert(self.in_flight <= slots_count);
         assertOperation(submission.operation);
-        // An arrival needs a table to take its entry in.
-        assert(submission.operation != .accept or self.table != null);
+        // A send names its peer's entry, and an arrival takes one, so both need a table.
+        assert(submission.operation == .execute or self.table != null);
+        // Looked up before anything changes, as the real type does: a send naming a peer
+        // that isn't live in the table (free, stale or past its end) is a caller's bug and
+        // crashes, full queue or not.
+        const sends_before = self.sendsCounted(submission.operation);
         self.assertIdNotInFlight(submission.id);
         assert(self.sends_in_flight <= send_slots_max);
         if (self.in_flight == slots_count) return error.QueueFull;
@@ -203,8 +215,26 @@ pub const Sim = struct {
         self.in_flight += 1;
         if (submission.operation == .send) self.sends_in_flight += 1;
         self.submitted += 1;
+        // Counted on the peer's entry until it completes, through the same call the real
+        // type makes, so the table refuses to release the entry meanwhile.
+        if (submission.operation == .send) self.table.?.sendSubmitted(submission.operation.send.peer);
+        const sends_added: connections.SendCount = if (submission.operation == .send) 1 else 0;
+        assert(self.sendsCounted(submission.operation) == sends_before + sends_added);
         assert(self.slots[index] != null);
         assert(self.completed + self.in_flight == self.submitted);
+    }
+
+    /// Sends counted on a send's peer, read through `Table.get`, which crashes unless the
+    /// peer is live; 0 for an accept or a statement, which name no peer.
+    fn sendsCounted(self: *const Sim, operation: io.Operation) connections.SendCount {
+        const count: connections.SendCount = switch (operation) {
+            .send => |send| self.table.?.get(send.peer).sends_in_flight,
+            .accept, .execute => 0,
+        };
+        // Only a send names a peer, so only a send can have a count.
+        assert(operation == .send or count == 0);
+        assert(count <= slots_count);
+        return count;
     }
 
     /// Moves operations that are due into `completions` and returns how many. The scan starts
@@ -339,7 +369,14 @@ pub const Sim = struct {
             .send => |sent| sent: {
                 assert(self.sends_in_flight > 0); // Counted at submit.
                 self.sends_in_flight -= 1;
-                self.countSend(sent, slot.submission.operation.send);
+                // The table refused to release the peer while this send was counted, so
+                // the id is still live; `sendCompleted` crashes if it isn't.
+                const send = slot.submission.operation.send;
+                const table = self.table.?;
+                const sends_before = table.get(send.peer).sends_in_flight;
+                table.sendCompleted(send.peer);
+                assert(table.get(send.peer).sends_in_flight == sends_before - 1);
+                self.countSend(sent, send);
                 break :sent .{ .send = sent };
             },
             .execute => |executed| executed: {
@@ -475,8 +512,10 @@ const Recording = struct {
 };
 
 /// Submits `recorded_max` operations, alternating sends and statements, at two per tick,
-/// and records the order and the ticks their completions come back on.
-fn record(seed: u64, fault_percent: u8) io.SubmitError!Recording {
+/// and records the order and the ticks their completions come back on. The sends go to
+/// `fixture`'s peers, which must outlive the recording; every send is uncounted again
+/// once its completion has come back.
+fn record(fixture: *TableFixture, seed: u64, fault_percent: u8) !Recording {
     var recording: Recording = .{
         .ids = @splat(0),
         .submitted_tick = @splat(0),
@@ -484,6 +523,7 @@ fn record(seed: u64, fault_percent: u8) io.SubmitError!Recording {
         .count = 0,
         .sim = .init(seed, fault_percent),
     };
+    recording.sim.attachTable(&fixture.table);
     var next: io.OperationId = 0;
     var ticks: u32 = 0;
     while (ticks < record_ticks_max and recording.count < recorded_max) : (ticks += 1) {
@@ -501,6 +541,7 @@ fn record(seed: u64, fault_percent: u8) io.SubmitError!Recording {
     assert(ticks <= record_ticks_max);
     assert(recording.count == recorded_max);
     assert(recording.sim.in_flight == 0);
+    try fixture.expectNoSendsCounted();
     return recording;
 }
 
@@ -520,11 +561,12 @@ fn drainInto(recording: *Recording) void {
     assert(batches < slots_count);
 }
 
-/// Even ids are sends, odd ids are statements.
+/// Even ids are sends to peer `id % test_peers` (so to the even-numbered peers only), and
+/// odd ids are statements.
 fn testSubmission(id: io.OperationId) io.Submission {
     assert(id <= recorded_max + slots_count);
     const operation: io.Operation = if (id % 2 == 0)
-        .{ .send = .{ .peer = @intCast(id % 8), .bytes = "ping" } }
+        .{ .send = .{ .peer = @intCast(id % test_peers), .bytes = "ping" } }
     else
         .{ .execute = .{ .statement = "select 1" } };
     const expected: io.Kind = if (id % 2 == 0) .send else .execute;
@@ -533,18 +575,24 @@ fn testSubmission(id: io.OperationId) io.Submission {
 }
 
 test "sim: same seed, same completion order and counts" {
-    const a = try record(42, 20);
-    const b = try record(42, 20);
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    const a = try record(&fixture, 42, 20);
+    const b = try record(&fixture, 42, 20);
     try testing.expectEqualSlices(io.OperationId, &a.ids, &b.ids);
     try testing.expectEqual(a.sim.faults, b.sim.faults);
     try testing.expectEqual(a.sim.bytes_sent, b.sim.bytes_sent);
     try testing.expectEqual(a.sim.statements, b.sim.statements);
-    const c = try record(43, 20);
+    const c = try record(&fixture, 43, 20);
     try testing.expect(!std.mem.eql(io.OperationId, &a.ids, &c.ids));
 }
 
 test "sim: delays reorder completions within the bound, each operation once" {
-    const run = try record(7, 0);
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    const run = try record(&fixture, 7, 0);
     var seen: [recorded_max]bool = @splat(false);
     var reordered = false;
     for (run.ids[0..run.count], 0..) |id, index| {
@@ -563,7 +611,10 @@ test "sim: delays reorder completions within the bound, each operation once" {
 }
 
 test "sim: a seeded run injects every fault kind and short sends" {
-    const run = try record(1, constants.sim_fault_percent_max);
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    const run = try record(&fixture, 1, constants.sim_fault_percent_max);
     try testing.expect(run.sim.faults.peer_down > 0);
     try testing.expect(run.sim.faults.backpressure > 0);
     try testing.expect(run.sim.faults.unavailable > 0);
@@ -580,7 +631,11 @@ test "sim: time moves only on tick" {
 }
 
 test "sim: a poll with nothing due returns 0 and changes nothing" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
     var sim = Sim.init(5, 0);
+    sim.attachTable(&fixture.table);
     var completions: [4]io.Completion = undefined;
     try testing.expectEqual(@as(u32, 0), sim.poll(&completions));
     try sim.submit(testSubmission(0));
@@ -600,7 +655,11 @@ test "sim: a poll with nothing due returns 0 and changes nothing" {
 }
 
 test "sim: a zero fault rate never fails and never sends short" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
     var sim = Sim.init(7, 0);
+    sim.attachTable(&fixture.table);
     try sim.submit(.{ .id = 1, .operation = .{ .send = .{ .peer = 0, .bytes = "hello" } } });
     try sim.submit(.{ .id = 2, .operation = .{ .execute = .{ .statement = "select 1" } } });
     var completions: [4]io.Completion = undefined;
@@ -622,10 +681,21 @@ test "sim: a zero fault rate never fails and never sends short" {
 }
 
 test "sim: a full table refuses a submission and changes nothing" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
     var sim = Sim.init(3, 0);
+    sim.attachTable(&fixture.table);
     var id: io.OperationId = 0;
     while (id < slots_count) : (id += 1) try sim.submit(testSubmission(id));
-    try testing.expectError(error.QueueFull, sim.submit(testSubmission(id)));
+    // The refused submission is a send to peer 0, which holds every eighth id's send: it
+    // must not be counted on the entry.
+    const refused = testSubmission(id);
+    try testing.expectEqual(io.Kind.send, @as(io.Kind, refused.operation));
+    const entry_before = fixture.table.get(refused.operation.send.peer).*;
+    try testing.expectEqual(@as(connections.SendCount, slots_count / test_peers), entry_before.sends_in_flight);
+    try testing.expectError(error.QueueFull, sim.submit(refused));
+    try testing.expectEqual(entry_before, fixture.table.get(refused.operation.send.peer).*);
     try testing.expectEqual(slots_count, sim.in_flight);
     try testing.expectEqual(@as(u64, slots_count), sim.submitted);
 
@@ -638,15 +708,23 @@ test "sim: a full table refuses a submission and changes nothing" {
 }
 
 test "sim: a send past the sends' share is refused, and the last operation still goes in" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
     var sim = Sim.init(5, 0);
+    sim.attachTable(&fixture.table);
     var id: io.OperationId = 0;
     while (id < send_slots_max) : (id += 1) {
         try sim.submit(.{ .id = id, .operation = .{ .send = .{ .peer = 0, .bytes = "s" } } });
     }
     try testing.expectEqual(send_slots_max, sim.sends_in_flight);
+    // The refused send must not be counted on its peer's entry either.
+    const entry_before = fixture.table.get(0).*;
+    try testing.expectEqual(@as(connections.SendCount, send_slots_max), entry_before.sends_in_flight);
     const slots_before = sim.slots;
     const send: io.Submission = .{ .id = id, .operation = .{ .send = .{ .peer = 0, .bytes = "s" } } };
     try testing.expectError(error.SendSlotsFull, sim.submit(send));
+    try testing.expectEqual(entry_before, fixture.table.get(0).*);
     try testing.expectEqual(send_slots_max, sim.in_flight);
     try testing.expectEqual(@as(u64, send_slots_max), sim.submitted);
     try testing.expectEqualDeep(slots_before, sim.slots);
@@ -665,12 +743,17 @@ test "sim: a send past the sends' share is refused, and the last operation still
     try testing.expectEqual(slots_count, sim.poll(&completions));
     try testing.expectEqual(@as(u32, 0), sim.sends_in_flight);
     try testing.expectEqual(@as(u32, 0), sim.in_flight);
+    try fixture.expectNoSendsCounted();
 }
 
 test "sim: an id may be reused once its operation has completed" {
     // Ids need be distinct only while in flight. With every other slot still full, the id
     // that just completed is accepted again, three times over.
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
     var sim = Sim.init(17, 0);
+    sim.attachTable(&fixture.table);
     var id: io.OperationId = 0;
     while (id < slots_count) : (id += 1) try sim.submit(testSubmission(id));
     var completions: [1]io.Completion = undefined;
@@ -690,7 +773,11 @@ test "sim: an id may be reused once its operation has completed" {
 }
 
 test "sim: an operation submitted on the last tick still completes" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
     var sim = Sim.init(13, 0);
+    sim.attachTable(&fixture.table);
     var ticks: u32 = 0;
     while (ticks < constants.sim_ticks_max - 1) : (ticks += 1) sim.tick();
     try sim.submit(testSubmission(0));
@@ -718,9 +805,13 @@ test "sim: same seed, same random bytes" {
 }
 
 test "sim: drawing random bytes and polling often leave outcomes unchanged" {
-    const plain = try record(11, constants.sim_fault_percent_max);
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    const plain = try record(&fixture, 11, constants.sim_fault_percent_max);
     // Same seed and submissions, but this run draws a nonce and polls before every tick too.
     var busy = Sim.init(11, constants.sim_fault_percent_max);
+    busy.attachTable(&fixture.table);
     var completions: [16]io.Completion = undefined;
     var nonce: [24]u8 = undefined;
     var id: io.OperationId = 0;
@@ -761,6 +852,31 @@ const TableFixture = struct {
         assert(self.table.count() == 0);
     }
 
+    /// A table of `size` entries, every one in use, for sends. A fresh table hands out
+    /// entry 0 first, each under generation 0, so peer `n` is entry `n`, as
+    /// `testSubmission` names it.
+    fn setUpPeers(self: *TableFixture, size: u32) !void {
+        try self.setUp(size);
+        var index: u32 = 0;
+        while (index < size) : (index += 1) {
+            const peer = try self.table.acquire(peerSocket(index));
+            assert(peer == index);
+        }
+        assert(index == size);
+        assert(self.table.count() == size);
+    }
+
+    /// Every entry in use has no send counted, as when every send has completed.
+    fn expectNoSendsCounted(self: *const TableFixture) !void {
+        var checked: u32 = 0;
+        for (self.table.entries) |entry| {
+            if (entry.state == .free) continue;
+            try testing.expectEqual(@as(connections.SendCount, 0), entry.sends_in_flight);
+            checked += 1;
+        }
+        try testing.expectEqual(self.table.count(), checked);
+    }
+
     fn tearDown(self: *TableFixture) void {
         assert(self.table.capacity() > 0);
         self.startup.beginShutdown();
@@ -768,6 +884,16 @@ const TableFixture = struct {
         assert(self.startup.bytes_live == 0);
     }
 };
+
+/// The peers the send tests name: `testSubmission` sends to peer `id % test_peers`.
+const test_peers: u32 = 8;
+
+/// The fake socket a send test's entry holds: below any arrival's, and distinct per entry.
+fn peerSocket(index: u32) io.Socket {
+    assert(index < constants.http_connections_max);
+    comptime assert(test_listener + 1 + constants.http_connections_max < socket_first);
+    return test_listener + 1 + @as(io.Socket, @intCast(index));
+}
 
 const StartupAllocator = @import("../startup_allocator.zig").StartupAllocator;
 
@@ -890,4 +1016,198 @@ test "sim: same seed, same accepts, refusals and faults, in the same order" {
     try testing.expect(a.faults.accept_peer_down > 0);
     try testing.expect(a.faults.accept_backpressure > 0);
     try testing.expectEqual(@as(u64, runs), a.accepted + a.refused + a.faults.total());
+}
+
+test "sim: a release with a send in flight is refused until the send completes" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(23, 0);
+    sim.attachTable(&fixture.table);
+    const peer: io.PeerId = 3;
+    const send: io.Send = .{ .peer = peer, .bytes = "held" };
+    try sim.submit(.{ .id = 1, .operation = .{ .send = send } });
+    try sim.submit(.{ .id = 2, .operation = .{ .send = send } });
+    try testing.expectEqual(@as(connections.SendCount, 2), fixture.table.get(peer).sends_in_flight);
+    const entry_before = fixture.table.get(peer).*;
+    try testing.expectError(error.SendsInFlight, fixture.table.release(peer));
+    try testing.expectEqual(entry_before, fixture.table.get(peer).*);
+    try testing.expectEqual(test_peers, fixture.table.count());
+
+    // One completion at a time: with one send still in flight, the release is still refused.
+    var completions: [1]io.Completion = undefined;
+    var done: u32 = 0;
+    var ticks: u32 = 0;
+    while (ticks <= constants.sim_completion_delay_ticks_max and done < 2) : (ticks += 1) {
+        sim.tick();
+        var polls: u32 = 0;
+        while (polls < 2 and sim.poll(&completions) == 1) : (polls += 1) {
+            done += 1;
+            try testing.expect(completions[0].id == 1 or completions[0].id == 2);
+            try testing.expectEqual(@as(u32, send.bytes.len), try completions[0].result.send);
+            const left: connections.SendCount = @intCast(2 - done);
+            try testing.expectEqual(left, fixture.table.get(peer).sends_in_flight);
+            if (left > 0) try testing.expectError(error.SendsInFlight, fixture.table.release(peer));
+        }
+    }
+    try testing.expectEqual(@as(u32, 2), done);
+    try testing.expectEqual(peerSocket(3), try fixture.table.release(peer));
+    try testing.expect(fixture.table.lookup(peer) == null);
+    try testing.expectEqual(test_peers - 1, fixture.table.count());
+}
+
+/// What `sendSoak` did, for the test to check that every path ran.
+const SoakCounts = struct {
+    sends: u32 = 0,
+    completions: u32 = 0,
+    releases_refused: u32 = 0,
+    reconnects: u32 = 0,
+    /// FNV-1a over every completion's id, in order, so a replay that completed the same
+    /// totals in another order still differs.
+    trace: u64 = 0xcbf29ce484222325,
+};
+
+const soak_steps: u32 = 4_000;
+/// The last steps only tick, so every send in flight completes.
+const soak_steps_total: u32 = soak_steps + constants.sim_completion_delay_ticks_max + 1;
+
+/// A soak's simulator and its model: each entry's live id and its sends in flight, and the
+/// entry each operation id's send went to (an id is its step number).
+const Soak = struct {
+    sim: Sim,
+    table: *connections.Table,
+    ids: [test_peers]io.PeerId,
+    sends: [test_peers]u32,
+    op_entry: [soak_steps]u8,
+    counts: SoakCounts,
+
+    /// A send to `entry`'s live id, unless every slot is in use.
+    fn send(soak: *Soak, step_index: u32, entry: u32) !void {
+        assert(step_index < soak_steps);
+        assert(entry < test_peers);
+        // A tick follows a send three times in eight, and nothing waits more than the
+        // longest delay, so the soak holds a few dozen sends at most, never every slot;
+        // the full-slot paths have tests of their own.
+        assert(soak.sim.in_flight < slots_count);
+        const operation: io.Send = .{ .peer = soak.ids[entry], .bytes = "soak" };
+        try soak.sim.submit(.{ .id = step_index, .operation = .{ .send = operation } });
+        soak.op_entry[step_index] = @intCast(entry);
+        soak.sends[entry] += 1;
+        soak.counts.sends += 1;
+    }
+
+    /// A release of `entry`: refused, changing nothing, exactly while the model counts a
+    /// send on it; otherwise it succeeds, and the entry is taken again at once under its
+    /// next generation, so the old id must find nothing.
+    fn release(soak: *Soak, entry: u32) !void {
+        assert(entry < test_peers);
+        const table = soak.table;
+        const before = table.get(soak.ids[entry]).*;
+        const socket = table.release(soak.ids[entry]) catch |err| {
+            try testing.expectEqual(error.SendsInFlight, err);
+            try testing.expect(soak.sends[entry] > 0);
+            try testing.expectEqual(before, table.get(soak.ids[entry]).*);
+            soak.counts.releases_refused += 1;
+            return;
+        };
+        try testing.expectEqual(@as(u32, 0), soak.sends[entry]);
+        try testing.expectEqual(before.socket, socket);
+        // The free stack hands back the entry just released, under a new generation.
+        const again = try table.acquire(socket);
+        const old: connections.IdParts = @bitCast(soak.ids[entry]);
+        const new: connections.IdParts = @bitCast(again);
+        try testing.expectEqual(old.index, new.index);
+        try testing.expectEqual(old.generation + 1, new.generation);
+        try testing.expect(table.lookup(soak.ids[entry]) == null);
+        soak.ids[entry] = again;
+        soak.counts.reconnects += 1;
+    }
+
+    /// One tick, then every completion due, each uncounted from the entry its send went to.
+    fn tick(soak: *Soak) !void {
+        const completed_before = soak.counts.completions;
+        const in_flight_before = soak.sim.in_flight;
+        soak.sim.tick();
+        var completions: [16]io.Completion = undefined;
+        var batches: u32 = 0;
+        while (batches < slots_count) : (batches += 1) {
+            const count = soak.sim.poll(&completions);
+            for (completions[0..count]) |completion| {
+                try testing.expect(completion.id < soak_steps);
+                try testing.expectEqual(io.Kind.send, @as(io.Kind, completion.result));
+                const done = soak.op_entry[@intCast(completion.id)];
+                try testing.expect(soak.sends[done] > 0);
+                soak.sends[done] -= 1;
+                soak.counts.completions += 1;
+                soak.counts.trace = (soak.counts.trace ^ completion.id) *% 0x100000001b3;
+            }
+            if (count < completions.len) break;
+        }
+        try testing.expect(batches < slots_count);
+        // Every completion taken left the simulator: none lost, none taken twice.
+        assert(soak.counts.completions - completed_before == in_flight_before - soak.sim.in_flight);
+    }
+
+    /// Each entry's count in the table equals the model's, and together they are every
+    /// operation the simulator holds.
+    fn check(soak: *const Soak) !void {
+        var counted: u32 = 0;
+        for (soak.ids, soak.sends) |id, expected| {
+            try testing.expectEqual(expected, soak.table.get(id).sends_in_flight);
+            counted += expected;
+        }
+        try testing.expectEqual(soak.sim.in_flight, counted);
+        try testing.expectEqual(test_peers, soak.table.count());
+    }
+};
+
+/// Seeded steps over `test_peers` live connections: half are sends to a random peer, one
+/// in eight a release of a random peer, and the rest ticks that take every completion due.
+/// After every step the table's counts match the model's (see `Soak`).
+fn sendSoak(seed: u64) !SoakCounts {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var prng: std.Random.DefaultPrng = .init(seed ^ 0x5e9d_50a4);
+    const random = prng.random();
+    var soak: Soak = .{
+        .sim = .init(seed, constants.sim_fault_percent_max),
+        .table = &fixture.table,
+        .ids = undefined,
+        .sends = @splat(0),
+        .op_entry = undefined,
+        .counts = .{},
+    };
+    soak.sim.attachTable(&fixture.table);
+    for (&soak.ids, 0..) |*id, index| id.* = @intCast(index);
+
+    var step_index: u32 = 0;
+    while (step_index < soak_steps_total) : (step_index += 1) {
+        const action: u8 = if (step_index < soak_steps) random.uintLessThan(u8, 8) else 7;
+        const entry = random.uintLessThan(u32, test_peers);
+        switch (action) {
+            0...3 => try soak.send(step_index, entry),
+            4 => try soak.release(entry),
+            else => try soak.tick(),
+        }
+        try soak.check();
+    }
+    assert(step_index == soak_steps_total);
+    try testing.expectEqual(@as(u32, 0), soak.sim.in_flight);
+    try testing.expectEqual(soak.counts.sends, soak.counts.completions);
+    try fixture.expectNoSendsCounted();
+    return soak.counts;
+}
+
+test "sim: seeded sends, releases and reconnects keep the table's counts with the model" {
+    const seeds = [_]u64{ 1, 2, 0x5eed };
+    for (seeds) |seed| {
+        const counts = try sendSoak(seed);
+        // Every path ran: sends completed, releases were refused with sends in flight and
+        // allowed without, and entries were taken again under new generations.
+        try testing.expect(counts.sends > soak_steps / 4);
+        try testing.expect(counts.releases_refused > 0);
+        try testing.expect(counts.reconnects > 0);
+        try testing.expectEqual(counts, try sendSoak(seed));
+    }
 }

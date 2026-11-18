@@ -33,6 +33,13 @@
 //! Every field is required and unknown fields are refused, so a typo can't silently fall
 //! back to a default.
 //!
+//! The file decides where the server listens, so a file owned by another user, or writable
+//! by its group or by others, is refused before a byte of it is read. (Root, and anyone who
+//! may write its directory, can still replace it; the directory is the deployment's to
+//! guard.) The socket path must be valid UTF-8 with no control character in it: no byte
+//! below 0x20, no 0x7f and no C1 control (U+0080 to U+009F), any of which a ZON escape could
+//! otherwise put into a file name and into every log line that prints the path.
+//!
 //! Before the standard library's ZON parser sees the file, `prescan` checks it has exactly
 //! that shape: one flat struct literal of at most `config_fields_max` fields, each a string
 //! or a number, in ASCII outside strings and comments (so no byte-order mark). The parser
@@ -64,8 +71,15 @@ comptime {
 
 pub const ReadError = error{
     /// The file could not be opened or is not a regular file: missing, not readable, a
-    /// directory, device or FIFO, or the process is out of descriptors or memory.
+    /// directory, device or FIFO, or the process is out of descriptors or memory; or the
+    /// kernel couldn't say its type, mode or owner.
     ConfigUnavailable,
+    /// The file belongs to a user other than the one the server runs as, who could change
+    /// where it listens.
+    ConfigOwnerWrong,
+    /// The file is writable by its group or by others, any of whom could change where the
+    /// server listens.
+    ConfigWritableByOthers,
     /// A read failed part way (an I/O error), or the file took more than
     /// `config_read_attempts_max` read calls (short reads or signals).
     ConfigReadFailed,
@@ -90,6 +104,12 @@ pub const ParseError = error{
     SocketPathNotAbsolute,
     /// The path holds a NUL byte, which would cut it short at the kernel.
     SocketPathHasNul,
+    /// The path isn't valid UTF-8, so no log line could show it faithfully.
+    SocketPathNotUtf8,
+    /// The path holds another control character (a byte below 0x20, 0x7f, or a C1 control
+    /// U+0080 to U+009F): a line break or a terminal escape that would reach file names and
+    /// log lines.
+    SocketPathHasControl,
     /// A connection limit of 0, which would refuse every client.
     ConnectionsZero,
     /// More connections than `http_connections_max`, the table's compile-time size.
@@ -171,7 +191,7 @@ pub fn readFile(path: [:0]const u8, buffer: []u8) ReadError![:0]const u8 {
         else => return error.ConfigUnavailable,
     };
     defer _ = linux.close(fd);
-    if (!isRegularFile(fd)) return error.ConfigUnavailable;
+    try checkFile(fd);
 
     const room = buffer[0 .. file_size_max + 1];
     const len = try readAll(fd, room);
@@ -181,17 +201,28 @@ pub fn readFile(path: [:0]const u8, buffer: []u8) ReadError![:0]const u8 {
     return buffer[0..len :0];
 }
 
-/// Whether `fd` is a regular file: not a directory, FIFO, socket or device, any of which
-/// could block or never end.
-fn isRegularFile(fd: linux.fd_t) bool {
+/// Checks the open file `fd`: a regular file (not a directory, FIFO, socket or device, any
+/// of which could block or never end), owned by the user the server runs as (its effective
+/// user ID, the one it acts as) and writable by no one else. The checks run on the
+/// descriptor, so the file checked is the file read.
+fn checkFile(fd: linux.fd_t) ReadError!void {
     assert(fd >= 0);
     var status: linux.Statx = undefined;
-    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &status);
-    if (linux.errno(rc) != .SUCCESS) return false;
-    if (!status.mask.TYPE) return false;
+    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .MODE = true, .UID = true }, &status);
+    if (linux.errno(rc) != .SUCCESS) return error.ConfigUnavailable;
+    if (!status.mask.TYPE or !status.mask.MODE or !status.mask.UID) return error.ConfigUnavailable;
     // The kernel filled in the type it said it did.
     assert(status.mode & linux.S.IFMT != 0);
-    return linux.S.ISREG(status.mode);
+    if (!linux.S.ISREG(status.mode)) return error.ConfigUnavailable;
+    const server_uid = linux.geteuid();
+    if (status.uid != server_uid) {
+        std.log.info("config: owned by user {d}, but the server runs as user {d}", .{ status.uid, server_uid });
+        return error.ConfigOwnerWrong;
+    }
+    if (status.mode & (linux.S.IWGRP | linux.S.IWOTH) != 0) {
+        std.log.info("config: mode {o} lets its group or others write it", .{status.mode & 0o7777});
+        return error.ConfigWritableByOthers;
+    }
 }
 
 /// Reads from `fd` until end of file or until `room` is full, and returns the bytes read.
@@ -466,6 +497,19 @@ fn saturate(value: usize) u32 {
     return result;
 }
 
+/// The index of the first control character in the UTF-8 string `bytes`: a byte below 0x20,
+/// 0x7f, or a C1 control U+0080 to U+009F (encoded 0xc2 0x80 to 0xc2 0x9f), or null.
+fn findControl(bytes: []const u8) ?u32 {
+    assert(bytes.len <= socket_path_max);
+    // Valid UTF-8, so a 0xc2 byte always leads a two-byte character and never ends the string.
+    assert(std.unicode.utf8ValidateSlice(bytes));
+    for (bytes, 0..) |byte, index| {
+        if (byte < 0x20 or byte == 0x7f) return @intCast(index);
+        if (byte == 0xc2 and bytes[index + 1] >= 0x80 and bytes[index + 1] <= 0x9f) return @intCast(index);
+    }
+    return null;
+}
+
 /// Checks each field against its limit and copies the path out of the parser's memory.
 fn check(fields: FileFields) ParseError!Config {
     const path = fields.socket_path;
@@ -473,6 +517,8 @@ fn check(fields: FileFields) ParseError!Config {
     if (path.len > socket_path_max) return error.SocketPathTooLong;
     if (path[0] != '/') return error.SocketPathNotAbsolute;
     if (std.mem.findScalar(u8, path, 0) != null) return error.SocketPathHasNul;
+    if (!std.unicode.utf8ValidateSlice(path)) return error.SocketPathNotUtf8;
+    if (findControl(path) != null) return error.SocketPathHasControl;
     if (fields.connections_max == 0) return error.ConnectionsZero;
     if (fields.connections_max > constants.http_connections_max) return error.ConnectionsOverMax;
 
@@ -533,6 +579,18 @@ test "config: each bad value has its own error" {
         .{ .source = ".{ .socket_path = \"\", .connections_max = 1 }", .expected = error.SocketPathEmpty },
         .{ .source = ".{ .socket_path = \"run/app.sock\", .connections_max = 1 }", .expected = error.SocketPathNotAbsolute },
         .{ .source = ".{ .socket_path = \"/run/a\\x00b\", .connections_max = 1 }", .expected = error.SocketPathHasNul },
+        .{ .source = ".{ .socket_path = \"/run/a\\nb\", .connections_max = 1 }", .expected = error.SocketPathHasControl },
+        .{ .source = ".{ .socket_path = \"/run/\\x1b[2J\", .connections_max = 1 }", .expected = error.SocketPathHasControl },
+        .{ .source = ".{ .socket_path = \"/run/a\\x7f\", .connections_max = 1 }", .expected = error.SocketPathHasControl },
+        .{ .source = ".{ .socket_path = \"/run/a\\x1f\", .connections_max = 1 }", .expected = error.SocketPathHasControl },
+        .{ .source = ".{ .socket_path = \"/run/a\\tb\", .connections_max = 1 }", .expected = error.SocketPathHasControl },
+        .{ .source = ".{ .socket_path = \"/run/a\\rb\", .connections_max = 1 }", .expected = error.SocketPathHasControl },
+        .{ .source = ".{ .socket_path = \"/run/\\u{9b}2J\", .connections_max = 1 }", .expected = error.SocketPathHasControl },
+        .{ .source = ".{ .socket_path = \"/run/a\\u{85}b\", .connections_max = 1 }", .expected = error.SocketPathHasControl },
+        .{ .source = ".{ .socket_path = \"/run/\\x9b2J\", .connections_max = 1 }", .expected = error.SocketPathNotUtf8 },
+        .{ .source = ".{ .socket_path = \"/run/\\xff\", .connections_max = 1 }", .expected = error.SocketPathNotUtf8 },
+        // A lead byte with nothing after it: refused before findControl looks past it.
+        .{ .source = ".{ .socket_path = \"/run/a\\xc2\", .connections_max = 1 }", .expected = error.SocketPathNotUtf8 },
         .{ .source = ".{ .socket_path = \"/run/app.sock\", .connections_max = 0 }", .expected = error.ConnectionsZero },
         .{
             .source = std.fmt.comptimePrint(".{{ .socket_path = \"/run/app.sock\", .connections_max = {d} }}", .{
@@ -546,6 +604,20 @@ test "config: each bad value has its own error" {
         },
     };
     for (cases) |case| try testing.expectError(case.expected, parseTest(case.source));
+}
+
+test "config: printable ASCII and UTF-8 pass the control check; every control is found" {
+    try testing.expectEqual(@as(?u32, null), findControl("/run/a b~!\x20\x7e"));
+    try testing.expectEqual(@as(?u32, null), findControl("/run/caf\xc3\xa9.sock"));
+    // U+00A0, the first character past the C1 range, and a three-byte character.
+    try testing.expectEqual(@as(?u32, null), findControl("/run/\xc2\xa0\xe2\x82\xac"));
+    try testing.expectEqual(@as(?u32, 5), findControl("/run/\x1b[2J"));
+    try testing.expectEqual(@as(?u32, 1), findControl("/\x7f"));
+    try testing.expectEqual(@as(?u32, 2), findControl("/a\x1fb"));
+    try testing.expectEqual(@as(?u32, 5), findControl("/run/\xc2\x80"));
+    try testing.expectEqual(@as(?u32, 1), findControl("/\xc2\x9fb"));
+    const config = try parseTest(".{ .socket_path = \"/run/caf\\u{e9}.sock\", .connections_max = 1 }");
+    try testing.expectEqualStrings("/run/caf\xc3\xa9.sock", config.socketPath());
 }
 
 test "config: a network address in place of the socket path is SocketPathNotAbsolute" {
@@ -726,6 +798,8 @@ const TestFile = struct {
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
         var file: TestFile = .{ .fd = @intCast(rc), .path_bytes = @splat(0) };
         errdefer _ = linux.close(file.fd);
+        // A memfd starts 0777; a config file is writable by its owner alone.
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fchmod(file.fd, 0o600)));
         if (bytes.len > 0) {
             const written = linux.write(file.fd, bytes.ptr, bytes.len);
             try testing.expectEqual(linux.E.SUCCESS, linux.errno(written));
@@ -782,6 +856,43 @@ test "config: a missing file, a directory, a device or a FIFO is ConfigUnavailab
     _ = try std.fmt.bufPrint(&path_bytes, "/proc/self/fd/{d}", .{fds[0]});
     const path = std.mem.sliceTo(&path_bytes, 0);
     try testing.expectError(error.ConfigUnavailable, readFile(path, &test_buffer));
+}
+
+test "config: a file writable by its group or others is ConfigWritableByOthers" {
+    for ([_]u32{ 0o666, 0o620, 0o602, 0o622, 0o777 }) |mode| {
+        var file = try TestFile.init(valid_source);
+        defer file.deinit();
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fchmod(file.fd, mode)));
+        try testing.expectError(error.ConfigWritableByOthers, readFile(file.path(), &test_buffer));
+    }
+    // Readable by everyone is fine, and so is read-only for the owner.
+    for ([_]u32{ 0o644, 0o400, 0o755 }) |mode| {
+        var file = try TestFile.init(valid_source);
+        defer file.deinit();
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fchmod(file.fd, mode)));
+        try testing.expectEqualStrings(valid_source, try readFile(file.path(), &test_buffer));
+    }
+}
+
+test "config: a file another user owns is ConfigOwnerWrong" {
+    if (linux.geteuid() == 0) {
+        // Root may give a file away: a memfd owned by nobody.
+        var file = try TestFile.init(valid_source);
+        defer file.deinit();
+        const chowned = linux.errno(linux.fchown(file.fd, 65534, 65534));
+        if (chowned == .SUCCESS) {
+            return testing.expectError(error.ConfigOwnerWrong, readFile(file.path(), &test_buffer));
+        }
+        // A user namespace that maps root alone has no other user to give a file to.
+        try testing.expectEqual(linux.E.INVAL, chowned);
+    }
+    // /etc/passwd, a regular file mode 0644, is owned by root, or, where root is a
+    // namespace's only user, by the overflow user: either way not by this process.
+    var status: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, "/etc/passwd", 0, .{ .UID = true }, &status);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try testing.expect(status.uid != linux.geteuid());
+    try testing.expectError(error.ConfigOwnerWrong, readFile("/etc/passwd", &test_buffer));
 }
 
 test "config: an I/O error part way through is ConfigReadFailed" {
