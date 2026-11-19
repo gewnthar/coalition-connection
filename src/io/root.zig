@@ -21,7 +21,11 @@
 //! and unchanged until its completion arrives, as with io_uring; the simulator checks this.
 //! Each accepted operation completes exactly once, carrying the `id` the caller gave it, and
 //! ids in flight must be distinct; the simulator and the real type both check this. A
-//! submission refused with `error.QueueFull` never completes. `poll` takes a buffer of 1 to
+//! submission refused with `error.QueueFull` or `error.SendSlotsFull` never completes.
+//! Sends may hold at most `constants.io_sends_in_flight_max` operations; the rest are kept
+//! for accepts, so clients that stop reading can't keep the server from accepting. A send
+//! past that share is refused with `error.SendSlotsFull`, even with operations free; the
+//! simulator and the real type both check this. `poll` takes a buffer of 1 to
 //! `constants.io_operations_in_flight_max` completions. A send may complete short,
 //! reporting fewer bytes than it was given; the caller sends the rest. A send's peer stays
 //! in the connection table, with its socket open, until the send's completion arrives. The
@@ -82,7 +86,10 @@ pub const Socket = i32;
 /// Chosen by the caller and handed back with the completion, like io_uring's user_data.
 pub const OperationId = u64;
 
-pub const SubmitError = error{QueueFull};
+/// `QueueFull`: every operation the I/O type holds is in flight. `SendSlotsFull`: a send,
+/// with sends already holding their whole share (`constants.io_sends_in_flight_max`); the
+/// operations left are kept for accepts. Either way, submit again after a completion.
+pub const SubmitError = error{ QueueFull, SendSlotsFull };
 pub const SendError = error{ PeerDown, Backpressure };
 pub const DatabaseError = error{ Unavailable, Timeout };
 

@@ -54,7 +54,10 @@
 //! `release` refuses with `error.SendsInFlight`, changing nothing, while it is above zero.
 //! A refusal is a state the caller meets in normal running (a second send still queued
 //! when the first fails with `PeerDown`), so it is an error to handle, not a bug: the
-//! caller stops sending on that connection and releases it after its last completion.
+//! caller stops sending on that connection and releases it after its last completion. A
+//! send to a client that stops reading never completes on its own, so the caller first
+//! drops the connection through the I/O type (`io.real.Real.drop`), which fails every send
+//! still pending on its socket.
 
 const std = @import("std");
 const assert = std.debug.assert;
