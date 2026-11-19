@@ -11,10 +11,12 @@
 //! free, ends startup, then attaches the table to a simulator; a response-writer case ends
 //! startup, then writes one response into a buffer cut from the middle of a larger array,
 //! with the body, a header name or a header value placed inside the buffer, across one of
-//! its edges, right next to it, or elsewhere. A case that `trips` must stop the process on
-//! an assertion (before the child allocator is touched, for the allocator), or, for a
-//! submitted execute, on the real type's placeholder panic; a control case makes a call
-//! its target allows and must finish normally.
+//! its edges, right next to it, or elsewhere; an in-place case ends startup, then writes
+//! one in-place response whose body offset or length sits inside, at or one past a bound.
+//! A case that `trips` must stop the process on an assertion (before the child allocator
+//! is touched, for the allocator), or, for a submitted execute, on the real type's
+//! placeholder panic; a control case makes a call its target allows and must finish
+//! normally.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -204,6 +206,37 @@ pub const ResponseCall = enum(u8) {
     empty_body_inside,
 };
 
+/// A call to the in-place response writer (`cc.live.http_response.writeInPlace`) on a
+/// buffer of `head_room` plus the body's length (cut shorter where a case says so), from
+/// the middle of a larger array, with the body already rendered after the room. Each
+/// response has status 200 and one header field outside the buffer. Each trip case breaks
+/// exactly one of the writer's three preconditions by one, and holds the other two at
+/// their bounds or inside them, so no other check in the writer can stop it.
+pub const InPlaceCall = enum(u8) {
+    /// The body starts one byte past the room (`head_room + 1`) and ends exactly at the
+    /// buffer's end, so it still fits: only the room assertion can stop it.
+    offset_past_room,
+    /// The body starts at `head_room` and its length runs one byte past the buffer's end:
+    /// only the body-fits assertion can stop it.
+    body_past_end,
+    /// The buffer is cut one byte shorter than `head_room`, the body starts at `head_room`
+    /// (the room assertion's bound) with length 0: only the offset-inside-the-buffer
+    /// assertion can stop it.
+    offset_past_buffer,
+    // Controls.
+    /// The body starts at `head_room` and ends exactly at the buffer's end: the room and
+    /// the body's bounds met exactly, so the write must succeed and return the exact
+    /// response.
+    exact_fit,
+    /// The buffer is cut to exactly `head_room`, and an empty body starts at its end: the
+    /// offset meets the room and the buffer's length exactly, so the write must succeed
+    /// and return the exact head.
+    empty_at_buffer_end,
+    /// The body starts one byte before `head_room` and ends one byte before the buffer's
+    /// end: inside every bound, so a check tightened to equality trips it.
+    inside_bounds,
+};
+
 /// How a tripping case must stop: on a failed assertion, or on the real type's panic for a
 /// submitted execute. A control case doesn't stop, and carries `.assertion` unused.
 pub const Panic = enum(u8) { assertion, execute_placeholder };
@@ -264,6 +297,7 @@ pub const Target = union(enum) {
     real_io: RealCall,
     sim_io: SimCall,
     http_response: ResponseCall,
+    http_response_in_place: InPlaceCall,
 };
 
 pub const Case = struct {
@@ -321,6 +355,19 @@ fn onResponse(name: []const u8, call: ResponseCall, outcome: Outcome) Case {
     // Response-writer case names start with "response_", so the build log groups them.
     assert(std.mem.startsWith(u8, name, "response_"));
     return .{ .name = name, .target = .{ .http_response = call }, .trips = outcome == .trips };
+}
+
+fn onInPlace(name: []const u8, call: InPlaceCall, outcome: Outcome) Case {
+    // A name longer than its group prefix: the prefix alone names no call.
+    assert(name.len > "response_in_place_".len);
+    // In-place case names start with "response_in_place_", so the build log groups them
+    // with the other response-writer cases.
+    assert(std.mem.startsWith(u8, name, "response_in_place_"));
+    return .{
+        .name = name,
+        .target = .{ .http_response_in_place = call },
+        .trips = outcome == .trips,
+    };
 }
 
 pub const exit_finished: u8 = 0;
@@ -445,6 +492,17 @@ pub const cases = [_]Case{
     onResponse("response_outside", .outside, .finishes),
     onResponse("response_adjacent", .adjacent, .finishes),
     onResponse("response_empty_body_inside", .empty_body_inside, .finishes),
+    // The in-place writer: a body offset past the room, a body past the buffer's end, and
+    // an offset past a buffer shorter than the room, each one byte past its bound.
+    onInPlace("response_in_place_offset_past_room", .offset_past_room, .trips),
+    onInPlace("response_in_place_body_past_end", .body_past_end, .trips),
+    onInPlace("response_in_place_offset_past_buffer", .offset_past_buffer, .trips),
+    // Controls: the bounds met exactly, with a body that ends the buffer and with an empty
+    // body at the buffer's end, and a body inside every bound. Each must write the exact
+    // response.
+    onInPlace("response_in_place_exact_fit", .exact_fit, .finishes),
+    onInPlace("response_in_place_empty_at_buffer_end", .empty_at_buffer_end, .finishes),
+    onInPlace("response_in_place_inside_bounds", .inside_bounds, .finishes),
 };
 
 /// The index of the case with exactly this name, or null.
@@ -511,7 +569,7 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .connection_table => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .real_io, .sim_io, .http_response => {},
+            .startup_allocator, .real_io, .sim_io, .http_response, .http_response_in_place => {},
         };
         assert(found == 1);
     }
@@ -520,7 +578,7 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .real_io => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .connection_table, .sim_io, .http_response => {},
+            .startup_allocator, .connection_table, .sim_io, .http_response, .http_response_in_place => {},
         };
         assert(found == 1);
     }
@@ -529,7 +587,7 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .sim_io => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .connection_table, .real_io, .http_response => {},
+            .startup_allocator, .connection_table, .real_io, .http_response, .http_response_in_place => {},
         };
         assert(found == 1);
     }
@@ -538,14 +596,28 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .http_response => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .connection_table, .real_io, .sim_io => {},
+            .startup_allocator, .connection_table, .real_io, .sim_io, .http_response_in_place => {},
+        };
+        assert(found == 1);
+    }
+    // Every in-place response-writer call has exactly one case.
+    for (std.enums.values(InPlaceCall)) |call| {
+        var found: u32 = 0;
+        for (cases) |case| switch (case.target) {
+            .http_response_in_place => |case_call| found += @intFromBool(case_call == call),
+            .startup_allocator, .connection_table, .real_io, .sim_io, .http_response => {},
         };
         assert(found == 1);
     }
     // Only real-I/O cases expect a panic other than an assertion.
     for (cases) |case| switch (case.target) {
         .real_io => {},
-        .startup_allocator, .connection_table, .sim_io, .http_response => assert(case.panic == .assertion),
+        .startup_allocator,
+        .connection_table,
+        .sim_io,
+        .http_response,
+        .http_response_in_place,
+        => assert(case.panic == .assertion),
     };
 }
 
