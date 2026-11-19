@@ -43,12 +43,18 @@
 //! The socket file is created with `listener_socket_mode` and no other: the umask is set
 //! for the one bind call so bind makes the file with exactly those bits, then put back.
 //! Nothing changes the mode by path afterwards, so a symlink swapped in at the path can't
-//! redirect a chmod onto another file. The mode is read back before listen, and anything
-//! else (a default ACL on the directory can narrow it) refuses with `SocketModeWrong`.
-//! Connecting to a Unix socket needs write permission on the file itself, so the mode
-//! decides who may connect; an access ACL the directory's default ACL adds can widen that,
-//! so the socket's directory carries none. The umask is the process's, so `open` runs at
-//! startup, before any other thread exists.
+//! redirect a chmod onto another file. Connecting to a Unix socket needs write permission
+//! on the file itself, so the mode decides who may connect, unless the file carries a POSIX
+//! access ACL. A default ACL on the socket's directory gives every new file one, and then
+//! the mode's group bits are only the ACL's mask: named entries (for example
+//! `u:nobody:rwx`) can let other users connect, or an empty owning-group entry can shut the
+//! group out, while the mode still reads exactly right. So before listen the socket file is
+//! first checked for an access ACL, and any POSIX ACL refuses with `SocketAclPresent`; then
+//! its mode is read back, and anything else (a default ACL with no named entries can narrow
+//! it) refuses with `SocketModeWrong`. Permission models outside POSIX ACLs (NFSv4 ACLs,
+//! CIFS, FUSE without default_permissions) aren't checked, so the socket's directory is on
+//! a local file system. The umask is the process's, so `open` runs at startup, before any
+//! other thread exists.
 //!
 //! `check` is the postcondition every listener meets before an accept is submitted on it:
 //! a Unix socket, a stream socket, bound to a path in the file system, and listening.
@@ -119,8 +125,16 @@ pub const OpenError = CheckError || error{
     /// A file, a directory, a symlink or a live datagram socket is at the path. It is never
     /// removed.
     SocketPathOccupied,
+    /// The socket file bind made carries a POSIX access ACL (a default ACL on its directory
+    /// gives it one), so its mode no longer says who may connect: the ACL's entries may let
+    /// users the mode leaves out connect, or shut out the group the mode names.
+    SocketAclPresent,
+    /// The kernel wouldn't say whether the socket file carries an access ACL; the errno is
+    /// logged.
+    SocketAclUnreadable,
     /// The socket file bind made doesn't have exactly `listener_socket_mode` (a default ACL
-    /// on the directory can narrow it), so the clients the mode names might not connect.
+    /// with no named entries on the directory can narrow it), so the clients the mode names
+    /// might not connect.
     SocketModeWrong,
     /// A system call failed for a reason none of the above names; the errno is logged.
     ListenFailed,
@@ -504,9 +518,13 @@ fn removeStale(address: *const linux.sockaddr.un, address_len: linux.socklen_t, 
 }
 
 /// The socket file bind just made at `file_path`, read back before listen: its file system
-/// and inode, once its mode is shown to be exactly `listener_socket_mode`. The kernel
-/// applies the umask itself, but a default ACL on the directory can narrow the mode, and a
-/// file system may rewrite it; either refuses here, before any client could connect.
+/// and inode, once it is shown to carry no POSIX access ACL and then to have exactly
+/// `listener_socket_mode`, in that order: with an access ACL the mode's group bits are only
+/// the ACL's mask, so a mode read back from such a file proves nothing. The kernel applies
+/// the umask itself, but a default ACL on the directory can add an access ACL or narrow the
+/// mode, and a file system may rewrite it; each refuses here, before any client could
+/// connect. The ACL is queried by path, so the path is shown to still name the file statx
+/// read before its identity is returned.
 fn boundFile(file_path: [:0]const u8) OpenError!FileId {
     assert(file_path.len > 0);
     assert(file_path[0] == '/');
@@ -521,12 +539,17 @@ fn boundFile(file_path: [:0]const u8) OpenError!FileId {
         std.log.err("listener {s}: can't read back the socket file", .{file_path});
         return error.ListenFailed;
     }
+    const file: FileId = .{ .dev_major = status.dev_major, .dev_minor = status.dev_minor, .ino = status.ino };
+    try aclCheck(file_path);
     const mode: u32 = @as(u32, status.mode) & 0o7777;
     modeCheck(mode) catch |err_mode| {
         std.log.err("listener {s}: socket file mode is {o}, not {o}", .{ file_path, mode, socket_mode });
         return err_mode;
     };
-    return .{ .dev_major = status.dev_major, .dev_minor = status.dev_minor, .ino = status.ino };
+    // Replaced between statx and the ACL query by a process that doesn't take the lock: the
+    // ACL checked may not be this file's.
+    if (!sameFile(file_path, file)) return error.SocketPathInUse;
+    return file;
 }
 
 /// Refuses a socket file mode other than exactly `listener_socket_mode`. Pure, so tests can
@@ -535,6 +558,69 @@ fn modeCheck(mode: u32) error{SocketModeWrong}!void {
     assert(mode & ~@as(u32, 0o7777) == 0);
     if (mode != socket_mode) return error.SocketModeWrong;
     assert(mode & bind_umask == 0);
+}
+
+/// The extended attribute a file's POSIX access ACL is stored in, as acl(5) names it.
+const acl_access_name = "system.posix_acl_access";
+
+/// Bytes of the smallest POSIX ACL in its extended-attribute form: a 4-byte version and the
+/// three entries every ACL has (owner, owning group, others), 8 bytes each.
+const acl_size_min: u32 = 4 + 3 * 8;
+
+/// Bytes of the largest extended-attribute value Linux reads or writes (XATTR_SIZE_MAX).
+const xattr_size_max: u32 = 65536;
+
+/// What a query for a file's POSIX access ACL found. Pure, so tests can check every arm,
+/// including those a test can't provoke (a file system without POSIX ACLs, a malformed size).
+const AclOutcome = enum {
+    /// No POSIX access ACL (ENODATA), or a file system without POSIX ACLs (EOPNOTSUPP, which
+    /// Linux also spells ENOTSUP). Other ACL models aren't seen here (see the file's doc).
+    none,
+    /// The query succeeded with a size an ACL can have, so an access ACL exists. Whatever its
+    /// entries say, it is refused: the kernel stores one whenever it isn't the three-entry
+    /// form the mode alone expresses.
+    present,
+    /// Any other errno (the file gone, a security policy refusing the read, an errno the
+    /// call isn't documented to return), or a size no ACL has: startup refuses, logged.
+    unreadable,
+};
+
+/// `len` is the attribute's size when the query succeeded, and 0 when it failed.
+fn aclOutcome(err: linux.E, len: u32) AclOutcome {
+    assert(@backingInt(err) < 4096);
+    assert(err == .SUCCESS or len == 0);
+    // The size comes from the file system, so it is checked, not trusted: an ACL is the
+    // version and at least three 8-byte entries, and no attribute is larger than Linux allows.
+    const well_formed = len >= acl_size_min and len <= xattr_size_max and (len - 4) % 8 == 0;
+    return switch (err) {
+        .SUCCESS => if (well_formed) .present else .unreadable,
+        .NODATA, .OPNOTSUPP => .none,
+        else => .unreadable,
+    };
+}
+
+/// Refuses a socket file at `file_path` that carries a POSIX access ACL. The query passes a
+/// size of 0, so the kernel only reports whether the attribute exists and how long it is,
+/// and copies nothing: no buffer is needed, whatever the ACL holds. lgetxattr reads the file
+/// at the path itself, never one a symlink there points to.
+fn aclCheck(file_path: [:0]const u8) error{ SocketAclPresent, SocketAclUnreadable }!void {
+    assert(file_path.len > 0);
+    assert(file_path[0] == '/');
+    var unused: [1]u8 = undefined;
+    const rc = linux.lgetxattr(file_path, acl_access_name, &unused, 0);
+    const err = linux.errno(rc);
+    // On success rc is the size; a size past u32 is past xattr_size_max, so it saturates.
+    const len: u32 = if (err == .SUCCESS) std.math.lossyCast(u32, rc) else 0;
+    switch (aclOutcome(err, len)) {
+        .none => {},
+        // Returned without a log line, like the other refusals with no number to report
+        // (SocketPathOccupied, SocketDirectoryUnusable): the error's name says what to fix.
+        .present => return error.SocketAclPresent,
+        .unreadable => {
+            std.log.err("listener {s}: can't read the socket file's ACL, errno {d}, size {d}", .{ file_path, @backingInt(err), len });
+            return error.SocketAclUnreadable;
+        },
+    }
 }
 
 /// The file system and inode at `file_path`, without following a symlink, or null when
@@ -903,6 +989,186 @@ test "listener: a socket file mode other than exactly the configured one is refu
     for ([_]u32{ 0o600, 0o640, 0o666, 0o670, 0o760, 0o000, 0o4660, 0o1660 }) |mode| {
         try testing.expectError(error.SocketModeWrong, modeCheck(mode));
     }
+}
+
+const AclTag = enum(u16) {
+    user_obj = 0x01,
+    user = 0x02,
+    group_obj = 0x04,
+    group = 0x08,
+    mask = 0x10,
+    other = 0x20,
+};
+
+/// One entry of a test ACL: a tag, rwx bits and, for a named user or group, its id.
+const AclEntry = struct { tag: AclTag, perm: u16, id: u32 = std.math.maxInt(u32) };
+
+/// Entries a test ACL may hold. Reason: the largest test ACL, owner, one named user,
+/// owning group, mask and others, has five.
+const test_acl_entries_max: u32 = 5;
+
+/// Bytes of the largest test ACL in the kernel's extended-attribute form.
+const test_acl_size_max: u32 = 4 + 8 * test_acl_entries_max;
+
+/// Writes `entries` into `buffer` in the extended-attribute form setxattr takes: a 4-byte
+/// version, then per entry a u16 tag, a u16 permission set and a u32 id, all little-endian.
+/// The entries must already be in the order the kernel accepts: by tag, then by id, with a
+/// mask whenever a named user or group is present (acl(5)), or setxattr refuses them.
+fn testAclBytes(entries: []const AclEntry, buffer: *[test_acl_size_max]u8) []const u8 {
+    assert(entries.len >= 3 and entries.len <= test_acl_entries_max);
+    var named: u32 = 0;
+    var masks: u32 = 0;
+    std.mem.writeInt(u32, buffer[0..4], 2, .little); // POSIX_ACL_XATTR_VERSION
+    for (entries, 0..) |entry, index| {
+        assert(entry.perm <= 7);
+        if (index > 0) {
+            const before = entries[index - 1];
+            const tag = @backingInt(entry.tag);
+            const tag_before = @backingInt(before.tag);
+            assert(tag > tag_before or (tag == tag_before and entry.id > before.id));
+        }
+        if (entry.tag == .user or entry.tag == .group) named += 1;
+        if (entry.tag == .mask) masks += 1;
+        const at = 4 + 8 * index;
+        assert(at + 8 <= buffer.len);
+        std.mem.writeInt(u16, buffer[at..][0..2], @backingInt(entry.tag), .little);
+        std.mem.writeInt(u16, buffer[at + 2 ..][0..2], entry.perm, .little);
+        std.mem.writeInt(u32, buffer[at + 4 ..][0..4], entry.id, .little);
+    }
+    assert(masks <= 1 and (named == 0 or masks == 1));
+    return buffer[0 .. 4 + 8 * entries.len];
+}
+
+/// A default ACL like `setfacl -d -m u:nobody:rwx,g::---` leaves: the owner, user 65534
+/// (nobody) and the mask rwx, the owning group and others nothing. A socket made under it
+/// reads mode 0660, yet nobody may connect and the owning group may not.
+const acl_nobody_in_group_out = [_]AclEntry{
+    .{ .tag = .user_obj, .perm = 7 },
+    .{ .tag = .user, .perm = 7, .id = 65534 },
+    .{ .tag = .group_obj, .perm = 0 },
+    .{ .tag = .mask, .perm = 7 },
+    .{ .tag = .other, .perm = 0 },
+};
+
+/// The same with a read-only mask: a socket made under it reads mode 0640, which the mode
+/// check would refuse too, so it pins that the ACL check runs first.
+const acl_nobody_mask_read = [_]AclEntry{
+    .{ .tag = .user_obj, .perm = 7 },
+    .{ .tag = .user, .perm = 7, .id = 65534 },
+    .{ .tag = .group_obj, .perm = 7 },
+    .{ .tag = .mask, .perm = 4 },
+    .{ .tag = .other, .perm = 0 },
+};
+
+/// Gives the directory at `dir_path` a default ACL of `entries`. The test needs /tmp on a
+/// file system with POSIX ACLs (ext4, xfs, btrfs and tmpfs have them): one that refuses
+/// fails the test with the errno, never skips it.
+fn setDefaultAcl(dir_path: [:0]const u8, entries: []const AclEntry) !void {
+    assert(dir_path.len > 0);
+    assert(dir_path[0] == '/');
+    var buffer: [test_acl_size_max]u8 = undefined;
+    const acl = testAclBytes(entries, &buffer);
+    const err = linux.errno(linux.setxattr(dir_path, "system.posix_acl_default", acl.ptr, acl.len, 0));
+    if (err != .SUCCESS) std.log.warn("test dir {s}: setxattr of a default ACL failed, errno {d}", .{ dir_path, @backingInt(err) });
+    try testing.expectEqual(linux.E.SUCCESS, err);
+}
+
+/// Whether the access ACL at `file_path` (read without following a symlink) holds a
+/// named-user entry for `id`.
+fn aclNamesUser(file_path: [:0]const u8, id: u32) !bool {
+    assert(file_path.len > 0);
+    assert(file_path[0] == '/');
+    var buffer: [test_acl_size_max]u8 = undefined;
+    const rc = linux.lgetxattr(file_path, acl_access_name, &buffer, buffer.len);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try testing.expect(rc >= acl_size_min and rc <= buffer.len and (rc - 4) % 8 == 0);
+    var at: usize = 4;
+    var entries: u32 = 0;
+    while (at + 8 <= rc and entries < test_acl_entries_max) : (entries += 1) {
+        const tag = std.mem.readInt(u16, buffer[at..][0..2], .little);
+        const entry_id = std.mem.readInt(u32, buffer[at + 4 ..][0..4], .little);
+        if (tag == @backingInt(AclTag.user) and entry_id == id) return true;
+        at += 8;
+    }
+    assert(entries <= test_acl_entries_max);
+    return false;
+}
+
+test "listener: a default ACL on the directory leaves the mode right but adds an access ACL" {
+    // The gap the ACL check closes: under the umask open uses, a socket bound in a directory
+    // with a default ACL naming another user reads exactly listener_socket_mode, so the mode
+    // check alone passes it, yet its access ACL names that user.
+    var dir: TestDir = undefined;
+    try dir.create("aclmode");
+    defer dir.remove();
+    try setDefaultAcl(dir.path(), &acl_nobody_in_group_out);
+    var buffer: [path_max + 1]u8 = undefined;
+    const file_path = dir.file(&buffer, "other.sock");
+    const original = setUmask(bind_umask);
+    const socket = bindUnlocked(file_path, linux.SOCK.STREAM, false);
+    _ = setUmask(original);
+    closeLogged(try socket, "test socket");
+    var status: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, file_path, linux.AT.SYMLINK_NOFOLLOW, .{ .MODE = true }, &status);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try modeCheck(@as(u32, status.mode) & 0o7777);
+    try testing.expect(try aclNamesUser(file_path, 65534));
+    try testing.expectError(error.SocketAclPresent, aclCheck(file_path));
+    // A symlink to that socket is read as the link, which carries no ACL, never the socket.
+    const link = dir.file(&buffer, "link.sock");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink("other.sock", link)));
+    try aclCheck(link);
+}
+
+test "listener: a socket that a directory's default ACL gives an access ACL is refused, and nothing is left" {
+    var dir: TestDir = undefined;
+    try dir.create("acl");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+    const file_path = dir.file(&buffer, "app.sock");
+
+    // The fresh directory carries no default ACL (none inherited from /tmp), so it opens.
+    var none: [1]u8 = undefined;
+    const inherited = linux.lgetxattr(dir.path(), "system.posix_acl_default", &none, 0);
+    try testing.expectEqual(linux.E.NODATA, linux.errno(inherited));
+    {
+        var plain = try open(file_path);
+        defer plain.close();
+    }
+
+    try setDefaultAcl(dir.path(), &acl_nobody_in_group_out);
+    try expectOpenError(error.SocketAclPresent, file_path);
+    // The refused open removed the socket file it bound and released the lock.
+    try testing.expect(!try exists(file_path));
+
+    // A mask that also narrows the mode to 0640 is still SocketAclPresent: the ACL is
+    // checked before the mode, which an access ACL makes meaningless.
+    try setDefaultAcl(dir.path(), &acl_nobody_mask_read);
+    try expectOpenError(error.SocketAclPresent, file_path);
+    try testing.expect(!try exists(file_path));
+
+    // With the default ACL gone, the same path opens again, so the lock was released.
+    const removed = linux.errno(linux.removexattr(dir.path(), "system.posix_acl_default"));
+    try testing.expectEqual(linux.E.SUCCESS, removed);
+    var again = try open(file_path);
+    defer again.close();
+    try check(again.socket);
+}
+
+test "listener: every ACL query outcome, and only a well-formed successful query is an ACL" {
+    try testing.expectEqual(AclOutcome.present, aclOutcome(.SUCCESS, acl_size_min));
+    try testing.expectEqual(AclOutcome.present, aclOutcome(.SUCCESS, 44));
+    try testing.expectEqual(AclOutcome.present, aclOutcome(.SUCCESS, xattr_size_max - 4));
+    // Sizes no ACL has: empty, short, between entries, and past the largest attribute.
+    for ([_]u32{ 0, 4, acl_size_min - 8, acl_size_min - 1, 45, xattr_size_max + 4, std.math.maxInt(u32) }) |len| {
+        try testing.expectEqual(AclOutcome.unreadable, aclOutcome(.SUCCESS, len));
+    }
+    try testing.expectEqual(AclOutcome.none, aclOutcome(.NODATA, 0));
+    try testing.expectEqual(AclOutcome.none, aclOutcome(.OPNOTSUPP, 0));
+    const unreadable = [_]linux.E{ .NOENT, .ACCES, .PERM, .RANGE, .@"2BIG", .NOMEM, .IO, .FAULT, .NOTDIR, .LOOP };
+    for (unreadable) |err| try testing.expectEqual(AclOutcome.unreadable, aclOutcome(err, 0));
+    // A number std has no name for.
+    try testing.expectEqual(AclOutcome.unreadable, aclOutcome(@fromBackingInt(@intCast(4000)), 0));
 }
 
 test "listener: every probe errno has an outcome, and only a refused connect is stale" {
