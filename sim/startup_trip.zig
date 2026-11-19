@@ -82,6 +82,18 @@
 //! hands it was checked first, so through `write` it can't be the only check left.
 //! As for every assertion case, a pass shows that some assertion fired during the call,
 //! not which one; nothing else in `write` can fire on these inputs today.
+//!
+//! For the in-place writer, `writeInPlace` asserts three preconditions before anything
+//! else: the body offset is at most `head_room`, at most the buffer's length, and the body
+//! fits in the buffer after it. Each trip case breaks one of them by one byte and meets the
+//! other two exactly at their bounds or inside them, so no other check can stop it.
+//! Without the room check, a body one past the room writes and returns (exit 2); without
+//! either buffer check, the slice past the buffer's end or the length subtraction stops on
+//! a safety panic, not an assertion (exit 3). Two controls meet the bounds exactly (a body
+//! at the room's end that ends the buffer; an empty body at the end of a buffer exactly the
+//! room's size), so a check made one byte too strict trips one of them; a third sits one
+//! byte inside the room and one byte short of the buffer's end, so a check tightened to
+//! equality trips it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -128,6 +140,7 @@ comptime {
         .real_io => |call| assert(c.trips != realCallAllowed(call)),
         .sim_io => |call| assert(c.trips != simCallAllowed(call)),
         .http_response => |call| assert(c.trips != responseCallAllowed(call)),
+        .http_response_in_place => |call| assert(c.trips != inPlaceCallAllowed(call)),
     };
 }
 
@@ -263,6 +276,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         .real_io => |call| runRealCase(&startup, call, case),
         .sim_io => |call| runSimCase(&startup, call, case),
         .http_response => |call| runResponseCase(&startup, call, case),
+        .http_response_in_place => |call| runInPlaceCase(&startup, call, case),
     }
 }
 
@@ -1377,6 +1391,150 @@ fn responseControlHeld(
     if (!std.mem.eql(u8, storage[response_margin..end], expected)) return false;
     if (!std.mem.eql(u8, storage[0..response_margin], before[0..response_margin])) return false;
     return std.mem.eql(u8, storage[end..], before[end..]);
+}
+
+/// The in-place buffer: the fixed room, then the body exactly to the buffer's end. Each
+/// side keeps `response_margin` bytes of the array, so a write outside the buffer shows.
+const in_place_buffer_len: u32 = http_response.head_room + response_body.len;
+const in_place_storage_len: u32 = response_margin + in_place_buffer_len + response_margin;
+
+comptime {
+    assert(in_place_buffer_len <= cc.constants.http_response_size_max);
+    // The offset-past-room case's body is one byte shorter than the control's, so the
+    // body has at least one byte to lose.
+    assert(response_body.len >= 1);
+    // The control's whole head fits even the inside control's room, one byte short of the
+    // fixed one, so only the bounds under test can stop a case, never ResponseTooLarge.
+    assert(response_expected.len - response_body.len < http_response.head_room - 1);
+    // The fill byte is in none of the bytes the control writes, so a moved byte would show.
+    assert(std.mem.findScalar(u8, response_expected, response_fill) == null);
+    // Each trip case breaks exactly one of the writer's three preconditions, and a control
+    // breaks none. Checked here once for every call, not again in each run.
+    for (std.enums.values(trip.InPlaceCall)) |call| {
+        const broken = inPlaceBoundsBroken(inPlaceShape(call));
+        assert(broken == @intFromBool(!inPlaceCallAllowed(call)));
+    }
+}
+
+/// Whether the in-place writer allows `call`: the controls. The cases file says the same
+/// through each case's outcome, and the comptime block at the top checks the two agree.
+fn inPlaceCallAllowed(call: trip.InPlaceCall) bool {
+    const allowed = switch (call) {
+        .exact_fit, .empty_at_buffer_end, .inside_bounds => true,
+        .offset_past_room, .body_past_end, .offset_past_buffer => false,
+    };
+    const shape = inPlaceShape(call);
+    // A control's body is the whole fixed body or none, so its exact output is known.
+    assert(!allowed or shape.body_len == 0 or shape.body_len == response_body.len);
+    // A control's room is never larger than the fixed one.
+    assert(!allowed or shape.body_offset <= http_response.head_room);
+    return allowed;
+}
+
+/// The buffer length, body offset and body length an in-place case passes.
+const InPlaceShape = struct { buffer_len: u32, body_offset: u32, body_len: u32 };
+
+/// Each trip case is one byte past exactly one bound and meets the other two; the exact-fit
+/// and empty controls meet each bound they touch exactly, and the inside control sits one
+/// byte inside both the room and the buffer's end.
+fn inPlaceShape(call: trip.InPlaceCall) InPlaceShape {
+    const room = http_response.head_room;
+    const body: u32 = response_body.len;
+    const full = in_place_buffer_len;
+    const shape: InPlaceShape = switch (call) {
+        .offset_past_room => .{ .buffer_len = full, .body_offset = room + 1, .body_len = body - 1 },
+        .body_past_end => .{ .buffer_len = full, .body_offset = room, .body_len = body + 1 },
+        .offset_past_buffer => .{ .buffer_len = room - 1, .body_offset = room, .body_len = 0 },
+        .exact_fit => .{ .buffer_len = full, .body_offset = room, .body_len = body },
+        .empty_at_buffer_end => .{ .buffer_len = room, .body_offset = room, .body_len = 0 },
+        .inside_bounds => .{ .buffer_len = full, .body_offset = room - 1, .body_len = body },
+    };
+    assert(shape.buffer_len <= full);
+    assert(shape.body_offset <= room + 1);
+    return shape;
+}
+
+/// How many of `writeInPlace`'s three preconditions `shape` breaks: the offset at most the
+/// room, the offset inside the buffer, the body inside the buffer after the offset.
+fn inPlaceBoundsBroken(shape: InPlaceShape) u32 {
+    assert(shape.buffer_len <= in_place_buffer_len);
+    const room_ok = shape.body_offset <= http_response.head_room;
+    const offset_ok = shape.body_offset <= shape.buffer_len;
+    // The writer computes the room left only once the offset is inside, so does this.
+    const fits = offset_ok and shape.body_len <= shape.buffer_len - shape.body_offset;
+    const broken: u32 = @as(u32, @intFromBool(!room_ok)) + @intFromBool(!offset_ok) +
+        @intFromBool(offset_ok and !fits);
+    assert(broken <= 3);
+    return broken;
+}
+
+/// Ends startup (the writer runs after it, and never allocates), renders the body after
+/// the room, and writes one in-place response into the buffer in the middle of the array.
+fn runInPlaceCase(startup: *cc.StartupAllocator, call: trip.InPlaceCall, case: trip.Case) noreturn {
+    assert(startup.bytes_live == 0);
+    assert(startup.phase == .startup);
+    startup.finishStartup();
+
+    const shape = inPlaceShape(call);
+    var storage: [in_place_storage_len]u8 = @splat(response_fill);
+    const buffer: []u8 = storage[response_margin..][0..shape.buffer_len];
+    // The body as a page renders it, right after the room, wherever it fits the buffer.
+    if (shape.body_len > 0 and shape.body_offset + shape.body_len <= shape.buffer_len) {
+        @memcpy(buffer[shape.body_offset..][0..shape.body_len], response_body[0..shape.body_len]);
+    }
+    const headers = [_]http_response.Header{.{ .name = response_name, .value = response_value }};
+    const response: http_response.InPlace = .{
+        .status = .ok,
+        .headers = &headers,
+        .body_offset = shape.body_offset,
+        .body_len = shape.body_len,
+    };
+    // A control's expected output is a plain GET response without Connection: close.
+    assert(!response.omit_body and !response.close);
+    const before: [in_place_storage_len]u8 = storage;
+
+    child_calls_armed = child_calls;
+    armed = true;
+    const result = http_response.writeInPlace(buffer, response);
+    armed = false;
+
+    if (case.trips) {
+        std.debug.print("startup_trip: {s} returned without tripping: the check is missing\n", .{case.name});
+        std.process.exit(exit_not_tripped);
+    }
+    if (!inPlaceControlHeld(&storage, &before, shape, result)) {
+        std.debug.print("startup_trip: {s} control failed: result={any} child calls={d}\n", .{
+            case.name, result, child_calls - child_calls_armed,
+        });
+        std.process.exit(exit_control_failed);
+    }
+    std.process.exit(trip.exit_finished);
+}
+
+/// A control's write must touch no allocator and return exactly the head and body (the head
+/// alone for the empty body) as one slice of the buffer, ending where the body ends; the
+/// body and every byte outside the buffer must be as they were.
+fn inPlaceControlHeld(
+    storage: *const [in_place_storage_len]u8,
+    before: *const [in_place_storage_len]u8,
+    shape: InPlaceShape,
+    result: http_response.Error![]const u8,
+) bool {
+    assert(inPlaceBoundsBroken(shape) == 0);
+    assert(shape.body_len == 0 or shape.body_len == response_body.len);
+    if (child_calls != child_calls_armed) return false;
+    const expected: []const u8 =
+        if (shape.body_len == 0) response_expected_empty else response_expected;
+    const slice = result catch return false;
+    if (!std.mem.eql(u8, slice, expected)) return false;
+    // The slice lies in the buffer and ends exactly where the body ends.
+    const buffer_start = @intFromPtr(storage) + response_margin;
+    const body_end = buffer_start + shape.body_offset + shape.body_len;
+    if (@intFromPtr(slice.ptr) + slice.len != body_end) return false;
+    // The body and everything after it, and the margin before the buffer, are untouched.
+    const body_start = response_margin + shape.body_offset;
+    if (!std.mem.eql(u8, storage[body_start..], before[body_start..])) return false;
+    return std.mem.eql(u8, storage[0..response_margin], before[0..response_margin]);
 }
 
 const Sim = cc.io.sim.Sim;
