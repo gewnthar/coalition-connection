@@ -119,8 +119,9 @@ pub const OpenError = CheckError || error{
     /// Another server holds the path's lock; or a live server, which took no lock, answers
     /// on the socket at the path; or a socket there can't be probed (no permission to
     /// connect), so it can't be shown stale; or a process that doesn't take the lock bound
-    /// the path, or replaced the socket there, while the stale socket was being replaced.
-    /// A live socket is never removed.
+    /// the path, or replaced the socket there, while the stale socket was being replaced;
+    /// or such a process removed or replaced the socket file between bind and listen. A
+    /// live socket, and any file this call didn't bind, is never removed.
     SocketPathInUse,
     /// A file, a directory, a symlink or a live datagram socket is at the path. It is never
     /// removed.
@@ -140,8 +141,10 @@ pub const OpenError = CheckError || error{
     ListenFailed,
 };
 
-/// Where the socket file came from: the file system and inode bind made. `close` removes the
-/// path only while it still names this file, never one someone put there since.
+/// Where the socket file came from: the file system and inode bind made. `close`, and `open`
+/// on failure, remove the path only while it still names this file, never one someone put
+/// there since. The pair names one file only while the listener's socket is open, since the
+/// socket holds the inode; so each removal runs before that socket is closed.
 const FileId = struct {
     dev_major: u32,
     dev_minor: u32,
@@ -171,8 +174,7 @@ pub const Listener = struct {
     pub fn close(self: *Listener) void {
         assert(self.socket >= 0);
         assert(self.lock >= 0 and self.lock != self.socket);
-        const file_path = self.path();
-        if (sameFile(file_path, self.file)) unlinkLogged(file_path);
+        unlinkIfSame(self.path(), self.file, self.socket);
         closeLogged(self.socket, "socket");
         closeLogged(self.lock, "lock file");
         self.socket = -1;
@@ -182,9 +184,32 @@ pub const Listener = struct {
 
 /// Opens a Unix stream socket listening at `socket_path`, replacing a stale socket a
 /// stopped server left there: one a probe connect shows nothing accepts on. It sets the
-/// process umask for its one bind call, so it runs before any other thread exists. Nothing is left behind on failure but the lock file: the
-/// socket and lock are closed, and a socket file this call bound is removed.
+/// process umask for its one bind call, so it runs before any other thread exists. On
+/// failure the socket and lock are closed, and a socket file this call bound is removed
+/// while the path still names it; a file put at the path since, by a process that doesn't
+/// take the lock, is never removed. Left behind: the lock file, and the socket file itself
+/// when its identity couldn't be read right after bind (statx failed), since then nothing
+/// tells it from a replacement. The next `open` replaces such a file as stale.
 pub fn open(socket_path: []const u8) OpenError!Listener {
+    return openPaused(socket_path, pauseNone);
+}
+
+/// Called by `openPaused` between reading the bound file's identity and checking it, with
+/// the socket path. `open` passes `pauseNone`; a test passes one that replaces the file at
+/// the path, as a process that doesn't take the lock could at that moment. The one test
+/// seam in this file: a comptime parameter, so no function pointer exists at run time.
+const Pause = fn (file_path: [:0]const u8) void;
+
+/// Does nothing, so it has no assertions: there is no state of its own to check, and
+/// `openPaused` has already asserted everything about the path.
+fn pauseNone(file_path: [:0]const u8) void {
+    _ = file_path;
+}
+
+/// `open`, with `pause` run once after bind, at the point where a replaced file is most
+/// easily mistaken for this call's own. `pause` is comptime, so `open` calls `pauseNone`
+/// directly, which compiles to nothing.
+fn openPaused(socket_path: []const u8, comptime pause: Pause) OpenError!Listener {
     assert(socket_path.len > 0 and socket_path.len <= path_max);
     assert(socket_path[0] == '/');
     assert(std.mem.findScalar(u8, socket_path, 0) == null);
@@ -204,9 +229,18 @@ pub fn open(socket_path: []const u8) OpenError!Listener {
     listener.socket = try unixSocket(.blocking);
     errdefer closeLogged(listener.socket, "socket");
     try bindReplacingStale(listener.socket, &listener.address, file_path);
-    // The lock is held, so the file at the path is the one bind just made.
-    errdefer unlinkLogged(file_path);
+    // The lock is held, so the socket at the path is the one bind just made, unless a
+    // process that doesn't take the lock replaced it in between; boundFile refuses a path
+    // that names no socket. A socket swapped in before boundFile's statx would be taken
+    // for this one: Linux has no call that gives a bound socket's file by descriptor, so
+    // that window, like the one in removeStale, isn't closed. Until the identity is known
+    // nothing is removed on failure.
     listener.file = try boundFile(file_path);
+    // Removed on failure only while the path still names that file: a file put there since
+    // is someone else's, which is exactly what boundCheck refuses as SocketPathInUse.
+    errdefer unlinkIfSame(file_path, listener.file, listener.socket);
+    pause(file_path);
+    try boundCheck(file_path, listener.file);
 
     const listened = linux.errno(linux.listen(listener.socket, backlog));
     if (listened != .SUCCESS) {
@@ -517,39 +551,71 @@ fn removeStale(address: *const linux.sockaddr.un, address_len: linux.socklen_t, 
     }
 }
 
-/// The socket file bind just made at `file_path`, read back before listen: its file system
-/// and inode, once it is shown to carry no POSIX access ACL and then to have exactly
-/// `listener_socket_mode`, in that order: with an access ACL the mode's group bits are only
-/// the ACL's mask, so a mode read back from such a file proves nothing. The kernel applies
-/// the umask itself, but a default ACL on the directory can add an access ACL or narrow the
-/// mode, and a file system may rewrite it; each refuses here, before any client could
-/// connect. The ACL is queried by path, so the path is shown to still name the file statx
-/// read before its identity is returned.
+/// The file system and inode of the socket file bind just made at `file_path`, read once,
+/// right after bind, so that every later check and the cleanup on failure can tell this
+/// file from one put at the path since. A path that no longer names a socket (removed, or
+/// replaced by another kind of file, since bind) is `SocketPathInUse`: no socket there is
+/// this call's.
 fn boundFile(file_path: [:0]const u8) OpenError!FileId {
     assert(file_path.len > 0);
     assert(file_path[0] == '/');
     var status: linux.Statx = undefined;
-    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .INO = true };
+    const mask: linux.STATX = .{ .TYPE = true, .INO = true };
     const err = linux.errno(linux.statx(linux.AT.FDCWD, file_path, linux.AT.SYMLINK_NOFOLLOW, mask, &status));
+    if (err == .NOENT) return error.SocketPathInUse;
     if (err != .SUCCESS) {
         std.log.err("listener {s}: statx of the socket file failed, errno {d}", .{ file_path, @backingInt(err) });
         return error.ListenFailed;
     }
-    if (!status.mask.TYPE or !status.mask.MODE or !status.mask.INO or !linux.S.ISSOCK(status.mode)) {
+    if (!status.mask.TYPE or !status.mask.INO) {
         std.log.err("listener {s}: can't read back the socket file", .{file_path});
         return error.ListenFailed;
     }
-    const file: FileId = .{ .dev_major = status.dev_major, .dev_minor = status.dev_minor, .ino = status.ino };
-    try aclCheck(file_path);
+    if (!linux.S.ISSOCK(status.mode)) return error.SocketPathInUse;
+    return .{ .dev_major = status.dev_major, .dev_minor = status.dev_minor, .ino = status.ino };
+}
+
+/// Checks the socket file `file` at `file_path` before listen: first that it carries no
+/// POSIX access ACL, then that it has exactly `listener_socket_mode`, in that order: with an
+/// access ACL the mode's group bits are only the ACL's mask, so a mode read back from such a
+/// file proves nothing. The kernel applies the umask itself, but a default ACL on the
+/// directory can add an access ACL or narrow the mode, and a file system may rewrite it;
+/// each refuses here, before any client could connect. The ACL is queried by path, so the
+/// mode is read by a statx that also shows the path still names `file`: otherwise the ACL
+/// checked may not be its, and the path is `SocketPathInUse`.
+fn boundCheck(file_path: [:0]const u8, file: FileId) OpenError!void {
+    assert(file_path.len > 0);
+    assert(file_path[0] == '/');
+    aclCheck(file_path) catch |err_acl| {
+        // A query that failed on a file put at the path since (or on an empty path) says
+        // nothing about this one: the path is someone else's.
+        if (!sameFile(file_path, file)) return error.SocketPathInUse;
+        return err_acl;
+    };
+    var status: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .INO = true };
+    const err = linux.errno(linux.statx(linux.AT.FDCWD, file_path, linux.AT.SYMLINK_NOFOLLOW, mask, &status));
+    if (err == .NOENT) return error.SocketPathInUse;
+    if (err != .SUCCESS) {
+        std.log.err("listener {s}: statx of the socket file failed, errno {d}", .{ file_path, @backingInt(err) });
+        return error.ListenFailed;
+    }
+    if (!status.mask.TYPE or !status.mask.MODE or !status.mask.INO) {
+        std.log.err("listener {s}: can't read back the socket file", .{file_path});
+        return error.ListenFailed;
+    }
+    const same = linux.S.ISSOCK(status.mode) and status.ino == file.ino and
+        status.dev_major == file.dev_major and status.dev_minor == file.dev_minor;
+    if (!same) {
+        std.log.info("listener {s}: the socket file was replaced before listen", .{file_path});
+        return error.SocketPathInUse;
+    }
     const mode: u32 = @as(u32, status.mode) & 0o7777;
     modeCheck(mode) catch |err_mode| {
         std.log.err("listener {s}: socket file mode is {o}, not {o}", .{ file_path, mode, socket_mode });
         return err_mode;
     };
-    // Replaced between statx and the ACL query by a process that doesn't take the lock: the
-    // ACL checked may not be this file's.
-    if (!sameFile(file_path, file)) return error.SocketPathInUse;
-    return file;
+    assert(mode == socket_mode);
 }
 
 /// Refuses a socket file mode other than exactly `listener_socket_mode`. Pure, so tests can
@@ -580,8 +646,11 @@ const AclOutcome = enum {
     /// entries say, it is refused: the kernel stores one whenever it isn't the three-entry
     /// form the mode alone expresses.
     present,
-    /// Any other errno (the file gone, a security policy refusing the read, an errno the
-    /// call isn't documented to return), or a size no ACL has: startup refuses, logged.
+    /// The path names nothing (ENOENT): the socket file bind made was removed since, by a
+    /// process that doesn't take the lock, so the path is someone else's.
+    gone,
+    /// Any other errno (a security policy refusing the read, an errno the call isn't
+    /// documented to return), or a size no ACL has: startup refuses, logged.
     unreadable,
 };
 
@@ -595,6 +664,7 @@ fn aclOutcome(err: linux.E, len: u32) AclOutcome {
     return switch (err) {
         .SUCCESS => if (well_formed) .present else .unreadable,
         .NODATA, .OPNOTSUPP => .none,
+        .NOENT => .gone,
         else => .unreadable,
     };
 }
@@ -603,7 +673,7 @@ fn aclOutcome(err: linux.E, len: u32) AclOutcome {
 /// size of 0, so the kernel only reports whether the attribute exists and how long it is,
 /// and copies nothing: no buffer is needed, whatever the ACL holds. lgetxattr reads the file
 /// at the path itself, never one a symlink there points to.
-fn aclCheck(file_path: [:0]const u8) error{ SocketAclPresent, SocketAclUnreadable }!void {
+fn aclCheck(file_path: [:0]const u8) error{ SocketAclPresent, SocketAclUnreadable, SocketPathInUse }!void {
     assert(file_path.len > 0);
     assert(file_path[0] == '/');
     var unused: [1]u8 = undefined;
@@ -616,6 +686,7 @@ fn aclCheck(file_path: [:0]const u8) error{ SocketAclPresent, SocketAclUnreadabl
         // Returned without a log line, like the other refusals with no number to report
         // (SocketPathOccupied, SocketDirectoryUnusable): the error's name says what to fix.
         .present => return error.SocketAclPresent,
+        .gone => return error.SocketPathInUse,
         .unreadable => {
             std.log.err("listener {s}: can't read the socket file's ACL, errno {d}, size {d}", .{ file_path, @backingInt(err), len });
             return error.SocketAclUnreadable;
@@ -642,6 +713,26 @@ fn sameFile(file_path: [:0]const u8, file: FileId) bool {
     assert(file_path[0] == '/');
     const now = fileId(file_path) orelse return false;
     return now.ino == file.ino and now.dev_major == file.dev_major and now.dev_minor == file.dev_minor;
+}
+
+/// Removes `file_path` while it still names the socket file `file`, and leaves anything else
+/// there: a file put at the path by a process that doesn't take the lock is never this
+/// server's to remove. Such a process could still swap the file between the check and the
+/// unlink; Linux has no unlink by inode, and the lock is what keeps this server's own
+/// copies apart. `socket`, the one bound to `file`, must still be open: it holds the file's
+/// inode, so no file put at the path since can have been given the same number. Once it
+/// is closed, a file system such as ext4 hands the freed number to the next file at once.
+fn unlinkIfSame(file_path: [:0]const u8, file: FileId, socket: io.Socket) void {
+    assert(file_path.len > 0 and file_path[0] == '/');
+    assert(socket >= 0);
+    assert(linux.errno(linux.fcntl(socket, linux.F.GETFD, 0)) == .SUCCESS);
+    if (sameFile(file_path, file)) {
+        unlinkLogged(file_path);
+    } else if (linux.errno(linux.access(file_path, linux.F_OK)) == .NOENT) {
+        std.log.info("listener {s}: the socket file was already removed", .{file_path});
+    } else {
+        std.log.info("listener {s}: left a file someone else put at the path", .{file_path});
+    }
 }
 
 /// Removes `file_path`, logging any failure but a file already gone.
@@ -1165,7 +1256,8 @@ test "listener: every ACL query outcome, and only a well-formed successful query
     }
     try testing.expectEqual(AclOutcome.none, aclOutcome(.NODATA, 0));
     try testing.expectEqual(AclOutcome.none, aclOutcome(.OPNOTSUPP, 0));
-    const unreadable = [_]linux.E{ .NOENT, .ACCES, .PERM, .RANGE, .@"2BIG", .NOMEM, .IO, .FAULT, .NOTDIR, .LOOP };
+    try testing.expectEqual(AclOutcome.gone, aclOutcome(.NOENT, 0));
+    const unreadable = [_]linux.E{ .ACCES, .PERM, .RANGE, .@"2BIG", .NOMEM, .IO, .FAULT, .NOTDIR, .LOOP };
     for (unreadable) |err| try testing.expectEqual(AclOutcome.unreadable, aclOutcome(err, 0));
     // A number std has no name for.
     try testing.expectEqual(AclOutcome.unreadable, aclOutcome(@fromBackingInt(@intCast(4000)), 0));
@@ -1290,6 +1382,163 @@ test "listener: close leaves a socket someone else put at the path" {
 
     first.close();
     try testing.expect(try exists(file_path));
+}
+
+/// What a process that doesn't take the lock leaves at the path while `open` runs, after
+/// bind: a socket of its own, the same under a default ACL on the directory, a file of
+/// another kind, or nothing. Each replacement has exactly `listener_socket_mode`, so only
+/// the identity check can tell it from the file bind made.
+const Replacement = enum { socket, socket_acl, file, nothing };
+
+/// The pause the replacement tests pass to `openPaused`: removes the socket file `open`
+/// just bound and puts `replacement` in its place. The pause can't return an error, so a
+/// failed step sets `failed`, which the test checks first; a socket it binds stays open in
+/// `socket` until the test closes it. Set by `expectReplacedRefused` before each call.
+const ReplaceDuringOpen = struct {
+    var replacement: Replacement = .nothing;
+    var socket: io.Socket = -1;
+    var failed: bool = false;
+
+    fn pause(file_path: [:0]const u8) void {
+        assert(file_path.len > 0 and file_path[0] == '/');
+        assert(socket == -1 and !failed);
+        failed = !replace(file_path);
+    }
+
+    fn replace(file_path: [:0]const u8) bool {
+        assert(file_path.len > 0);
+        assert(socket == -1);
+        if (linux.errno(linux.unlink(file_path)) != .SUCCESS) return false;
+        switch (replacement) {
+            .socket, .socket_acl => {
+                if (replacement == .socket_acl) {
+                    var dir_buffer: [path_max + 1]u8 = undefined;
+                    const slash = std.mem.findScalarLast(u8, file_path, '/') orelse return false;
+                    @memcpy(dir_buffer[0..slash], file_path[0..slash]);
+                    dir_buffer[slash] = 0;
+                    setDefaultAcl(dir_buffer[0..slash :0], &acl_nobody_in_group_out) catch return false;
+                }
+                const previous = linux.syscall1(.umask, bind_umask);
+                defer _ = linux.syscall1(.umask, previous);
+                socket = bindUnlocked(file_path, linux.SOCK.STREAM, true) catch return false;
+            },
+            .file => {
+                const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true };
+                const created = linux.open(file_path, flags, 0o600);
+                if (linux.errno(created) != .SUCCESS) return false;
+                const fd: linux.fd_t = @intCast(created);
+                defer closeLogged(fd, "test file");
+                if (linux.errno(linux.fchmod(fd, socket_mode)) != .SUCCESS) return false;
+            },
+            .nothing => {},
+        }
+        return true;
+    }
+};
+
+/// Expects `openPaused` with `replacement` put at the path during open to refuse
+/// `file_path` as `SocketPathInUse`.
+fn expectReplacedRefused(replacement: Replacement, file_path: [:0]const u8) !void {
+    assert(file_path.len > 0);
+    assert(ReplaceDuringOpen.socket == -1);
+    ReplaceDuringOpen.replacement = replacement;
+    ReplaceDuringOpen.failed = false;
+    const result = openPaused(file_path, ReplaceDuringOpen.pause);
+    try testing.expect(!ReplaceDuringOpen.failed);
+    if (result) |opened| {
+        var listener = opened;
+        listener.close();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.SocketPathInUse, err);
+}
+
+/// Closes the replacement socket a test left open, if any.
+fn closeReplacement() void {
+    assert(ReplaceDuringOpen.socket >= -1);
+    if (ReplaceDuringOpen.socket >= 0) closeLogged(ReplaceDuringOpen.socket, "test socket");
+    ReplaceDuringOpen.socket = -1;
+    assert(ReplaceDuringOpen.socket == -1);
+}
+
+test "listener: a socket put at the path during open is SocketPathInUse, kept and still reachable" {
+    var dir: TestDir = undefined;
+    try dir.create("swapsock");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+    const file_path = dir.file(&buffer, "app.sock");
+    defer closeReplacement();
+
+    try expectReplacedRefused(.socket, file_path);
+    // The refused open's cleanup left the other program's socket where it was, though its
+    // mode is exactly the one this server sets.
+    try testing.expect(ReplaceDuringOpen.socket >= 0);
+    try testing.expect(try exists(file_path));
+    try testing.expectEqual(linux.E.SUCCESS, try connectTo(file_path));
+
+    // The lock was released: with the other socket gone, the path opens again.
+    closeReplacement();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(file_path)));
+    var again = try open(file_path);
+    defer again.close();
+    try check(again.socket);
+}
+
+test "listener: a replacement that carries an ACL is SocketPathInUse, not SocketAclPresent, and kept" {
+    var dir: TestDir = undefined;
+    try dir.create("swapacl");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+    const file_path = dir.file(&buffer, "app.sock");
+    defer closeReplacement();
+
+    // The pause sets a default ACL on the directory before it binds, so only the
+    // replacement carries an access ACL: the identity is checked before the ACL's error.
+    try expectReplacedRefused(.socket_acl, file_path);
+    try testing.expect(try aclNamesUser(file_path, 65534));
+    try testing.expectEqual(linux.E.SUCCESS, try connectTo(file_path));
+}
+
+test "listener: a file put at the path, or the path emptied, during open is SocketPathInUse" {
+    var dir: TestDir = undefined;
+    try dir.create("swapfile");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+
+    const file_path = dir.file(&buffer, "app.sock");
+    try expectReplacedRefused(.file, file_path);
+    // A regular file is never mistaken for the socket bind made, so it stays.
+    try testing.expect(try exists(file_path));
+    try testing.expect(fileId(file_path) == null);
+
+    const emptied = dir.file(&buffer, "gone.sock");
+    try expectReplacedRefused(.nothing, emptied);
+    try testing.expect(!try exists(emptied));
+}
+
+test "listener: unlinkIfSame removes only the socket file it names, while both are bound" {
+    var dir: TestDir = undefined;
+    try dir.create("ifsame");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+    const file_path = dir.file(&buffer, "app.sock");
+
+    // Both sockets stay open, as open's and close's own socket does when they clean up: an
+    // open socket holds its file's inode, so the second file can't be given the first's
+    // number. (Once both are closed, ext4 hands a freed number to the next file at once.)
+    const first = try bindUnlocked(file_path, linux.SOCK.STREAM, true);
+    defer closeLogged(first, "test socket");
+    const first_file = fileId(file_path) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(file_path)));
+    const second = try bindUnlocked(file_path, linux.SOCK.STREAM, true);
+    defer closeLogged(second, "test socket");
+    const second_file = fileId(file_path) orelse return error.TestUnexpectedResult;
+    try testing.expect(first_file.ino != second_file.ino);
+
+    unlinkIfSame(file_path, first_file, first);
+    try testing.expect(try exists(file_path));
+    try testing.expect(sameFile(file_path, second_file));
+    unlinkIfSame(file_path, second_file, second);
+    try testing.expect(!try exists(file_path));
 }
 
 /// A TCP socket on 127.0.0.1 at a port the kernel picks, listening: what a server that
