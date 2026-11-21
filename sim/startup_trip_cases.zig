@@ -122,6 +122,15 @@ pub const RealCall = enum(u8) {
     /// in use: the peer is checked before the queue, so the call trips instead of
     /// returning QueueFull.
     send_free_queue_full,
+    /// A send to the entry in use whose id is the first fill send's, still in flight, with
+    /// every slot a send may take in use: the distinct-id check comes before the sends'
+    /// share, so the call trips instead of returning SendSlotsFull. Of the two refusals only
+    /// SendSlotsFull applies here, so this also fails if the check runs only on a full ring.
+    send_duplicate_id_slots_full,
+    /// The same with an accept in the slot kept for accepts as well, so the whole ring is
+    /// in use: both refusals apply, so the call trips only if the distinct-id check comes
+    /// before both, instead of returning QueueFull.
+    send_duplicate_id_queue_full,
     /// `Real.init` after startup has finished.
     init_running,
     // Controls.
@@ -160,6 +169,10 @@ pub const SimCall = enum(u8) {
     /// the distinct-id check comes before the queue, as on the real type, so the call trips
     /// instead of returning QueueFull.
     send_duplicate_id_queue_full,
+    /// The same with only the slots a send may take in use: the distinct-id check comes
+    /// before the sends' share, as on the real type, so the call trips instead of returning
+    /// SendSlotsFull, and a check run only on a full queue fails it.
+    send_duplicate_id_slots_full,
     /// A poll that completes a send whose entry was released while it was in flight (the
     /// harness clears the entry's count first, so the release goes through): the
     /// completion must stop on the table's live-id check, not uncount a dead entry quietly.
@@ -453,7 +466,8 @@ pub const cases = [_]Case{
     onTable("table_get_writing", .get_writing, .finishes),
     onTable("table_set_state_to_reading", .set_state_to_reading, .finishes),
     // The real I/O type: its clock never steps back, it refuses an execute, a send must
-    // name an entry in use (checked before the queue), and it is set up during startup only.
+    // name an entry in use (checked before the queue), an id in flight is refused before
+    // the sends' share and the queue, and it is set up during startup only.
     onReal("real_now_after_max", .now_after_max, .trips),
     onReal("real_submit_execute", .submit_execute, .trips),
     onReal("real_send_free", .send_free, .trips),
@@ -461,6 +475,8 @@ pub const cases = [_]Case{
     onReal("real_send_out_of_range", .send_out_of_range, .trips),
     onReal("real_send_free_slots_full", .send_free_slots_full, .trips),
     onReal("real_send_free_queue_full", .send_free_queue_full, .trips),
+    onReal("real_send_duplicate_id_slots_full", .send_duplicate_id_slots_full, .trips),
+    onReal("real_send_duplicate_id_queue_full", .send_duplicate_id_queue_full, .trips),
     onReal("real_init_running", .init_running, .trips),
     // Controls: the clock read once, a send to the entry in use, and that send on a full
     // ring.
@@ -470,13 +486,15 @@ pub const cases = [_]Case{
     // The simulator: a send must name a live entry, checked through the table before the
     // queue, as on the real type: a stale id, the free entry, or an index past the table;
     // a send needs a table to check it against; an id in flight is refused before the
-    // queue; and a send that outlived its entry stops when it completes.
+    // sends' share and the queue; and a send that outlived its entry stops when it
+    // completes.
     onSim("sim_send_stale", .send_stale, .trips),
     onSim("sim_send_free", .send_free, .trips),
     onSim("sim_send_out_of_range", .send_out_of_range, .trips),
     onSim("sim_send_stale_queue_full", .send_stale_queue_full, .trips),
     onSim("sim_send_no_table", .send_no_table, .trips),
     onSim("sim_send_duplicate_id_queue_full", .send_duplicate_id_queue_full, .trips),
+    onSim("sim_send_duplicate_id_slots_full", .send_duplicate_id_slots_full, .trips),
     onSim("sim_complete_released", .complete_released, .trips),
     // Controls: a send to the entry in use, and that send with every slot in use.
     onSim("sim_send_peer", .send_peer, .finishes),
