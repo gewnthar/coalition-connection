@@ -2,7 +2,8 @@
 //! a phase that forbids the call, before the child allocator is touched, that the
 //! connection table stops it when code releases, reads or moves an entry not in use, and
 //! that the real I/O type stops it when its clock steps back, when it is handed an execute,
-//! when a send names a peer not in the table, and when it is set up after startup. It also
+//! when a send names a peer not in the table or reuses an id still in flight, and when it
+//! is set up after startup. It also
 //! proves the response writer stops the process when the body, a header name or a header
 //! value shares a byte with the buffer it writes into.
 //!
@@ -55,7 +56,11 @@
 //! take in use, where the peer must be checked before the sends' share, or the call
 //! returns SendSlotsFull instead of tripping, and again with an accept in the slot kept for
 //! accepts too, where the peer must be checked before the queue, or the call returns
-//! QueueFull. Every real-I/O case but `real_init_running` sets up a
+//! QueueFull. A send to the entry in use that reuses the first fill send's id, still in
+//! flight, is tried on the same two full rings. On the whole ring both refusals apply, so
+//! that case alone fails if the distinct-id check moves below either one; on the sends'
+//! share alone only SendSlotsFull applies, so that case also fails if the check runs only
+//! once the whole ring is full. Every real-I/O case but `real_init_running` sets up a
 //! ring first; where the kernel refuses one, they fail with the setup code, never pass.
 //! `real_init_running` trips before the ring is set up, so it runs either way.
 //!
@@ -68,7 +73,8 @@
 //! where the peer must be checked before the queue, or the call returns QueueFull instead
 //! of tripping. A send on a simulator with no table attached must trip too, or a send
 //! could skip every one of those checks, and so must a send whose id is
-//! already in flight, even with every slot in use. On the completion side, a send whose
+//! already in flight, both with every slot in use and with only the sends' share in use,
+//! as on the real type. On the completion side, a send whose
 //! entry was released under it (the harness clears the count by hand to get there) must
 //! stop when it completes. The controls send to the entry in use.
 //!
@@ -734,9 +740,13 @@ const send_slots_max: u32 = cc.constants.io_sends_in_flight_max;
 /// Empty polls `drain` allows, 1 ms apart. Reason: a socketpair send completes during the
 /// submitting system call; a second is ample even on a loaded CI machine.
 const poll_attempts_max: u32 = 1_000;
-/// The operation id the send control uses; the queue-full fill numbers its sends from 1,
-/// so no fill send shares it.
-const send_peer_id: cc.io.OperationId = slots_max + 1;
+/// The id of the first fill send, on the real type and the simulator alike; the fills
+/// number their operations up from it. The duplicate-id cases resubmit it while that send
+/// is still in flight.
+const first_fill_id: cc.io.OperationId = 1;
+/// The operation id the send control uses: one past the last id any fill hands out, so no
+/// fill operation shares it.
+const send_peer_id: cc.io.OperationId = first_fill_id + slots_max;
 /// The byte each fill send carries.
 const fill_byte: u8 = 'x';
 /// The statement the simulator's fill puts in each slot kept back from sends.
@@ -754,12 +764,15 @@ fn realCallAllowed(call: trip.RealCall) bool {
         .send_out_of_range,
         .send_free_slots_full,
         .send_free_queue_full,
+        .send_duplicate_id_slots_full,
+        .send_duplicate_id_queue_full,
         .init_running,
         => false,
     };
-    // The controls are the clock read and the two sends to the entry in use; every case
-    // that fills the ring is a send.
-    assert(allowed == (call == .now_fresh or realCallPeer(call) == trip.real_peer_id));
+    // The controls are the clock read and the two sends to the entry in use under a fresh
+    // id; every case that fills the ring is a send.
+    const fresh_send = realCallPeer(call) == trip.real_peer_id and !realCallDuplicatesId(call);
+    assert(allowed == (call == .now_fresh or fresh_send));
     assert(!realCallFillsRing(call) or realCallPeer(call) != null);
     return allowed;
 }
@@ -775,23 +788,72 @@ fn realCallPeer(call: trip.RealCall) ?cc.io.PeerId {
     const peer: ?cc.io.PeerId = switch (call) {
         .send_free, .send_free_stale_socket, .send_free_slots_full, .send_free_queue_full => free_peer,
         .send_out_of_range => trip.real_table_size,
-        .send_peer, .send_slots_full => trip.real_peer_id,
+        .send_peer,
+        .send_slots_full,
+        .send_duplicate_id_slots_full,
+        .send_duplicate_id_queue_full,
+        => trip.real_peer_id,
         .now_after_max, .submit_execute, .init_running, .now_fresh => null,
     };
-    // Only the two send controls name the entry in use; the forbidden sends name the free
-    // entry or an id past the table.
+    // Only the two send controls and the duplicate-id sends name the entry in use; the
+    // other forbidden sends name the free entry or an id past the table.
     const index: ?connections.Index = if (peer) |id| @as(connections.IdParts, @bitCast(id)).index else null;
     assert(index == null or index.? <= trip.real_table_size);
-    assert((peer == trip.real_peer_id) == (call == .send_peer or call == .send_slots_full));
+    const names_peer = call == .send_peer or call == .send_slots_full or realCallDuplicatesId(call);
+    assert((peer == trip.real_peer_id) == names_peer);
     return peer;
+}
+
+/// Whether the case's send reuses the id of the first fill send, still in flight, rather
+/// than `send_peer_id`. Such a send names the entry in use, so only the distinct-id check
+/// can stop it. Calls no other case helper, so the helpers' cross-checks can call it.
+fn realCallDuplicatesId(call: trip.RealCall) bool {
+    const duplicates = switch (call) {
+        .send_duplicate_id_slots_full, .send_duplicate_id_queue_full => true,
+        .now_after_max,
+        .submit_execute,
+        .send_free,
+        .send_free_stale_socket,
+        .send_out_of_range,
+        .send_free_slots_full,
+        .send_free_queue_full,
+        .init_running,
+        .now_fresh,
+        .send_peer,
+        .send_slots_full,
+        => false,
+    };
+    // Never a control: the controls send under `send_peer_id`, which no fill uses.
+    assert(!duplicates or (call != .send_peer and call != .send_slots_full));
+    assert(send_peer_id != first_fill_id);
+    return duplicates;
 }
 
 /// Whether the case fills every slot of the ring a send may take before its call.
 fn realCallFillsRing(call: trip.RealCall) bool {
-    const fills = call == .send_free_slots_full or call == .send_slots_full or
-        call == .send_free_queue_full;
+    const fills = switch (call) {
+        .send_free_slots_full,
+        .send_slots_full,
+        .send_free_queue_full,
+        .send_duplicate_id_slots_full,
+        .send_duplicate_id_queue_full,
+        => true,
+        .now_after_max,
+        .submit_execute,
+        .send_free,
+        .send_free_stale_socket,
+        .send_out_of_range,
+        .init_running,
+        .now_fresh,
+        .send_peer,
+        => false,
+    };
     // Sends that meet a full share, or a full ring; only `send_slots_full` is a control.
-    assert(!fills or (call == .send_slots_full) == (realCallPeer(call) == trip.real_peer_id));
+    const control_send = realCallPeer(call) == trip.real_peer_id and !realCallDuplicatesId(call);
+    assert(!fills or (call == .send_slots_full) == control_send);
+    // A duplicate id needs the fill, since its id is the first fill send's; this list and
+    // the one in `realCallDuplicatesId` are kept separately and must agree.
+    assert(fills or !realCallDuplicatesId(call));
     assert(!fills or realCallPeer(call) != null);
     return fills;
 }
@@ -799,7 +861,7 @@ fn realCallFillsRing(call: trip.RealCall) bool {
 /// Whether the case also puts an accept in the slot kept for accepts, so the whole ring is
 /// in use and the next submission of any kind meets QueueFull.
 fn realCallFillsAccept(call: trip.RealCall) bool {
-    const fills = call == .send_free_queue_full;
+    const fills = call == .send_free_queue_full or call == .send_duplicate_id_queue_full;
     // Only a ring already holding every send it may take has the accepts' slot to fill.
     assert(!fills or realCallFillsRing(call));
     assert(!fills or !realCallAllowed(call));
@@ -878,6 +940,7 @@ fn runRealCase(startup: *cc.StartupAllocator, call: trip.RealCall, case: trip.Ca
     if (realCallFillsRing(call)) fillRing(&real, case);
     // The accept waits on a listener nobody connects to; the case trips before it matters.
     if (realCallFillsAccept(call)) fillAccept(&real, case);
+    if (realCallDuplicatesId(call)) assertFirstFillInFlight(&real);
 
     var before: RealBefore = undefined;
     @memcpy(&before.entries, table.entries);
@@ -956,7 +1019,7 @@ fn fillRing(real: *Real, case: trip.Case) void {
     var filled: u32 = 0;
     while (filled < send_slots_max) : (filled += 1) {
         const send: cc.io.Send = .{ .peer = trip.real_peer_id, .bytes = &.{fill_byte} };
-        real.submit(.{ .id = filled + 1, .operation = .{ .send = send } }) catch |err| switch (err) {
+        real.submit(.{ .id = first_fill_id + filled, .operation = .{ .send = send } }) catch |err| switch (err) {
             error.QueueFull, error.SendSlotsFull => setupFailed(case, "the ring filled early"),
         };
     }
@@ -988,6 +1051,26 @@ fn fillAccept(real: *Real, case: trip.Case) void {
     assert(real.free_count == 0);
 }
 
+/// The duplicate-id cases reuse `first_fill_id`, so exactly one slot must hold it, still in
+/// flight: nothing has polled since `fillRing`, so its completion, if the kernel has posted
+/// one, hasn't freed the slot. Without this, a fill that stopped handing out that id would
+/// make the case fail as if the distinct-id check were missing (exit 2); this names the
+/// real cause as a setup panic instead.
+fn assertFirstFillInFlight(real: *const Real) void {
+    assert(!armed);
+    var holding: u32 = 0;
+    var index: u32 = 0;
+    while (index < real.slots.len) : (index += 1) {
+        const slot = &real.slots[index];
+        if (slot.in_use and slot.id == first_fill_id) {
+            assert(slot.kind == .send);
+            holding += 1;
+        }
+    }
+    assert(index == real.slots.len);
+    assert(holding == 1);
+}
+
 /// Makes the case's one call on the real type; nothing else runs while `armed` is set.
 fn callReal(
     real: *Real,
@@ -999,7 +1082,8 @@ fn callReal(
     assert(child_calls == child_calls_armed);
     if (realCallPeer(call)) |peer| {
         const bytes = trip.real_send_bytes;
-        const id: cc.io.OperationId = send_peer_id;
+        // The duplicate cases reuse the first fill send's id, which is still in flight.
+        const id: cc.io.OperationId = if (realCallDuplicatesId(call)) first_fill_id else send_peer_id;
         real.submit(.{ .id = id, .operation = .{ .send = .{ .peer = peer, .bytes = bytes } } }) catch |err| {
             switch (err) {
                 error.QueueFull => return .{ .queue_full = true },
@@ -1037,6 +1121,8 @@ fn callReal(
         .send_out_of_range,
         .send_free_slots_full,
         .send_free_queue_full,
+        .send_duplicate_id_slots_full,
+        .send_duplicate_id_queue_full,
         .send_peer,
         .send_slots_full,
         => unreachable, // realCallPeer named a peer for each of these.
@@ -1087,6 +1173,8 @@ fn realControlHeld(
         .send_out_of_range,
         .send_free_slots_full,
         .send_free_queue_full,
+        .send_duplicate_id_slots_full,
+        .send_duplicate_id_queue_full,
         .init_running,
         => unreachable, // Asserted allowed above.
     }
@@ -1555,6 +1643,7 @@ fn simCallAllowed(call: trip.SimCall) bool {
         .send_out_of_range,
         .send_stale_queue_full,
         .send_no_table,
+        .send_duplicate_id_slots_full,
         .send_duplicate_id_queue_full,
         .complete_released,
         => false,
@@ -1581,6 +1670,7 @@ fn simCallPeer(call: trip.SimCall) cc.io.PeerId {
         .send_peer,
         .send_queue_full,
         .send_no_table,
+        .send_duplicate_id_slots_full,
         .send_duplicate_id_queue_full,
         .complete_released,
         => trip.sim_peer_index,
@@ -1600,6 +1690,16 @@ fn simCallFillsSlots(call: trip.SimCall) bool {
     // Each filling case's send is a send, so the fill's slots are what it meets.
     assert(!fills or call != .complete_released);
     assert(!fills or simCallPeer(call) <= trip.sim_table_size);
+    return fills;
+}
+
+/// Whether the case fills only the slots a send may take before its call, leaving the
+/// slots kept back from sends free, so a send meets SendSlotsFull but not QueueFull.
+fn simCallFillsSendShare(call: trip.SimCall) bool {
+    const fills = call == .send_duplicate_id_slots_full;
+    // Never both fills, and never a control.
+    assert(!fills or !simCallFillsSlots(call));
+    assert(!fills or call != .send_peer and call != .send_queue_full);
     return fills;
 }
 
@@ -1631,7 +1731,8 @@ fn runSimCase(startup: *cc.StartupAllocator, call: trip.SimCall, case: trip.Case
 
     var sim = Sim.init(sim_seed, 0);
     if (call != .send_no_table) sim.attachTable(&table);
-    if (simCallFillsSlots(call)) fillSim(&sim, case);
+    if (simCallFillsSlots(call)) fillSim(&sim, case, slots_max);
+    if (simCallFillsSendShare(call)) fillSim(&sim, case, send_slots_max);
     if (call == .complete_released) releaseUnderSend(&sim, &table, case);
 
     var before: SimBefore = undefined;
@@ -1689,23 +1790,26 @@ fn simTable(startup: *cc.StartupAllocator, case: trip.Case) connections.Table {
     return table;
 }
 
-/// Fills every slot before the call: a one-byte send to the entry in use in each slot a
-/// send may take, then a statement in each slot kept back from sends, so the next
-/// submission of any kind meets a full queue.
-fn fillSim(sim: *Sim, case: trip.Case) void {
+/// Fills `count` slots before the call: a one-byte send to the entry in use in each slot a
+/// send may take, then, when `count` is every slot, a statement in each slot kept back
+/// from sends, so the next submission of any kind meets a full queue. With `count` equal to
+/// the sends' share, the next send meets SendSlotsFull and the queue still has room.
+fn fillSim(sim: *Sim, case: trip.Case, count: u32) void {
     assert(!armed);
     assert(sim.in_flight == 0);
+    assert(count == slots_max or count == send_slots_max);
     var filled: u32 = 0;
-    while (filled < slots_max) : (filled += 1) {
+    while (filled < count) : (filled += 1) {
         const operation: cc.io.Operation = if (filled < send_slots_max)
             .{ .send = .{ .peer = trip.sim_peer_index, .bytes = &.{fill_byte} } }
         else
             .{ .execute = .{ .statement = fill_statement } };
-        sim.submit(.{ .id = filled + 1, .operation = operation }) catch |err| switch (err) {
+        sim.submit(.{ .id = first_fill_id + filled, .operation = operation }) catch |err| switch (err) {
             error.QueueFull, error.SendSlotsFull => setupFailed(case, "the simulator filled early"),
         };
     }
-    assert(sim.in_flight == slots_max);
+    assert(filled == count);
+    assert(sim.in_flight == count);
     assert(sim.sends_in_flight == send_slots_max);
 }
 
@@ -1742,8 +1846,9 @@ fn callSim(sim: *Sim, call: trip.SimCall) SimRefusal {
         _ = sim.poll(&completions);
         return .none;
     }
-    // The duplicate case reuses the first fill send's id, which is still in flight.
-    const id: cc.io.OperationId = if (call == .send_duplicate_id_queue_full) 1 else send_peer_id;
+    // The duplicate cases reuse the first fill send's id, which is still in flight.
+    const duplicates = call == .send_duplicate_id_queue_full or call == .send_duplicate_id_slots_full;
+    const id: cc.io.OperationId = if (duplicates) first_fill_id else send_peer_id;
     const send: cc.io.Send = .{ .peer = simCallPeer(call), .bytes = sim_send_bytes };
     sim.submit(.{ .id = id, .operation = .{ .send = send } }) catch |err| switch (err) {
         error.QueueFull => return .queue_full,
@@ -1797,6 +1902,7 @@ fn simControlHeld(
         .send_out_of_range,
         .send_stale_queue_full,
         .send_no_table,
+        .send_duplicate_id_slots_full,
         .send_duplicate_id_queue_full,
         .complete_released,
         => unreachable, // Asserted allowed above.
