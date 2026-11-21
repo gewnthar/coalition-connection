@@ -26,10 +26,24 @@ zig build sim --release=safe -Dseed=1    # seeded deterministic simulation
 
 The first line installs the server as `zig-out/bin/coalition-connection`. It takes one
 argument, the path of its config file, and [docs/config.example.zon](docs/config.example.zon)
-is a working example: `zig-out/bin/coalition-connection docs/config.example.zon`. For now it
-checks the config, prints its version and exits; it serves nothing yet, and it builds only
-for Linux. The last three lines compile every target in ReleaseSafe. A fuzz or simulation
-failure prints its seed, and the same `-Dseed` replays it.
+is a working example. Once the first line has made `zig-out/`, which git ignores, run the
+server on a private copy kept there:
+
+```sh
+cp docs/config.example.zon zig-out/config.zon
+chmod 600 zig-out/config.zon
+zig-out/bin/coalition-connection zig-out/config.zon
+```
+
+The config file must be owned by the user the server runs as, and the server refuses one
+that its group or others can write. A checkout made under a umask such as 002 leaves the
+example group-writable, hence the copy. `zig build test` starts the server on its own 0600
+copy of the example, so the tests don't depend on your umask.
+
+For now the server checks the config, prints its version and exits; it serves nothing yet,
+and it builds only for Linux. In the first block, the last three lines compile every target
+in ReleaseSafe. A fuzz or simulation failure prints its seed, and the same `-Dseed`
+replays it.
 [CONTRIBUTING.md](CONTRIBUTING.md#running-the-checks) lists every check CI runs.
 
 ## Documentation
