@@ -5,7 +5,10 @@
 //! until the table is full and `refusals_per_fill` arrivals were refused, then lets
 //! connections leave until the table is empty. A model beside the table predicts every
 //! answer: an arrival takes a free entry under a socket never seen before, a refusal comes
-//! only when every entry is in use, and each accept completes exactly once.
+//! only when every entry is in use, and each accept completes exactly once. After an
+//! accept completes with Backpressure, the model expects every accept submitted within
+//! `constants.io_accept_backpressure_wait_ns` to be refused with AcceptTooSoon, and the
+//! first one after it to be taken; the workload waits by ticking, as the server loop will.
 //!
 //! Each completion folds its id and result into a trace hash, and the workload runs twice
 //! per seed: both runs must match, count for count and completion for completion.
@@ -35,10 +38,16 @@ const departures_per_tick: u32 = 64;
 /// The listener every accept names. The simulator opens nothing, so any descriptor will do.
 const listener: io.Socket = 3;
 
-/// An accept waits 8 ticks on average, so about 15 complete per tick: a fill takes about
-/// 300 ticks and an empty about 70. Ten times the fill is a margin no valid seed comes
-/// near, and a phase that runs out of ticks is a failure, not a hang.
-const phase_ticks_max: u32 = 3_000;
+/// Ticks in the wait after a Backpressure; the simulator's clock moves in whole ticks.
+const wait_ticks: u32 = @intCast(constants.io_accept_backpressure_wait_ns / constants.tick_ns);
+
+/// An accept waits 8 ticks on average, so about 15 complete per tick: without waits a fill
+/// takes about 300 ticks, and an empty about 70. Top-ups also pause for about 50 waits per
+/// fill (measured: 733 to 820 ticks a fill on seeds 1 to 8 with 10-tick waits). Ten times
+/// that estimate is a margin no valid seed comes near, and it grows with the wait, so a
+/// longer wait can't make a valid seed run out of ticks. A phase that runs out of ticks is
+/// a failure, not a hang.
+const phase_ticks_max: u32 = 10 * (300 + 50 * wait_ticks);
 
 /// Ids in flight, tracked by id modulo the window. An id stays in flight for at most
 /// `sim_completion_delay_ticks_max + 1` ticks, and at most `accepts_in_flight` ids are
@@ -53,6 +62,8 @@ comptime {
     assert((constants.sim_completion_delay_ticks_max + 1) * accepts_in_flight < outstanding_window);
     // Every phase of every round fits in one simulated run.
     assert(@as(u64, rounds) * 2 * phase_ticks_max < constants.sim_ticks_max);
+    // The model's wait in ticks is exactly the simulator's wait in nanoseconds.
+    assert(@as(u64, wait_ticks) * constants.tick_ns == constants.io_accept_backpressure_wait_ns);
 }
 
 /// What a run did. Two runs with the same seed must match field for field.
@@ -62,6 +73,8 @@ pub const Counts = struct {
     refused: u32 = 0,
     peer_down: u32 = 0,
     backpressure: u32 = 0,
+    /// Accepts refused with AcceptTooSoon while the wait after a Backpressure ran.
+    too_soon: u32 = 0,
     departures: u32 = 0,
     peak: u32 = 0,
     /// An FNV-style hash, one 64-bit word at a time, over every completion's id and result
@@ -86,6 +99,9 @@ const Workload = struct {
     in_use: u32,
     /// The largest socket an arrival got; the simulator never hands one out twice.
     socket_last: io.Socket,
+    /// The model's wait: when an accept may be submitted again after a Backpressure, or
+    /// null when none is running.
+    resume_tick: ?u32,
 };
 
 /// The window entry for `id`, which must be handed out now or still recent enough that no
@@ -103,25 +119,40 @@ fn trace(counts: *Counts, value: u64) void {
     counts.trace = (counts.trace ^ value) *% fnv_prime;
 }
 
-/// Submits accepts until `accepts_in_flight` wait.
+/// Submits accepts until `accepts_in_flight` wait, or until one is refused because the
+/// wait after a Backpressure is still running, which the model must predict either way.
+/// The model counts the wait in ticks, not through the simulator's clock arithmetic.
 fn topUp(w: *Workload) Error!void {
     assert(w.sim.in_flight <= accepts_in_flight);
     const submitted_before = w.counts.submitted;
     var submissions: u32 = 0;
-    while (w.sim.in_flight < accepts_in_flight) : (submissions += 1) {
+    var waiting = false;
+    fill: while (w.sim.in_flight < accepts_in_flight) : (submissions += 1) {
         assert(submissions < accepts_in_flight); // Each one adds to what is in flight.
         const entry = &w.outstanding[windowIndex(w, w.next_id)];
         if (entry.*) return error.InvariantBroken; // The window is too small.
+        const tick = w.sim.ticks;
+        const too_soon = if (w.resume_tick) |resume_tick| tick < resume_tick else false;
         const submission: io.Submission = .{ .id = w.next_id, .operation = .{ .accept = .{ .listener = listener } } };
         w.sim.submit(submission) catch |err| switch (err) {
             // Fewer than the ring's depth are ever in flight here, and none is a send.
             error.QueueFull, error.SendSlotsFull => return error.InvariantBroken,
+            error.AcceptTooSoon => {
+                if (!too_soon) return error.InvariantBroken; // Refused with the wait over.
+                w.counts.too_soon += 1;
+                trace(&w.counts, 4 | (@as(u64, tick) << 8));
+                waiting = true;
+                break :fill; // Waits by ticking; the next top-up tries again.
+            },
         };
+        if (too_soon) return error.InvariantBroken; // Taken while the wait still ran.
+        w.resume_tick = null;
         entry.* = true;
         w.next_id += 1;
         w.counts.submitted += 1;
     }
-    assert(w.sim.in_flight == accepts_in_flight);
+    // Full, or stopped by a wait the model predicted.
+    assert(w.sim.in_flight == accepts_in_flight or (waiting and w.resume_tick.? > w.sim.ticks));
     assert(w.counts.submitted - submitted_before <= accepts_in_flight);
 }
 
@@ -146,6 +177,8 @@ fn check(w: *Workload, completion: io.Completion) Error!void {
             },
             error.Backpressure => backpressure: {
                 w.counts.backpressure += 1;
+                // Starts the wait, or starts it again, from the time of this poll.
+                w.resume_tick = w.sim.ticks + wait_ticks;
                 break :backpressure 3;
             },
         };
@@ -251,6 +284,9 @@ fn checkEnd(w: *const Workload) Error!void {
     if (completed != counts.submitted or w.sim.completed != counts.submitted) return error.InvariantBroken;
     if (w.sim.accepted != counts.accepted or w.sim.refused != counts.refused) return error.InvariantBroken;
     if (counts.peer_down == 0 or counts.backpressure == 0) return error.InvariantBroken;
+    // A Backpressure while filling is followed by a top-up within the wait, so some accepts
+    // were refused, and the simulator counted exactly those.
+    if (counts.too_soon == 0 or w.sim.accept_wait.refused != counts.too_soon) return error.InvariantBroken;
     if (w.sim.faults.accept_peer_down != counts.peer_down) return error.InvariantBroken;
     if (w.sim.faults.accept_backpressure != counts.backpressure) return error.InvariantBroken;
     // Only accepts were submitted, so no other fault was drawn.
@@ -277,6 +313,7 @@ fn runOnce(seed: u64, w: *Workload) Error!Counts {
         .peers = undefined,
         .in_use = 0,
         .socket_last = -1,
+        .resume_tick = null,
     };
     w.sim.attachTable(&table);
     var round: u32 = 0;

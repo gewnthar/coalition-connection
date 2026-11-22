@@ -18,7 +18,11 @@
 //! socket number never handed out before; a full table refuses it with `error.TableFull`,
 //! as the real type does, and counts the refusal. Whether the connection fails before it
 //! arrives is drawn at submit, like every other outcome, so the same seed refuses the same
-//! arrivals in the same order.
+//! arrivals in the same order. An accept that completes with `error.Backpressure` starts
+//! the wait the real type keeps: until `constants.io_accept_backpressure_wait_ns` of
+//! simulated time has passed, `submit` refuses every accept with `error.AcceptTooSoon`,
+//! draws nothing and changes nothing but the wait's refusal count (`io.AcceptWait`, the
+//! type the real one keeps too), so the loop is tested against it.
 //!
 //! Sends: a send goes through the attached table with the same calls the real type makes.
 //! Its peer is looked up at submit, before the queue is checked, so a free, stale or
@@ -124,6 +128,9 @@ pub const Sim = struct {
     /// Arrivals that took a table entry, and arrivals a full table refused.
     accepted: u64,
     refused: u64,
+    /// The wait after an accept completed with `Backpressure`, kept through the same calls
+    /// as on the real type, and the accepts it refused.
+    accept_wait: io.AcceptWait,
 
     pub fn init(seed: u64, fault_percent: u8) Sim {
         comptime assertSimulationAllowed();
@@ -148,6 +155,7 @@ pub const Sim = struct {
             .table = null,
             .accepted = 0,
             .refused = 0,
+            .accept_wait = .{},
         };
         assert(result.ticks == 0);
         assert(result.in_flight == 0);
@@ -180,10 +188,12 @@ pub const Sim = struct {
 
     /// Queues one operation to complete after a seeded delay of 0 to
     /// `sim_completion_delay_ticks_max` ticks, capped at the run's last tick, with its result
-    /// drawn now. A full table returns `error.QueueFull`, and a send with sends holding their
-    /// whole share (`send_slots_max`) `error.SendSlotsFull`, as on the real type; either
-    /// leaves the state unchanged. An id already in flight breaks the contract and crashes,
-    /// full table or not.
+    /// drawn now. A full table returns `error.QueueFull`, a send with sends holding their
+    /// whole share (`send_slots_max`) `error.SendSlotsFull`, and an accept while the wait
+    /// after a Backpressure runs `error.AcceptTooSoon`, as on the real type, in that order
+    /// when more than one holds; each draws nothing and takes no slot, and only the last
+    /// changes a count, the wait's refusals. An id already in flight breaks the contract and
+    /// crashes, full table or not.
     pub fn submit(self: *Sim, submission: io.Submission) io.SubmitError!void {
         comptime assertSimulationAllowed();
         assert(self.in_flight <= slots_count);
@@ -201,6 +211,7 @@ pub const Sim = struct {
         if (submission.operation == .send and self.sends_in_flight == send_slots_max) {
             return error.SendSlotsFull;
         }
+        if (submission.operation == .accept) try self.accept_wait.admit(self.now_ns);
 
         const index = self.freeSlot();
         const delay_max = constants.sim_completion_delay_ticks_max;
@@ -398,11 +409,18 @@ pub const Sim = struct {
         assert(self.table != null); // `submit` checked it for every accept.
         const table = self.table.?;
         const faults_before = self.faults.total();
+        const resume_before = self.accept_wait.resume_at;
         arrival catch |err| {
             switch (err) {
                 error.PeerDown => self.faults.accept_peer_down += 1,
-                error.Backpressure => self.faults.accept_backpressure += 1,
+                error.Backpressure => {
+                    self.faults.accept_backpressure += 1;
+                    // Starts the wait, or starts it again, as the real type does.
+                    self.accept_wait.begin(self.now_ns);
+                },
             }
+            // Only Backpressure touches the wait, as on the real type.
+            assert(err == error.Backpressure or std.meta.eql(self.accept_wait.resume_at, resume_before));
             assert(self.faults.total() == faults_before + 1);
             return err;
         };
@@ -1018,6 +1036,94 @@ test "sim: same seed, same accepts, refusals and faults, in the same order" {
     try testing.expect(a.faults.accept_peer_down > 0);
     try testing.expect(a.faults.accept_backpressure > 0);
     try testing.expectEqual(@as(u64, runs), a.accepted + a.refused + a.faults.total());
+}
+
+/// Ticks in the wait after a Backpressure.
+const wait_ticks: u32 = @intCast(constants.io_accept_backpressure_wait_ns / constants.tick_ns);
+
+test "sim: after Backpressure an accept is refused until the wait is over, sends are not" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(11, 0);
+    sim.attachTable(&fixture.table);
+    sim.tick();
+    // A connection that failed says nothing of the system's descriptors: no wait.
+    try testing.expectError(error.PeerDown, sim.arrive(error.PeerDown));
+    try testing.expectEqual(@as(?io.Instant, null), sim.accept_wait.resume_at);
+    try testing.expectError(error.Backpressure, sim.arrive(error.Backpressure));
+    const resume_at = sim.now() + constants.io_accept_backpressure_wait_ns;
+    try testing.expectEqual(@as(?io.Instant, resume_at), sim.accept_wait.resume_at);
+
+    // Refused through the last tick before the wait ends, drawing nothing and taking no
+    // slot: only the refusal count changes.
+    var ticks: u32 = 0;
+    while (ticks < wait_ticks) : (ticks += 1) {
+        var expected = sim;
+        expected.accept_wait.refused += 1;
+        try testing.expectError(error.AcceptTooSoon, sim.submit(acceptSubmission(0)));
+        try testing.expectEqual(expected, sim);
+        sim.tick();
+    }
+    try testing.expectEqual(@as(u64, wait_ticks), sim.accept_wait.refused);
+    // A send isn't held back by the wait.
+    try sim.submit(.{ .id = 1, .operation = .{ .send = .{ .peer = 0, .bytes = "s" } } });
+    // On the tick the wait ends, the accept goes in and the wait is cleared.
+    try testing.expectEqual(resume_at, sim.now());
+    try sim.submit(acceptSubmission(0));
+    try testing.expectEqual(@as(?io.Instant, null), sim.accept_wait.resume_at);
+    try testing.expectEqual(@as(u32, 2), sim.in_flight);
+    var completions: [2]io.Completion = undefined;
+    try testing.expectEqual(@as(u32, 2), drainAll(&sim, &completions));
+    try fixture.expectNoSendsCounted();
+}
+
+test "sim: a second Backpressure starts the wait again" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUp(4);
+    defer fixture.tearDown();
+    var sim = Sim.init(12, 0);
+    sim.attachTable(&fixture.table);
+    try testing.expectError(error.Backpressure, sim.arrive(error.Backpressure));
+    var ticks: u32 = 0;
+    while (ticks < wait_ticks - 1) : (ticks += 1) sim.tick();
+    try testing.expectError(error.Backpressure, sim.arrive(error.Backpressure));
+    // The first wait would end on the next tick; the second still runs then.
+    sim.tick();
+    try testing.expectError(error.AcceptTooSoon, sim.submit(acceptSubmission(0)));
+    ticks = 0;
+    while (ticks < wait_ticks - 1) : (ticks += 1) sim.tick();
+    try sim.submit(acceptSubmission(0));
+    try testing.expectEqual(@as(u64, 1), sim.accept_wait.refused);
+    var completions: [1]io.Completion = undefined;
+    try testing.expectEqual(@as(u32, 1), drainAll(&sim, &completions));
+    _ = try fixture.table.release(try completions[0].result.accept);
+}
+
+test "sim: a full queue refuses an accept with QueueFull while the wait runs" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(13, 0);
+    sim.attachTable(&fixture.table);
+    var id: io.OperationId = 0;
+    while (id < slots_count) : (id += 1) try sim.submit(testSubmission(id));
+    try testing.expectError(error.Backpressure, sim.arrive(error.Backpressure));
+    // An id no fill submission holds.
+    const accept: io.Submission = .{ .id = slots_count, .operation = .{ .accept = .{ .listener = test_listener } } };
+    // Both refusals hold; the full queue is reported, and the wait's count is untouched.
+    try testing.expectError(error.QueueFull, sim.submit(accept));
+    try testing.expectEqual(@as(u64, 0), sim.accept_wait.refused);
+    // With room again, the wait still runs: the same accept meets AcceptTooSoon. With 256
+    // delays drawn from 0 to 16 ticks, this seed has some due at once, so no tick passes.
+    var completions: [slots_count]io.Completion = undefined;
+    try testing.expectEqual(@as(u32, 1), sim.poll(completions[0..1]));
+    try testing.expect(sim.accept_wait.resume_at != null);
+    try testing.expect(sim.now() < sim.accept_wait.resume_at.?);
+    try testing.expectError(error.AcceptTooSoon, sim.submit(accept));
+    try testing.expectEqual(@as(u64, 1), sim.accept_wait.refused);
+    _ = drainAll(&sim, &completions);
+    try fixture.expectNoSendsCounted();
 }
 
 test "sim: a release with a send in flight is refused until the send completes" {
