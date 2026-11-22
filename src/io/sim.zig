@@ -197,8 +197,8 @@ pub const Sim = struct {
     /// holding their whole share (`shared_slots_max`), `error.SlotsKeptForAccepts`; and an
     /// accept while the wait after a Backpressure runs `error.AcceptTooSoon`, as on the real
     /// type, in that order when more than one holds; each draws nothing and takes no slot,
-    /// and only the last changes a count, the wait's refusals. An id already in flight breaks the contract and
-    /// crashes, full table or not.
+    /// and only the last changes a count, the wait's refusals. An id already in flight
+    /// breaks the contract and crashes, full table or not.
     pub fn submit(self: *Sim, submission: io.Submission) io.SubmitError!void {
         comptime assertSimulationAllowed();
         assert(self.in_flight <= slots_count);
@@ -213,7 +213,7 @@ pub const Sim = struct {
         assert(self.sends_in_flight <= shared_slots_max);
         if (self.in_flight == slots_count) return error.QueueFull;
         // The operations past shared_slots_max are kept for accepts.
-        try self.share.admit(submission.operation, self.in_flight);
+        try self.share.admit(submission.operation, slots_count - self.in_flight);
         if (submission.operation == .accept) try self.accept_wait.admit(self.now_ns);
 
         const index = self.freeSlot();
@@ -606,13 +606,10 @@ fn testSubmission(id: io.OperationId) io.Submission {
 /// from accepts, and an accept in each slot past it.
 fn fullSubmission(id: io.OperationId) io.Submission {
     assert(id < slots_count);
-    const submission: io.Submission = if (id < shared_slots_max)
-        testSubmission(id)
-    else
-        .{ .id = id, .operation = .{ .accept = .{ .listener = test_listener } } };
-    // Only the slots past the share take accepts.
-    assert((submission.operation == .accept) == (id >= shared_slots_max));
-    return submission;
+    // The share leaves at least one slot for the accepts.
+    comptime assert(shared_slots_max < slots_count);
+    if (id < shared_slots_max) return testSubmission(id);
+    return .{ .id = id, .operation = .{ .accept = .{ .listener = test_listener } } };
 }
 
 test "sim: same seed, same completion order and counts" {
@@ -757,11 +754,13 @@ test "sim: past the share kept from accepts, a send and a statement are refused 
     sim.attachTable(&fixture.table);
     // The share filled with sends and statements alike: both count against it.
     var id: io.OperationId = 0;
-    while (id < shared_slots_max) : (id += 1) try sim.submit(mixedSubmission(id));
+    while (id < shared_slots_max) : (id += 1) try sim.submit(testSubmission(id));
     try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
     try testing.expectEqual(shared_slots_max - shared_slots_max / 2, sim.sends_in_flight);
     // Neither refusal may count a send on its peer's entry, take a slot or draw anything.
+    // Peer 0 holds every eighth id's send.
     const entry_before = fixture.table.get(0).*;
+    try testing.expectEqual(@as(connections.SendCount, shared_slots_max / test_peers + 1), entry_before.sends_in_flight);
     const slots_before = sim.slots;
     const outcomes_before = sim.outcomes.s;
     const send: io.Submission = .{ .id = id, .operation = .{ .send = .{ .peer = 0, .bytes = "s" } } };
@@ -776,7 +775,7 @@ test "sim: past the share kept from accepts, a send and a statement are refused 
     try testing.expectEqual(outcomes_before, sim.outcomes.s);
 
     // The operations kept back take an accept; then the table is full for every kind.
-    const accept: io.Submission = .{ .id = id, .operation = .{ .accept = .{ .listener = 3 } } };
+    const accept: io.Submission = .{ .id = id, .operation = .{ .accept = .{ .listener = test_listener } } };
     try sim.submit(accept);
     try testing.expectEqual(slots_count, sim.in_flight);
     try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
@@ -803,9 +802,9 @@ test "sim: an accept counts against no share, so a send still takes the last fre
     defer fixture.tearDown();
     var sim = Sim.init(6, 0);
     sim.attachTable(&fixture.table);
-    try sim.submit(.{ .id = 0, .operation = .{ .accept = .{ .listener = 3 } } });
+    try sim.submit(.{ .id = 0, .operation = .{ .accept = .{ .listener = test_listener } } });
     var id: io.OperationId = 1;
-    while (id < shared_slots_max) : (id += 1) try sim.submit(mixedSubmission(id));
+    while (id < shared_slots_max) : (id += 1) try sim.submit(testSubmission(id));
     try testing.expectEqual(slots_count - 1, sim.in_flight);
     try testing.expectEqual(shared_slots_max - 1, sim.share.others_in_flight);
     try sim.submit(.{ .id = id, .operation = .{ .send = .{ .peer = 1, .bytes = "s" } } });
@@ -824,7 +823,7 @@ test "sim: an accept counts against no share, so a send still takes the last fre
             if (completion.result == .accept) accept_done = true;
             // Anything else that completes is put straight back, so only the accept's
             // slot is free afterwards.
-            if (completion.result != .accept) try sim.submit(mixedSubmission(completion.id));
+            if (completion.result != .accept) try sim.submit(testSubmission(completion.id));
         }
     }
     try testing.expect(accept_done);
@@ -832,20 +831,8 @@ test "sim: an accept counts against no share, so a send still takes the last fre
     try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
     const statement: io.Submission = .{ .id = id + 1, .operation = .{ .execute = .{ .statement = "select 1" } } };
     try testing.expectError(error.SlotsKeptForAccepts, sim.submit(statement));
-    try sim.submit(.{ .id = id + 1, .operation = .{ .accept = .{ .listener = 3 } } });
+    try sim.submit(.{ .id = id + 1, .operation = .{ .accept = .{ .listener = test_listener } } });
     try testing.expectEqual(slots_count, sim.in_flight);
-}
-
-/// A send to peer 0 for an even id, a statement for an odd one.
-fn mixedSubmission(id: io.OperationId) io.Submission {
-    const operation: io.Operation = if (id % 2 == 0)
-        .{ .send = .{ .peer = 0, .bytes = "s" } }
-    else
-        .{ .execute = .{ .statement = "select 1" } };
-    const submission: io.Submission = .{ .id = id, .operation = operation };
-    assert(submission.operation != .accept);
-    assert(submission.id == id);
-    return submission;
 }
 
 test "sim: an id may be reused once its operation has completed" {

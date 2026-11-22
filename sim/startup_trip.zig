@@ -879,8 +879,8 @@ const RealResult = struct {
     clock_after: cc.io.Instant = 0,
     /// Whether a submit returned QueueFull.
     queue_full: bool = false,
-    /// Whether a send returned SlotsKeptForAccepts.
-    send_slots_full: bool = false,
+    /// Whether a send or a statement returned SlotsKeptForAccepts.
+    slots_kept_for_accepts: bool = false,
     /// Whether a submit returned AcceptTooSoon, which no call here should meet: the harness
     /// never completes an accept with Backpressure.
     accept_too_soon: bool = false,
@@ -1093,7 +1093,7 @@ fn callReal(
         real.submit(.{ .id = id, .operation = .{ .send = .{ .peer = peer, .bytes = bytes } } }) catch |err| {
             switch (err) {
                 error.QueueFull => return .{ .queue_full = true },
-                error.SlotsKeptForAccepts => return .{ .send_slots_full = true },
+                error.SlotsKeptForAccepts => return .{ .slots_kept_for_accepts = true },
                 error.AcceptTooSoon => return .{ .accept_too_soon = true },
             }
         };
@@ -1109,7 +1109,7 @@ fn callReal(
             const execute: cc.io.Execute = .{ .statement = "select 1" };
             real.submit(.{ .id = send_peer_id, .operation = .{ .execute = execute } }) catch |err| switch (err) {
                 error.QueueFull => return .{ .queue_full = true },
-                error.SlotsKeptForAccepts => return .{ .send_slots_full = true },
+                error.SlotsKeptForAccepts => return .{ .slots_kept_for_accepts = true },
                 error.AcceptTooSoon => return .{ .accept_too_soon = true },
             };
             return .{};
@@ -1196,7 +1196,7 @@ fn realControlHeld(
 fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
     assert(!armed);
     assert(before.in_flight == 0);
-    if (result.queue_full or result.send_slots_full or result.accept_too_soon) return false;
+    if (result.queue_full or result.slots_kept_for_accepts or result.accept_too_soon) return false;
     if (real.submitted != before.submitted + 1) return false;
     if (real.last != before.last) return false;
     // `submit` hands the send to the kernel at once, unless the kernel refused for a moment.
@@ -1224,7 +1224,7 @@ fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remo
 fn slotsFullHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
     assert(!armed);
     assert(before.in_flight == send_slots_max);
-    if (!result.send_slots_full or result.queue_full or result.accept_too_soon) return false;
+    if (!result.slots_kept_for_accepts or result.queue_full or result.accept_too_soon) return false;
     if (real.inFlight() != before.in_flight or real.free_count != before.free_count) return false;
     if (real.submitted != before.submitted or real.completed != before.completed) return false;
     if (real.ring.sq.sqe_tail != before.sqe_tail or real.last != before.last) return false;
@@ -1844,7 +1844,7 @@ fn releaseUnderSend(sim: *Sim, table: *connections.Table, case: trip.Case) void 
 }
 
 /// How the simulator answered the case's call.
-const SimRefusal = enum { none, queue_full, send_slots_full, accept_too_soon };
+const SimRefusal = enum { none, queue_full, slots_kept_for_accepts, accept_too_soon };
 
 /// Makes the case's one call, a send or (for `complete_released`) a poll; nothing else
 /// runs while `armed` is set. Returns which refusal, if any, the simulator gave a send.
@@ -1862,7 +1862,7 @@ fn callSim(sim: *Sim, call: trip.SimCall) SimRefusal {
     const send: cc.io.Send = .{ .peer = simCallPeer(call), .bytes = sim_send_bytes };
     sim.submit(.{ .id = id, .operation = .{ .send = send } }) catch |err| switch (err) {
         error.QueueFull => return .queue_full,
-        error.SlotsKeptForAccepts => return .send_slots_full,
+        error.SlotsKeptForAccepts => return .slots_kept_for_accepts,
         error.AcceptTooSoon => return .accept_too_soon,
     };
     return .none;
@@ -1907,7 +1907,7 @@ fn simControlHeld(
             };
             if (sent != sim_send_bytes.len) return false;
         },
-        .send_queue_full => if (!simQueueFullHeld(sim, before, refusal)) return false,
+        .send_queue_full => if (!simQueueFullHeld(sim, table, before, refusal)) return false,
         .send_stale,
         .send_free,
         .send_out_of_range,
@@ -1925,9 +1925,11 @@ fn simControlHeld(
 
 /// The simulator's queue-full control: QueueFull with the counts unchanged; then every
 /// operation the fill put in completes once, under its id, as it was filled: a send of its
-/// one byte in each slot a send may take, an accept after them, taking the free entry.
-fn simQueueFullHeld(sim: *Sim, before: *const SimBefore, refusal: SimRefusal) bool {
+/// one byte in each slot a send may take, an accept after them, whose arrival takes the
+/// free entry and leaves it in use, so the table is full.
+fn simQueueFullHeld(sim: *Sim, table: *const connections.Table, before: *const SimBefore, refusal: SimRefusal) bool {
     assert(!armed);
+    assert(table.count() == trip.sim_table_size - 1);
     assert(before.in_flight == slots_max);
     if (refusal != .queue_full) return false;
     if (sim.in_flight != before.in_flight or sim.submitted != before.submitted) return false;
@@ -1947,14 +1949,17 @@ fn simQueueFullHeld(sim: *Sim, before: *const SimBefore, refusal: SimRefusal) bo
             },
             .accept => |accepted| {
                 if (filled_send) return false;
-                // The one free entry takes the arrival.
-                const parts: connections.IdParts = @bitCast(accepted catch return false);
+                // The one free entry takes the arrival, under a generation past the one
+                // it was released under, and the id names it as live.
+                const peer = accepted catch return false;
+                const parts: connections.IdParts = @bitCast(peer);
                 if (parts.index != trip.sim_free_index) return false;
+                if (table.lookup(peer) == null) return false;
             },
             .execute => return false,
         }
     }
-    return sim.sends_in_flight == 0;
+    return sim.sends_in_flight == 0 and table.count() == trip.sim_table_size;
 }
 
 /// Ticks past the longest delay, taking each tick's completions, so everything in flight

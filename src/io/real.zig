@@ -304,10 +304,10 @@ pub const Real = struct {
     /// release that entry meanwhile, so the number can't be closed and reused under it.
     /// With every slot in use, returns `error.QueueFull`; for anything but an accept when
     /// those hold every slot they may (`shared_slots_max`), `error.SlotsKeptForAccepts`;
-    /// and for an accept while the wait after a Backpressure runs, `error.AcceptTooSoon`. The first two change nothing,
-    /// the last only the wait's refusal count and the clock's latest reading, and a full ring
-    /// wins when it and another hold. An id already in flight breaks the contract
-    /// and stops the process, full ring or not.
+    /// and for an accept while the wait after a Backpressure runs, `error.AcceptTooSoon`.
+    /// The first two change nothing, the last only the wait's refusal count and the clock's
+    /// latest reading, and a full ring wins when it and another hold. An id already in
+    /// flight breaks the contract and stops the process, full ring or not.
     pub fn submit(self: *Real, submission: io.Submission) io.SubmitError!void {
         comptime assertLinux();
         const submitted_before = self.submitted;
@@ -328,7 +328,7 @@ pub const Real = struct {
         assert(self.sends_in_flight <= shared_slots_max);
         if (self.free_count == 0) return error.QueueFull;
         // The slots past shared_slots_max are kept for accepts.
-        try self.share.admit(submission.operation, in_flight_before);
+        try self.share.admit(submission.operation, self.free_count);
         // Checked last, so a refusal above leaves the wait and the clock as they were. The
         // clock is read only while a wait runs.
         if (submission.operation == .accept and self.accept_wait.resume_at != null) {
@@ -1466,6 +1466,7 @@ test "real: an accept counts against no share, so a send takes the last free slo
     // The last free slot is not the kept one: the share counts operations, not free slots.
     try fixture.send(id, "w");
     id += 1;
+    try expectStuck(&fixture.real);
     try testing.expectEqual(slots_count, fixture.real.inFlight());
     try testing.expectEqual(shared_slots_max, fixture.real.share.others_in_flight);
 
