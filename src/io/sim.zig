@@ -50,8 +50,9 @@ const connections = @import("../live/connections.zig");
 const io = @import("root.zig");
 
 const slots_count = constants.io_operations_in_flight_max;
-/// Operations in flight that may be sends; the rest are kept for accepts, as on the real type.
-const send_slots_max = constants.io_sends_in_flight_max;
+/// Operations in flight that may be anything but accepts; the rest are kept for accepts, as
+/// on the real type.
+const shared_slots_max = constants.io_non_accepts_in_flight_max;
 
 /// The first fake socket an arrival gets: above any descriptor a test or workload names as
 /// its listener, so an arrival never shares a number with one, as with a real kernel.
@@ -114,8 +115,11 @@ pub const Sim = struct {
     now_ns: io.Instant,
     slots: [slots_count]?Slot,
     in_flight: u32,
-    /// Operations in flight that are sends: never more than `send_slots_max`.
+    /// Operations in flight that are sends: never more than `shared_slots_max`.
     sends_in_flight: u32,
+    /// Operations in flight that aren't accepts, counted against the share kept from
+    /// accepts through the same calls as on the real type.
+    share: io.SlotShare,
     submitted: u64,
     completed: u64,
     bytes_sent: u64,
@@ -145,6 +149,7 @@ pub const Sim = struct {
             .slots = @splat(null),
             .in_flight = 0,
             .sends_in_flight = 0,
+            .share = .{},
             .submitted = 0,
             .completed = 0,
             .bytes_sent = 0,
@@ -188,11 +193,11 @@ pub const Sim = struct {
 
     /// Queues one operation to complete after a seeded delay of 0 to
     /// `sim_completion_delay_ticks_max` ticks, capped at the run's last tick, with its result
-    /// drawn now. A full table returns `error.QueueFull`, a send with sends holding their
-    /// whole share (`send_slots_max`) `error.SendSlotsFull`, and an accept while the wait
-    /// after a Backpressure runs `error.AcceptTooSoon`, as on the real type, in that order
-    /// when more than one holds; each draws nothing and takes no slot, and only the last
-    /// changes a count, the wait's refusals. An id already in flight breaks the contract and
+    /// drawn now. A full table returns `error.QueueFull`; anything but an accept, with those
+    /// holding their whole share (`shared_slots_max`), `error.SlotsKeptForAccepts`; and an
+    /// accept while the wait after a Backpressure runs `error.AcceptTooSoon`, as on the real
+    /// type, in that order when more than one holds; each draws nothing and takes no slot,
+    /// and only the last changes a count, the wait's refusals. An id already in flight breaks the contract and
     /// crashes, full table or not.
     pub fn submit(self: *Sim, submission: io.Submission) io.SubmitError!void {
         comptime assertSimulationAllowed();
@@ -205,12 +210,10 @@ pub const Sim = struct {
         // crashes, full queue or not.
         const sends_before = self.sendsCounted(submission.operation);
         self.assertIdNotInFlight(submission.id);
-        assert(self.sends_in_flight <= send_slots_max);
+        assert(self.sends_in_flight <= shared_slots_max);
         if (self.in_flight == slots_count) return error.QueueFull;
-        // The operations past send_slots_max are kept for accepts.
-        if (submission.operation == .send and self.sends_in_flight == send_slots_max) {
-            return error.SendSlotsFull;
-        }
+        // The operations past shared_slots_max are kept for accepts.
+        try self.share.admit(submission.operation, self.in_flight);
         if (submission.operation == .accept) try self.accept_wait.admit(self.now_ns);
 
         const index = self.freeSlot();
@@ -226,6 +229,7 @@ pub const Sim = struct {
             .bytes_hash = hashOperation(submission.operation),
         };
         self.in_flight += 1;
+        self.share.taken(submission.operation);
         if (submission.operation == .send) self.sends_in_flight += 1;
         self.submitted += 1;
         // Counted on the peer's entry until it completes, through the same call the real
@@ -295,17 +299,20 @@ pub const Sim = struct {
     fn assertIdNotInFlight(self: *const Sim, id: io.OperationId) void {
         var occupied: u32 = 0;
         var sends: u32 = 0;
+        var accepts: u32 = 0;
         var index: u32 = 0;
         while (index < slots_count) : (index += 1) {
             const slot = self.slots[index] orelse continue;
             occupied += 1;
             if (slot.submission.operation == .send) sends += 1;
+            if (slot.submission.operation == .accept) accepts += 1;
             assert(slot.submission.id != id);
         }
-        // The count of occupied slots, `in_flight` and `sends_in_flight` are kept
-        // separately; they must agree.
+        // The count of occupied slots, `in_flight`, `sends_in_flight` and the share kept
+        // from accepts are kept separately; they must agree.
         assert(occupied == self.in_flight);
         assert(sends == self.sends_in_flight);
+        assert(occupied - accepts == self.share.others_in_flight);
     }
 
     /// Takes a free slot, scanning from a seeded offset.
@@ -378,6 +385,7 @@ pub const Sim = struct {
     fn complete(self: *Sim, slot: Slot) io.Completion {
         assert(self.completed < self.submitted);
         assert(hashOperation(slot.submission.operation) == slot.bytes_hash);
+        self.share.released(slot.submission.operation);
         const result: io.Result = switch (slot.drawn) {
             .send => |sent| sent: {
                 assert(self.sends_in_flight > 0); // Counted at submit.
@@ -594,6 +602,19 @@ fn testSubmission(id: io.OperationId) io.Submission {
     return .{ .id = id, .operation = operation };
 }
 
+/// The submission each id fills a whole table with: `testSubmission` within the share kept
+/// from accepts, and an accept in each slot past it.
+fn fullSubmission(id: io.OperationId) io.Submission {
+    assert(id < slots_count);
+    const submission: io.Submission = if (id < shared_slots_max)
+        testSubmission(id)
+    else
+        .{ .id = id, .operation = .{ .accept = .{ .listener = test_listener } } };
+    // Only the slots past the share take accepts.
+    assert((submission.operation == .accept) == (id >= shared_slots_max));
+    return submission;
+}
+
 test "sim: same seed, same completion order and counts" {
     var fixture: TableFixture = undefined;
     try fixture.setUpPeers(test_peers);
@@ -707,7 +728,7 @@ test "sim: a full table refuses a submission and changes nothing" {
     var sim = Sim.init(3, 0);
     sim.attachTable(&fixture.table);
     var id: io.OperationId = 0;
-    while (id < slots_count) : (id += 1) try sim.submit(testSubmission(id));
+    while (id < slots_count) : (id += 1) try sim.submit(fullSubmission(id));
     // The refused submission is a send to peer 0, which holds every eighth id's send: it
     // must not be counted on the entry.
     const refused = testSubmission(id);
@@ -723,47 +744,108 @@ test "sim: a full table refuses a submission and changes nothing" {
     var ticks: u32 = 0;
     while (ticks <= constants.sim_completion_delay_ticks_max) : (ticks += 1) sim.tick();
     try testing.expectEqual(@as(u32, 1), sim.poll(&completions));
-    try sim.submit(testSubmission(id));
+    // The freed slot takes the kind that left it: an accept's slot stays kept for accepts.
+    try sim.submit(fullSubmission(completions[0].id));
     try testing.expectEqual(slots_count, sim.in_flight);
 }
 
-test "sim: a send past the sends' share is refused, and the last operation still goes in" {
+test "sim: past the share kept from accepts, a send and a statement are refused and an accept still goes in" {
     var fixture: TableFixture = undefined;
     try fixture.setUpPeers(test_peers);
     defer fixture.tearDown();
     var sim = Sim.init(5, 0);
     sim.attachTable(&fixture.table);
+    // The share filled with sends and statements alike: both count against it.
     var id: io.OperationId = 0;
-    while (id < send_slots_max) : (id += 1) {
-        try sim.submit(.{ .id = id, .operation = .{ .send = .{ .peer = 0, .bytes = "s" } } });
-    }
-    try testing.expectEqual(send_slots_max, sim.sends_in_flight);
-    // The refused send must not be counted on its peer's entry either.
+    while (id < shared_slots_max) : (id += 1) try sim.submit(mixedSubmission(id));
+    try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
+    try testing.expectEqual(shared_slots_max - shared_slots_max / 2, sim.sends_in_flight);
+    // Neither refusal may count a send on its peer's entry, take a slot or draw anything.
     const entry_before = fixture.table.get(0).*;
-    try testing.expectEqual(@as(connections.SendCount, send_slots_max), entry_before.sends_in_flight);
     const slots_before = sim.slots;
+    const outcomes_before = sim.outcomes.s;
     const send: io.Submission = .{ .id = id, .operation = .{ .send = .{ .peer = 0, .bytes = "s" } } };
-    try testing.expectError(error.SendSlotsFull, sim.submit(send));
-    try testing.expectEqual(entry_before, fixture.table.get(0).*);
-    try testing.expectEqual(send_slots_max, sim.in_flight);
-    try testing.expectEqual(@as(u64, send_slots_max), sim.submitted);
-    try testing.expectEqualDeep(slots_before, sim.slots);
-
-    // The operations kept back take anything but a send; then the table is full for all.
     const statement: io.Submission = .{ .id = id, .operation = .{ .execute = .{ .statement = "select 1" } } };
-    try sim.submit(statement);
+    try testing.expectError(error.SlotsKeptForAccepts, sim.submit(send));
+    try testing.expectError(error.SlotsKeptForAccepts, sim.submit(statement));
+    try testing.expectEqual(entry_before, fixture.table.get(0).*);
+    try testing.expectEqual(shared_slots_max, sim.in_flight);
+    try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
+    try testing.expectEqual(@as(u64, shared_slots_max), sim.submitted);
+    try testing.expectEqualDeep(slots_before, sim.slots);
+    try testing.expectEqual(outcomes_before, sim.outcomes.s);
+
+    // The operations kept back take an accept; then the table is full for every kind.
+    const accept: io.Submission = .{ .id = id, .operation = .{ .accept = .{ .listener = 3 } } };
+    try sim.submit(accept);
     try testing.expectEqual(slots_count, sim.in_flight);
+    try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
+    try testing.expectError(error.QueueFull, sim.submit(.{ .id = id + 1, .operation = accept.operation }));
     try testing.expectError(error.QueueFull, sim.submit(.{ .id = id + 1, .operation = statement.operation }));
     try testing.expectError(error.QueueFull, sim.submit(.{ .id = id + 1, .operation = send.operation }));
 
-    // Every send completes and is uncounted.
+    // Every operation completes and is uncounted, from the share and from its peer.
     var completions: [slots_count]io.Completion = undefined;
     var ticks: u32 = 0;
     while (ticks <= constants.sim_completion_delay_ticks_max) : (ticks += 1) sim.tick();
     try testing.expectEqual(slots_count, sim.poll(&completions));
     try testing.expectEqual(@as(u32, 0), sim.sends_in_flight);
+    try testing.expectEqual(@as(u32, 0), sim.share.others_in_flight);
     try testing.expectEqual(@as(u32, 0), sim.in_flight);
     try fixture.expectNoSendsCounted();
+}
+
+test "sim: an accept counts against no share, so a send still takes the last free slot" {
+    // The share counts operations, not free slots: with an accept in flight beside one
+    // operation fewer than the share, the last free slot goes to a send.
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(6, 0);
+    sim.attachTable(&fixture.table);
+    try sim.submit(.{ .id = 0, .operation = .{ .accept = .{ .listener = 3 } } });
+    var id: io.OperationId = 1;
+    while (id < shared_slots_max) : (id += 1) try sim.submit(mixedSubmission(id));
+    try testing.expectEqual(slots_count - 1, sim.in_flight);
+    try testing.expectEqual(shared_slots_max - 1, sim.share.others_in_flight);
+    try sim.submit(.{ .id = id, .operation = .{ .send = .{ .peer = 1, .bytes = "s" } } });
+    try testing.expectEqual(slots_count, sim.in_flight);
+    try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
+
+    // Once the accept completes, its slot is free but kept: a statement is refused, and
+    // another accept takes it.
+    var completions: [slots_count]io.Completion = undefined;
+    var ticks: u32 = 0;
+    var accept_done = false;
+    while (ticks <= constants.sim_completion_delay_ticks_max and !accept_done) : (ticks += 1) {
+        sim.tick();
+        const count = sim.poll(&completions);
+        for (completions[0..count]) |completion| {
+            if (completion.result == .accept) accept_done = true;
+            // Anything else that completes is put straight back, so only the accept's
+            // slot is free afterwards.
+            if (completion.result != .accept) try sim.submit(mixedSubmission(completion.id));
+        }
+    }
+    try testing.expect(accept_done);
+    try testing.expectEqual(slots_count - 1, sim.in_flight);
+    try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
+    const statement: io.Submission = .{ .id = id + 1, .operation = .{ .execute = .{ .statement = "select 1" } } };
+    try testing.expectError(error.SlotsKeptForAccepts, sim.submit(statement));
+    try sim.submit(.{ .id = id + 1, .operation = .{ .accept = .{ .listener = 3 } } });
+    try testing.expectEqual(slots_count, sim.in_flight);
+}
+
+/// A send to peer 0 for an even id, a statement for an odd one.
+fn mixedSubmission(id: io.OperationId) io.Submission {
+    const operation: io.Operation = if (id % 2 == 0)
+        .{ .send = .{ .peer = 0, .bytes = "s" } }
+    else
+        .{ .execute = .{ .statement = "select 1" } };
+    const submission: io.Submission = .{ .id = id, .operation = operation };
+    assert(submission.operation != .accept);
+    assert(submission.id == id);
+    return submission;
 }
 
 test "sim: an id may be reused once its operation has completed" {
@@ -775,7 +857,7 @@ test "sim: an id may be reused once its operation has completed" {
     var sim = Sim.init(17, 0);
     sim.attachTable(&fixture.table);
     var id: io.OperationId = 0;
-    while (id < slots_count) : (id += 1) try sim.submit(testSubmission(id));
+    while (id < slots_count) : (id += 1) try sim.submit(fullSubmission(id));
     var completions: [1]io.Completion = undefined;
     var ticks: u32 = 0;
     while (ticks <= constants.sim_completion_delay_ticks_max) : (ticks += 1) sim.tick();
@@ -785,7 +867,7 @@ test "sim: an id may be reused once its operation has completed" {
         try testing.expectEqual(slots_count - 1, sim.in_flight);
         const reused = completions[0].id;
         try testing.expect(reused < slots_count);
-        try sim.submit(testSubmission(reused));
+        try sim.submit(fullSubmission(reused));
         try testing.expectEqual(slots_count, sim.in_flight);
     }
     try testing.expectEqual(@as(u64, 3), sim.completed);
@@ -1107,7 +1189,7 @@ test "sim: a full queue refuses an accept with QueueFull while the wait runs" {
     var sim = Sim.init(13, 0);
     sim.attachTable(&fixture.table);
     var id: io.OperationId = 0;
-    while (id < slots_count) : (id += 1) try sim.submit(testSubmission(id));
+    while (id < slots_count) : (id += 1) try sim.submit(fullSubmission(id));
     try testing.expectError(error.Backpressure, sim.arrive(error.Backpressure));
     // An id no fill submission holds.
     const accept: io.Submission = .{ .id = slots_count, .operation = .{ .accept = .{ .listener = test_listener } } };

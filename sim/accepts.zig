@@ -135,8 +135,8 @@ fn topUp(w: *Workload) Error!void {
         const too_soon = if (w.resume_tick) |resume_tick| tick < resume_tick else false;
         const submission: io.Submission = .{ .id = w.next_id, .operation = .{ .accept = .{ .listener = listener } } };
         w.sim.submit(submission) catch |err| switch (err) {
-            // Fewer than the ring's depth are ever in flight here, and none is a send.
-            error.QueueFull, error.SendSlotsFull => return error.InvariantBroken,
+            // Fewer than the ring's depth are ever in flight here, and all are accepts.
+            error.QueueFull, error.SlotsKeptForAccepts => return error.InvariantBroken,
             error.AcceptTooSoon => {
                 if (!too_soon) return error.InvariantBroken; // Refused with the wait over.
                 w.counts.too_soon += 1;

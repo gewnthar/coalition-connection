@@ -276,13 +276,15 @@ pub const listener_socket_mode: u32 = 0o660;
 /// only client. Provisional: the server loop keeps to it.
 pub const accepts_in_flight_max: u32 = 1;
 
-/// Operations in flight that may be sends: the I/O operations less the slots kept for
-/// accepts. Reason: a client that stops reading leaves its send pending until the
-/// connection is dropped, and enough such clients could otherwise hold every slot, so that
-/// no accept could be submitted for anyone. With `accepts_in_flight_max` slots kept back,
-/// the server still accepts while every send slot is stuck. The real I/O type refuses a
-/// send past this with `error.SendSlotsFull`, and so does the simulator.
-pub const io_sends_in_flight_max: u32 = io_operations_in_flight_max - accepts_in_flight_max;
+/// Operations in flight that may be anything but accepts (sends and statements today,
+/// receives and cancels from core 3b): the I/O operations less the slots kept for accepts.
+/// Reason: a client that stops reading leaves its send pending until the connection is
+/// dropped, and enough such clients, or receives, cancels and statements piling up, could
+/// otherwise hold every slot, so that no accept could be submitted for anyone. With
+/// `accepts_in_flight_max` slots kept back from every other kind, the server still accepts
+/// while all of them are stuck. The real I/O type refuses any operation but an accept past
+/// this with `error.SlotsKeptForAccepts`, and so does the simulator.
+pub const io_non_accepts_in_flight_max: u32 = io_operations_in_flight_max - accepts_in_flight_max;
 
 /// File descriptors the server holds open besides its connections' sockets, at most, at
 /// any one moment:
@@ -468,8 +470,8 @@ comptime {
     assert(io_random_bytes_max >= 32);
     assert(io_random_attempts_max >= 2);
     assert(accepts_in_flight_max > 0 and accepts_in_flight_max <= io_operations_in_flight_max);
-    // Keeping slots for accepts leaves at least one for sends.
-    assert(io_sends_in_flight_max > 0);
+    // Keeping slots for accepts leaves at least one for every other operation.
+    assert(io_non_accepts_in_flight_max > 0);
     // fs.nr_open defaults to 1,048,576, and no hard open-file limit can pass it unless an
     // administrator raises that sysctl, so the largest config must fit below it.
     assert(descriptors_needed_max <= 1024 * 1024);
