@@ -58,6 +58,14 @@
 //! `accept_errno_undocumented_count`, with the latest one kept in
 //! `accept_errno_undocumented_last`.
 //!
+//! Waiting after Backpressure: when an accept completes with `error.Backpressure`, `poll`
+//! reads the clock and starts `accept_wait` (`io.AcceptWait`, shared with the simulator)
+//! from that reading. Until the clock is `constants.io_accept_backpressure_wait_ns` past it,
+//! `submit` refuses every accept with `error.AcceptTooSoon`, takes no slot and counts the
+//! refusal; the first accept submitted after that clears the wait. Each Backpressure starts
+//! the wait again. Sends are never held back, and a full ring is reported first, as
+//! `error.QueueFull`, when both hold.
+//!
 //! Errnos are printed as numbers (`{d}` of `@backingInt`), never by name: `linux.E` is
 //! non-exhaustive, and printing a value std has no name for stops the process with "invalid
 //! enum value" instead of the message meant.
@@ -194,6 +202,8 @@ pub const Real = struct {
     /// The latest of those errnos, or `.SUCCESS` if there has been none. Print it with
     /// `@backingInt`, as for sends.
     accept_errno_undocumented_last: linux.E,
+    /// The wait after an accept completed with `Backpressure`, and the accepts it refused.
+    accept_wait: io.AcceptWait,
     /// Drops whose shutdown failed with an errno shutdown(2) doesn't document. For metrics:
     /// any count above zero means `shutdownErrno` is missing a case, and those connections'
     /// sends may still be pending.
@@ -228,6 +238,7 @@ pub const Real = struct {
             .send_errno_undocumented_last = .SUCCESS,
             .accept_errno_undocumented_count = 0,
             .accept_errno_undocumented_last = .SUCCESS,
+            .accept_wait = .{},
             .drop_errno_undocumented_count = 0,
             .drop_errno_undocumented_last = .SUCCESS,
         };
@@ -285,10 +296,12 @@ pub const Real = struct {
     /// `submit` or `poll`, still naming the socket number read now. A send is therefore
     /// counted on its connection's entry until its completion, and the table refuses to
     /// release that entry meanwhile, so the number can't be closed and reused under it.
-    /// With every slot in use, returns `error.QueueFull`, and for a send when sends hold
-    /// every slot they may (`send_slots_max`), `error.SendSlotsFull`; either changes
-    /// nothing, and a full ring wins when both hold. An id already in flight breaks the
-    /// contract and stops the process, full ring or not.
+    /// With every slot in use, returns `error.QueueFull`, for a send when sends hold every
+    /// slot they may (`send_slots_max`), `error.SendSlotsFull`, and for an accept while the
+    /// wait after a Backpressure runs, `error.AcceptTooSoon`. The first two change nothing,
+    /// the last only the wait's refusal count and the clock's latest reading, and a full ring
+    /// wins when it and another hold. An id already in flight breaks the contract
+    /// and stops the process, full ring or not.
     pub fn submit(self: *Real, submission: io.Submission) io.SubmitError!void {
         comptime assertLinux();
         const submitted_before = self.submitted;
@@ -311,6 +324,11 @@ pub const Real = struct {
         // The slots past send_slots_max are kept for accepts.
         if (submission.operation == .send and self.sends_in_flight == send_slots_max) {
             return error.SendSlotsFull;
+        }
+        // Checked last, so a refusal above leaves the wait and the clock as they were. The
+        // clock is read only while a wait runs.
+        if (submission.operation == .accept and self.accept_wait.resume_at != null) {
+            try self.accept_wait.admit(self.now());
         }
         const sends_before = self.sendsCounted(submission.operation);
 
@@ -526,12 +544,19 @@ pub const Real = struct {
     }
 
     /// An accept's result from its completion: the new connection's entry, or the error its
-    /// errno means. A full table closes the new socket and counts the refusal.
+    /// errno means. A full table closes the new socket and counts the refusal; Backpressure
+    /// starts the wait before the next accept.
     fn acceptResult(self: *Real, res: i32) io.AcceptError!io.PeerId {
         assert(res > -4096);
         if (res < 0) {
             const err: linux.E = @fromBackingInt(@intCast(-res));
-            return self.acceptFailed(err);
+            const resume_before = self.accept_wait.resume_at;
+            const failed = self.acceptFailed(err);
+            if (failed == error.Backpressure) self.accept_wait.begin(self.now());
+            // Only Backpressure touches the wait: a connection that failed says nothing of
+            // the system's descriptors or memory.
+            assert(failed == error.Backpressure or std.meta.eql(self.accept_wait.resume_at, resume_before));
+            return failed;
         }
         const socket: io.Socket = res;
         const count_before = self.table.count();
@@ -1801,6 +1826,140 @@ test "real: a failed accept changes no table entry" {
     try testing.expectError(error.Backpressure, fixture.real.acceptResult(short));
     try testing.expectEqual(@as(u32, 1), fixture.table.count());
     try testing.expectEqual(@as(u64, 0), fixture.real.refused);
+}
+
+/// The completion result an accept gets when the system is short of descriptors.
+const accept_short: i32 = -@as(i32, @backingInt(linux.E.MFILE));
+
+/// Sleeps 1 ms at a time until the real type's clock reaches `instant`, at most
+/// `poll_attempts_max` times, or fails the test.
+fn sleepUntil(real: *Real, instant: io.Instant) !void {
+    assert(instant > real.epoch);
+    var attempts: u32 = 0;
+    while (real.now() < instant and attempts < poll_attempts_max) : (attempts += 1) {
+        const pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&pause, null);
+    }
+    assert(attempts <= poll_attempts_max);
+    try testing.expect(real.now() >= instant);
+}
+
+test "real: after Backpressure an accept is refused until the wait is over, sends are not" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    var loopback: Loopback = undefined;
+    try loopback.open();
+    defer loopback.close();
+
+    // A connection that failed starts no wait.
+    const aborted = -@as(i32, @backingInt(linux.E.CONNABORTED));
+    try testing.expectError(error.PeerDown, fixture.real.acceptResult(aborted));
+    try testing.expectEqual(@as(?io.Instant, null), fixture.real.accept_wait.resume_at);
+    const before_short = fixture.real.now();
+    try testing.expectError(error.Backpressure, fixture.real.acceptResult(accept_short));
+    const resume_at = fixture.real.accept_wait.resume_at orelse return error.TestExpectedWait;
+    // Started from a reading taken at the completion, no earlier than the one before it.
+    try testing.expect(resume_at >= before_short + constants.io_accept_backpressure_wait_ns);
+    try testing.expect(resume_at <= fixture.real.now() + constants.io_accept_backpressure_wait_ns);
+
+    // Refused, taking no slot and no submission entry; only the refusal count changes.
+    const accept: io.Submission = .{ .id = 21, .operation = .{ .accept = .{ .listener = loopback.listener } } };
+    const submitted_before = fixture.real.submitted;
+    const sqe_tail_before = fixture.real.ring.sq.sqe_tail;
+    const slots_before = fixture.real.slots;
+    try testing.expectError(error.AcceptTooSoon, fixture.real.submit(accept));
+    try testing.expectEqual(submitted_before, fixture.real.submitted);
+    try testing.expectEqual(sqe_tail_before, fixture.real.ring.sq.sqe_tail);
+    try testing.expectEqualSlices(Slot, &slots_before, &fixture.real.slots);
+    try testing.expectEqual(@as(u64, 1), fixture.real.accept_wait.refused);
+    try testing.expectEqual(@as(?io.Instant, resume_at), fixture.real.accept_wait.resume_at);
+
+    // A send isn't held back by the wait.
+    try fixture.send(22, "hi");
+    var completions: [2]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 1, fixture.remote);
+    try testing.expectEqual(@as(u32, 2), try completions[0].result.send);
+
+    // Once the clock reaches the end of the wait, the accept goes in and clears it.
+    try sleepUntil(&fixture.real, resume_at);
+    try fixture.real.submit(accept);
+    try testing.expectEqual(@as(?io.Instant, null), fixture.real.accept_wait.resume_at);
+    try testing.expectEqual(@as(u64, 1), fixture.real.accept_wait.refused);
+    try loopback.connect();
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(io.OperationId, 21), completions[0].id);
+    const peer = try completions[0].result.accept;
+    assert(fixture.table.get(peer).sends_in_flight == 0);
+    _ = linux.close(fixture.table.release(peer) catch |err| switch (err) {
+        error.SendsInFlight => unreachable,
+    });
+}
+
+test "real: a second Backpressure starts the wait again" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    var loopback: Loopback = undefined;
+    try loopback.open();
+    defer loopback.close();
+    try testing.expectError(error.Backpressure, fixture.real.acceptResult(accept_short));
+    const first = fixture.real.accept_wait.resume_at.?;
+    // A tenth of the wait passes, then another accept finds the system short.
+    try sleepUntil(&fixture.real, first - constants.io_accept_backpressure_wait_ns / 10 * 9);
+    try testing.expectError(error.Backpressure, fixture.real.acceptResult(accept_short));
+    const second = fixture.real.accept_wait.resume_at.?;
+    try testing.expect(second >= first + constants.io_accept_backpressure_wait_ns / 10);
+    // Past the first wait's end, the second still runs: about 90 ms of it is left, far
+    // longer than the 1 ms sleeps overshoot.
+    try sleepUntil(&fixture.real, first);
+    const accept: io.Submission = .{ .id = 23, .operation = .{ .accept = .{ .listener = loopback.listener } } };
+    try testing.expectError(error.AcceptTooSoon, fixture.real.submit(accept));
+    try testing.expectEqual(@as(?io.Instant, second), fixture.real.accept_wait.resume_at);
+}
+
+test "real: a full ring refuses an accept with QueueFull while the wait runs" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    var loopback: Loopback = undefined;
+    try loopback.open();
+    defer loopback.close();
+
+    // An accept in the slot kept for accepts, before any wait, and a one-byte send in
+    // every slot a send may take: every slot is in use until the next poll.
+    try fixture.real.submit(.{ .id = 0, .operation = .{ .accept = .{ .listener = loopback.listener } } });
+    var id: io.OperationId = 1;
+    while (id <= send_slots_max) : (id += 1) try fixture.send(id, "x");
+    try testing.expectEqual(@as(u32, 0), fixture.real.free_count);
+    try testing.expectError(error.Backpressure, fixture.real.acceptResult(accept_short));
+    // The wait just started, so it runs: both refusals hold.
+    try testing.expect(fixture.real.now() < fixture.real.accept_wait.resume_at.?);
+
+    // The full ring is reported, and the wait's count is untouched.
+    const late: io.Submission = .{ .id = id, .operation = .{ .accept = .{ .listener = loopback.listener } } };
+    try testing.expectError(error.QueueFull, fixture.real.submit(late));
+    try testing.expectEqual(@as(u64, 0), fixture.real.accept_wait.refused);
+
+    // With the sends back, the ring has room. A fresh Backpressure starts the wait again,
+    // so it surely runs, and the same accept meets AcceptTooSoon: both refusals held above.
+    var completions: [slots_count]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, send_slots_max, fixture.remote);
+    for (completions[0..send_slots_max]) |completion| try testing.expectEqual(@as(u32, 1), try completion.result.send);
+    try testing.expectError(error.Backpressure, fixture.real.acceptResult(accept_short));
+    try testing.expectError(error.AcceptTooSoon, fixture.real.submit(late));
+    try testing.expectEqual(@as(u64, 1), fixture.real.accept_wait.refused);
+
+    // The first accept still takes the connection.
+    try loopback.connect();
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(io.OperationId, 0), completions[0].id);
+    const peer = try completions[0].result.accept;
+    // No send is submitted on the new connection, so nothing holds its release back.
+    assert(fixture.table.get(peer).sends_in_flight == 0);
+    _ = linux.close(fixture.table.release(peer) catch |err| switch (err) {
+        error.SendsInFlight => unreachable,
+    });
 }
 
 /// Returns `-errno` the way a raw syscall does.

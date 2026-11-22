@@ -82,6 +82,8 @@ fn submitPair(run: *Run) SimError!void {
                 run.queue_full += 1; // Counted; the operation never completes.
                 continue;
             },
+            // Only an accept waits after Backpressure, and this workload submits none.
+            error.AcceptTooSoon => return error.InvariantBroken,
         };
         entry.* = true;
         switch (submission.operation) {
@@ -278,6 +280,7 @@ pub fn main() SimError!void {
         return err;
     };
     std.debug.print("sim: accepts submitted={d} accepted={d} refused={d}\n", .{ accepts.submitted, accepts.accepted, accepts.refused });
-    std.debug.print("sim: accepts peer_down={d} backpressure={d} departures={d}\n", .{ accepts.peer_down, accepts.backpressure, accepts.departures });
+    std.debug.print("sim: accepts peer_down={d} backpressure={d} too_soon={d}\n", .{ accepts.peer_down, accepts.backpressure, accepts.too_soon });
+    std.debug.print("sim: accepts departures={d}\n", .{accepts.departures});
     std.debug.print("sim: accepts trace={x:0>16} ok\n", .{accepts.trace});
 }

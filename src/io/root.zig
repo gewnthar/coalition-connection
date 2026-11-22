@@ -21,7 +21,7 @@
 //! and unchanged until its completion arrives, as with io_uring; the simulator checks this.
 //! Each accepted operation completes exactly once, carrying the `id` the caller gave it, and
 //! ids in flight must be distinct; the simulator and the real type both check this. A
-//! submission refused with `error.QueueFull` or `error.SendSlotsFull` never completes.
+//! submission refused with any `SubmitError` never completes.
 //! Sends may hold at most `constants.io_sends_in_flight_max` operations; the rest are kept
 //! for accepts, so clients that stop reading can't keep the server from accepting. A send
 //! past that share is refused with `error.SendSlotsFull`, even with operations free; the
@@ -37,7 +37,15 @@
 //! an entry in the connection table for it, so the caller never holds a raw socket. When
 //! the table is full, the connection is closed at once and the accept completes with
 //! `error.TableFull`; the caller decides when to accept again. Each accept takes one
-//! connection: to keep accepting, submit another.
+//! connection: to keep accepting, submit another. After an accept completes with
+//! `error.Backpressure`, every accept submitted within
+//! `constants.io_accept_backpressure_wait_ns` is refused with `error.AcceptTooSoon` and
+//! never completes. The wait is measured from a clock reading taken inside the `poll` that
+//! handed back the Backpressure, so a caller's deadline of `now()` after that poll plus the
+//! wait is never early. A refusal changes nothing the caller holds, so submitting again on
+//! any later tick is safe. Each Backpressure starts the wait again. Sends are not held
+//! back. The simulator and the real type both check this through `AcceptWait`, each
+//! against its own clock.
 //!
 //! Placeholders: `execute` stands in for database traffic until roadmap core 11 frames
 //! Postgres over sockets, and the contract has no cancel yet; core 3b adds socket reads and
@@ -65,6 +73,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const constants = @import("../constants.zig");
 
 pub const sim = @import("sim.zig");
 pub const real = @import("real.zig");
@@ -89,16 +98,61 @@ pub const OperationId = u64;
 /// `QueueFull`: every operation the I/O type holds is in flight. `SendSlotsFull`: a send,
 /// with sends already holding their whole share (`constants.io_sends_in_flight_max`); the
 /// operations left are kept for accepts. Either way, submit again after a completion.
-pub const SubmitError = error{ QueueFull, SendSlotsFull };
+/// `AcceptTooSoon`: an accept, less than `constants.io_accept_backpressure_wait_ns` after
+/// the latest accept that completed with `error.Backpressure`; submit it again once that
+/// time has passed. A full queue wins when it and `AcceptTooSoon` both hold.
+pub const SubmitError = error{ QueueFull, SendSlotsFull, AcceptTooSoon };
 pub const SendError = error{ PeerDown, Backpressure };
 pub const DatabaseError = error{ Unavailable, Timeout };
 
 /// Why an accept handed back no connection. `TableFull`: a connection arrived, but every
 /// entry of the connection table is in use, so it was closed. `PeerDown`: the connection
 /// failed before it could be accepted. `Backpressure`: the system is short of descriptors
-/// or memory, or the call was interrupted; try again later, not at once, or the retry
-/// fails the same way.
+/// or memory, or the call was interrupted; the I/O type refuses the next accept with
+/// `error.AcceptTooSoon` until `constants.io_accept_backpressure_wait_ns` has passed, so a
+/// retry that would fail the same way can't spin the loop.
 pub const AcceptError = error{ TableFull, PeerDown, Backpressure };
+
+/// The wait after an accept completes with `error.Backpressure`, kept by every I/O type
+/// that meets the contract, so the real type and the simulator make the same checks through
+/// the same calls, each with a reading of its own clock. Each Backpressure starts the wait
+/// again from the reading given; `admit` refuses an accept with `error.AcceptTooSoon` until
+/// a reading reaches `resume_at`, and clears the wait at the first one that does.
+pub const AcceptWait = struct {
+    /// The reading the running wait started from; meaningful only while `resume_at` is set.
+    started_at: Instant = 0,
+    /// When an accept may be submitted again, or null when no wait runs.
+    resume_at: ?Instant = null,
+    /// Accepts refused with `AcceptTooSoon`. For metrics and tests.
+    refused: u64 = 0,
+
+    /// Starts the wait, or starts it again, from `reading`, taken as the Backpressure
+    /// completion is handed back.
+    pub fn begin(self: *AcceptWait, reading: Instant) void {
+        const wait = constants.io_accept_backpressure_wait_ns;
+        // A clock reading has centuries of room below the top of a u64.
+        assert(reading <= std.math.maxInt(Instant) - wait);
+        // Readings come from one monotonic clock, so a restart never starts earlier.
+        assert(self.resume_at == null or self.started_at <= reading);
+        self.started_at = reading;
+        self.resume_at = reading + wait;
+    }
+
+    /// Lets an accept go ahead at `reading`, clearing a wait that is over, or refuses it
+    /// with `error.AcceptTooSoon` and counts the refusal; changes nothing else.
+    pub fn admit(self: *AcceptWait, reading: Instant) error{AcceptTooSoon}!void {
+        const resume_at = self.resume_at orelse return;
+        // The wait ends exactly one wait after it started, and it started at a reading no
+        // later than this one.
+        assert(resume_at - self.started_at == constants.io_accept_backpressure_wait_ns);
+        assert(self.started_at <= reading);
+        if (reading < resume_at) {
+            self.refused += 1;
+            return error.AcceptTooSoon;
+        }
+        self.resume_at = null;
+    }
+};
 
 /// The operating system could not supply random bytes. Production callers refuse the
 /// operation that needed them; they never fall back to a weaker source.
@@ -482,4 +536,22 @@ test {
         _ = real;
         _ = listener;
     }
+}
+
+test "AcceptWait: refuses until one wait past the latest Backpressure, then clears" {
+    const wait = constants.io_accept_backpressure_wait_ns;
+    var accept_wait: AcceptWait = .{};
+    // No wait runs: every reading is admitted, and nothing is counted.
+    try accept_wait.admit(5);
+    accept_wait.begin(1_000);
+    try testing.expectError(error.AcceptTooSoon, accept_wait.admit(1_000));
+    try testing.expectError(error.AcceptTooSoon, accept_wait.admit(1_000 + wait - 1));
+    // A second Backpressure starts the wait again from its own reading.
+    accept_wait.begin(1_500);
+    try testing.expectError(error.AcceptTooSoon, accept_wait.admit(1_000 + wait));
+    try testing.expectEqual(@as(?Instant, 1_500 + wait), accept_wait.resume_at);
+    try accept_wait.admit(1_500 + wait);
+    try testing.expectEqual(@as(?Instant, null), accept_wait.resume_at);
+    try accept_wait.admit(1_500 + wait);
+    try testing.expectEqual(@as(u64, 3), accept_wait.refused);
 }

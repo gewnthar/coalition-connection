@@ -1,7 +1,8 @@
 //! Seeded fuzzer: `zig build fuzz -Dseed=<n>`.
 //!
 //! Targets, each run for `fuzz_iterations_max` iterations from the same seed:
-//!   bounded_queue  random pushes and pops, checked against a trivial model after every step.
+//!   bounded_queue  random pushes and pops, checked against a trivial model after every step;
+//!                  the run must refuse a push on a full queue and a pop on an empty one.
 //!   http_request   valid requests from a generator, sometimes mutated or truncated, checked
 //!                  against what the generator wrote; plus cases at each size and field-count
 //!                  limit with the exact error expected, and a check that the run reached
@@ -32,6 +33,9 @@ const Queue = cc.BoundedQueue(u32, capacity);
 const Model = struct {
     next_push: u32 = 0,
     next_pop: u32 = 0,
+    /// Pushes refused as Full and pops refused as Empty, so the run can show it reached both.
+    full_refusals: u32 = 0,
+    empty_refusals: u32 = 0,
 
     fn len(self: Model) u32 {
         assert(self.next_push >= self.next_pop);
@@ -51,16 +55,20 @@ fn step(random: std.Random, queue: *Queue, model: *Model) FuzzError!void {
         if (queue.push(model.next_push)) {
             model.next_push += 1;
         } else |err| switch (err) {
-            error.Full => if (model.len() != capacity) return error.Mismatch,
-            error.Empty => return error.Mismatch,
+            error.Full => {
+                if (model.len() != capacity) return error.Mismatch;
+                model.full_refusals += 1;
+            },
         }
     } else {
         if (queue.pop()) |value| {
             if (value != model.next_pop) return error.Mismatch;
             model.next_pop += 1;
         } else |err| switch (err) {
-            error.Empty => if (model.len() != 0) return error.Mismatch,
-            error.Full => return error.Mismatch,
+            error.Empty => {
+                if (model.len() != 0) return error.Mismatch;
+                model.empty_refusals += 1;
+            },
         }
     }
     if (queue.count() != model.len()) return error.Mismatch;
@@ -81,6 +89,10 @@ fn runQueue(seed: u64) FuzzError!void {
         };
     }
     assert(iteration == cc.constants.fuzz_iterations_max);
+    // Each refusal is a step, so together they never pass the iterations.
+    assert(@as(u64, model.full_refusals) + model.empty_refusals <= iteration);
+    std.debug.print("fuzz bounded_queue: seed={d} full={d} empty={d}\n", .{ seed, model.full_refusals, model.empty_refusals });
+    if (model.full_refusals == 0 or model.empty_refusals == 0) return error.LimitMissed;
     std.debug.print("fuzz bounded_queue: seed={d} iterations={d} ok\n", .{ seed, iteration });
 }
 
