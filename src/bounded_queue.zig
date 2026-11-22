@@ -15,14 +15,17 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: u32) type {
         head: u32 = 0,
         len: u32 = 0,
 
-        pub const Error = error{ Full, Empty };
+        /// Returned by `push` when the queue is full.
+        pub const PushError = error{Full};
+        /// Returned by `pop` when the queue is empty.
+        pub const PopError = error{Empty};
 
         fn invariant(self: *const Self) void {
             assert(self.head < capacity);
             assert(self.len <= capacity);
         }
 
-        pub fn push(self: *Self, item: T) Error!void {
+        pub fn push(self: *Self, item: T) PushError!void {
             self.invariant();
             if (self.len == capacity) return error.Full;
             const len_before = self.len;
@@ -33,7 +36,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: u32) type {
             assert(self.len == len_before + 1);
         }
 
-        pub fn pop(self: *Self) Error!T {
+        pub fn pop(self: *Self) PopError!T {
             self.invariant();
             if (self.len == 0) return error.Empty;
             const len_before = self.len;
@@ -52,6 +55,20 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: u32) type {
             return result;
         }
     };
+}
+
+test "push can fail only with Full, and pop only with Empty" {
+    const Q = BoundedQueue(u8, 3);
+    // Each set has exactly its one error, so a switch over either needs exactly one arm.
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(Q.PushError).error_set.error_names.?.len);
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(Q.PopError).error_set.error_names.?.len);
+    // No set shared by both remains for a caller to reach for.
+    try std.testing.expect(!@hasDecl(Q, "Error"));
+    // The methods return exactly these sets, not a wider one.
+    const push_return = @typeInfo(@typeInfo(@TypeOf(Q.push)).@"fn".return_type.?).error_union;
+    const pop_return = @typeInfo(@typeInfo(@TypeOf(Q.pop)).@"fn".return_type.?).error_union;
+    try std.testing.expect(push_return.error_set == Q.PushError);
+    try std.testing.expect(pop_return.error_set == Q.PopError);
 }
 
 test "fifo order and wraparound" {
