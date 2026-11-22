@@ -235,6 +235,19 @@ pub const io_random_bytes_max: u32 = 64;
 /// a retry, and the bound stops a signal storm from spinning the event loop.
 pub const io_random_attempts_max: u32 = 8;
 
+/// How long the server waits, after an accept completes with `error.Backpressure`, before it
+/// submits the next accept. Reason: Backpressure mostly means the system is short of
+/// descriptors or memory, which come back only as other connections close or requests
+/// finish, so an accept submitted again at once fails the same way and spins the event
+/// loop. 100 ms caps the retries at ten a second. A client queued on the listener has
+/// already connected, so it waits on nginx's proxy read timeout (60 s by default), far
+/// longer. An interrupted accept, a would-block and an errno accept(2) doesn't document are
+/// Backpressure too and wait as well: io_uring rarely returns the first two, and the third
+/// is counted as a missing case. Each Backpressure starts the wait again. The real I/O type
+/// and the simulator refuse an accept submitted sooner with `error.AcceptTooSoon`.
+/// Provisional: the server loop (roadmap core 3) confirms it.
+pub const io_accept_backpressure_wait_ns: u64 = 100 * 1_000_000;
+
 /// Connections the kernel queues on the local listener before the server accepts them.
 /// Reason: nginx is the only client and opens a few connections per worker, so a queue of
 /// 512 rides out a burst between two accepts; Linux caps it at `net.core.somaxconn`
@@ -460,6 +473,10 @@ comptime {
     // fs.nr_open defaults to 1,048,576, and no hard open-file limit can pass it unless an
     // administrator raises that sysctl, so the largest config must fit below it.
     assert(descriptors_needed_max <= 1024 * 1024);
+    // The simulator moves in whole ticks, so the wait after Backpressure must be whole
+    // ticks, at least one. The accept workload sizes its phases from the wait (sim/).
+    assert(io_accept_backpressure_wait_ns % tick_ns == 0);
+    assert(io_accept_backpressure_wait_ns >= tick_ns);
     // A simulated run must leave room to drain every delayed completion.
     assert(sim_completion_delay_ticks_max < sim_ticks_max);
 }

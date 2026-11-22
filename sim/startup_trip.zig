@@ -880,6 +880,9 @@ const RealResult = struct {
     queue_full: bool = false,
     /// Whether a send returned SendSlotsFull.
     send_slots_full: bool = false,
+    /// Whether a submit returned AcceptTooSoon, which no call here should meet: the harness
+    /// never completes an accept with Backpressure.
+    accept_too_soon: bool = false,
 };
 
 /// The state a real-I/O control's call must leave as it was, or change as it says.
@@ -1021,6 +1024,7 @@ fn fillRing(real: *Real, case: trip.Case) void {
         const send: cc.io.Send = .{ .peer = trip.real_peer_id, .bytes = &.{fill_byte} };
         real.submit(.{ .id = first_fill_id + filled, .operation = .{ .send = send } }) catch |err| switch (err) {
             error.QueueFull, error.SendSlotsFull => setupFailed(case, "the ring filled early"),
+            error.AcceptTooSoon => setupFailed(case, "a send was refused as an early accept"),
         };
     }
     assert(real.inFlight() == send_slots_max);
@@ -1046,6 +1050,7 @@ fn fillAccept(real: *Real, case: trip.Case) void {
     const accept: cc.io.Operation = .{ .accept = .{ .listener = listener } };
     real.submit(.{ .id = slots_max, .operation = accept }) catch |err| switch (err) {
         error.QueueFull, error.SendSlotsFull => setupFailed(case, "the accepts' slot was taken"),
+        error.AcceptTooSoon => setupFailed(case, "an accept wait ran with no Backpressure"),
     };
     assert(real.inFlight() == slots_max);
     assert(real.free_count == 0);
@@ -1088,6 +1093,7 @@ fn callReal(
             switch (err) {
                 error.QueueFull => return .{ .queue_full = true },
                 error.SendSlotsFull => return .{ .send_slots_full = true },
+                error.AcceptTooSoon => return .{ .accept_too_soon = true },
             }
         };
         return .{};
@@ -1103,6 +1109,7 @@ fn callReal(
             real.submit(.{ .id = send_peer_id, .operation = .{ .execute = execute } }) catch |err| switch (err) {
                 error.QueueFull => return .{ .queue_full = true },
                 error.SendSlotsFull => return .{ .send_slots_full = true },
+                error.AcceptTooSoon => return .{ .accept_too_soon = true },
             };
             return .{};
         },
@@ -1188,7 +1195,7 @@ fn realControlHeld(
 fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
     assert(!armed);
     assert(before.in_flight == 0);
-    if (result.queue_full or result.send_slots_full) return false;
+    if (result.queue_full or result.send_slots_full or result.accept_too_soon) return false;
     if (real.submitted != before.submitted + 1) return false;
     if (real.last != before.last) return false;
     // `submit` hands the send to the kernel at once, unless the kernel refused for a moment.
@@ -1216,7 +1223,7 @@ fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remo
 fn slotsFullHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
     assert(!armed);
     assert(before.in_flight == send_slots_max);
-    if (!result.send_slots_full or result.queue_full) return false;
+    if (!result.send_slots_full or result.queue_full or result.accept_too_soon) return false;
     if (real.inFlight() != before.in_flight or real.free_count != before.free_count) return false;
     if (real.submitted != before.submitted or real.completed != before.completed) return false;
     if (real.ring.sq.sqe_tail != before.sqe_tail or real.last != before.last) return false;
@@ -1806,6 +1813,7 @@ fn fillSim(sim: *Sim, case: trip.Case, count: u32) void {
             .{ .execute = .{ .statement = fill_statement } };
         sim.submit(.{ .id = first_fill_id + filled, .operation = operation }) catch |err| switch (err) {
             error.QueueFull, error.SendSlotsFull => setupFailed(case, "the simulator filled early"),
+            error.AcceptTooSoon => setupFailed(case, "the fill was refused as an early accept"),
         };
     }
     assert(filled == count);
@@ -1822,6 +1830,7 @@ fn releaseUnderSend(sim: *Sim, table: *connections.Table, case: trip.Case) void 
     const send: cc.io.Send = .{ .peer = trip.sim_peer_index, .bytes = sim_send_bytes };
     sim.submit(.{ .id = send_peer_id, .operation = .{ .send = send } }) catch |err| switch (err) {
         error.QueueFull, error.SendSlotsFull => setupFailed(case, "the simulator was full"),
+        error.AcceptTooSoon => setupFailed(case, "a send was refused as an early accept"),
     };
     table.entries[trip.sim_peer_index].sends_in_flight = 0;
     _ = table.release(trip.sim_peer_index) catch |err| switch (err) {
@@ -1834,7 +1843,7 @@ fn releaseUnderSend(sim: *Sim, table: *connections.Table, case: trip.Case) void 
 }
 
 /// How the simulator answered the case's call.
-const SimRefusal = enum { none, queue_full, send_slots_full };
+const SimRefusal = enum { none, queue_full, send_slots_full, accept_too_soon };
 
 /// Makes the case's one call, a send or (for `complete_released`) a poll; nothing else
 /// runs while `armed` is set. Returns which refusal, if any, the simulator gave a send.
@@ -1853,6 +1862,7 @@ fn callSim(sim: *Sim, call: trip.SimCall) SimRefusal {
     sim.submit(.{ .id = id, .operation = .{ .send = send } }) catch |err| switch (err) {
         error.QueueFull => return .queue_full,
         error.SendSlotsFull => return .send_slots_full,
+        error.AcceptTooSoon => return .accept_too_soon,
     };
     return .none;
 }
