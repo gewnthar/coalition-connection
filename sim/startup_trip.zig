@@ -1706,7 +1706,7 @@ fn simCallFillsSendShare(call: trip.SimCall) bool {
     const fills = call == .send_duplicate_id_slots_full;
     // Never both fills, and never a control.
     assert(!fills or !simCallFillsSlots(call));
-    assert(!fills or call != .send_peer and call != .send_queue_full);
+    assert(!fills or (call != .send_peer and call != .send_queue_full));
     return fills;
 }
 
