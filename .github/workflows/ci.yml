@@ -79,3 +79,107 @@ jobs:
 
       - name: Simulation (fixed seed)
         run: zig build sim --release=safe -Dseed=1
+
+  # Zig's next release can reject code 0.17.1 accepts: master's operator precedence rule
+  # refuses `a | b << 8` and an unparenthesized mix of `or` and `and`. This job reads this
+  # repository's .zig and .zon files with Zig master's `zig ast-check`, so such code is seen
+  # in review instead of at the upgrade. Master changes daily and can break, or fail to
+  # download, through no fault of a change, so only build-and-test is a required check.
+  master-ast-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The same pinned checkout as above; the token isn't left in .git/config.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - name: Install minisign
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q minisign
+
+      - name: Install Zig master (signature and SHA-256 checked)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          fetch() { curl -fsSL --proto '=https' --retry 3 --max-time 120 "$@"; }
+          fetch https://ziglang.org/download/index.json -o "$RUNNER_TEMP/index.json"
+          version=$(jq -r '.master.version' "$RUNNER_TEMP/index.json")
+          url=$(jq -r '.master["x86_64-linux"].tarball' "$RUNNER_TEMP/index.json")
+          sha=$(jq -r '.master["x86_64-linux"].shasum' "$RUNNER_TEMP/index.json")
+          if [ "$version" = "null" ] || [ "$url" = "null" ] || [ "$sha" = "null" ]; then
+            echo "Zig master for x86_64-linux is not in the download index" >&2
+            exit 1
+          fi
+          # The whole name, so a signed tarball for another target or the source tarball
+          # can't stand in for this one.
+          name="zig-x86_64-linux-$version.tar.xz"
+          if [ "$url" != "https://ziglang.org/builds/$name" ]; then
+            echo "the index's master tarball isn't $name from ziglang.org: $url" >&2
+            exit 1
+          fi
+          fetch "$url" -o "$RUNNER_TEMP/zig.tar.xz"
+          fetch "$url.minisig" -o "$RUNNER_TEMP/zig.tar.xz.minisig"
+          echo "$sha  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict -
+          # Zig's signature, and its signed comment's file field must be exactly this name
+          # (the trusted comment's fields are separated by tabs).
+          minisign -V -m "$RUNNER_TEMP/zig.tar.xz" -x "$RUNNER_TEMP/zig.tar.xz.minisig" \
+            -P "$ZIG_PUBLIC_KEY" | tee "$RUNNER_TEMP/minisign.out"
+          grep -qF "$(printf '\tfile:%s\t' "$name")" "$RUNNER_TEMP/minisign.out"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Check the Zig master version
+        run: |
+          set -euo pipefail
+          expected=$(jq -r '.master.version' "$RUNNER_TEMP/index.json")
+          echo "Zig master: $(zig version)"
+          test "$(zig version)" = "$expected"
+
+      - name: zig ast-check on every tracked .zig and .zon file
+        run: |
+          set -euo pipefail
+          # The repository holds a few dozen such files; far more means something like a
+          # vendored tree was committed by mistake, which this job shouldn't read through.
+          files_max=256
+          git ls-files -z -- '*.zig' '*.zon' > "$RUNNER_TEMP/files"
+          count=$(tr -cd '\0' < "$RUNNER_TEMP/files" | wc -c)
+          if [ "$count" -eq 0 ] || [ "$count" -gt "$files_max" ]; then
+            echo "expected 1 to $files_max tracked .zig and .zon files, found $count" >&2
+            exit 1
+          fi
+          # Until the move to 0.18, master reads a copy in which `packed struct` and
+          # `packed union` are spelled `bitpack`, as master requires and 0.17.1 can't parse;
+          # otherwise master stops at the first `packed` and checks nothing after it in
+          # that file. Once the code says `bitpack`, the rename changes nothing.
+          tree="$RUNNER_TEMP/tree"
+          # A workflow command's message and property values, encoded as GitHub decodes them.
+          message() { local v=${1//%/%25}; v=${v//$'\r'/%0D}; printf '%s' "${v//$'\n'/%0A}"; }
+          property() { local v; v=$(message "$1"); v=${v//:/%3A}; printf '%s' "${v//,/%2C}"; }
+          seen=0
+          failed=0
+          while IFS= read -r -d '' file; do
+            seen=$((seen + 1))
+            mkdir -p "$tree/$(dirname -- "$file")"
+            sed -E 's/\bpacked (struct|union)\b/bitpack \1/g' -- "$file" > "$tree/$file"
+            if ! (cd "$tree" && zig ast-check "./$file" </dev/null) 2> "$RUNNER_TEMP/errors"; then
+              failed=$((failed + 1))
+              cat "$RUNNER_TEMP/errors" >&2
+              matched=0
+              while IFS= read -r line; do
+                if [[ $line =~ ^(.+):([0-9]+):([0-9]+):\ error:\ (.*)$ ]]; then
+                  matched=1
+                  echo "::error file=$(property "$file"),line=${BASH_REMATCH[2]},col=${BASH_REMATCH[3]}::$(message "${BASH_REMATCH[4]}")"
+                fi
+              done < "$RUNNER_TEMP/errors"
+              if [ "$matched" -eq 0 ]; then
+                echo "::error file=$(property "$file")::zig ast-check on Zig master failed"
+              fi
+            fi
+          done < "$RUNNER_TEMP/files"
+          # Every listed file was read: nothing in the loop took the rest of the list.
+          test "$seen" -eq "$count"
+          echo "checked $count files on Zig $(zig version); $failed failed"
+          test "$failed" -eq 0
