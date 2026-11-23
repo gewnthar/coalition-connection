@@ -116,7 +116,7 @@ pub const RealCall = enum(u8) {
     send_out_of_range,
     /// A send naming the free entry, with the stale descriptor written back as above and
     /// every slot a send may take in use: the peer is checked before the sends' share, so
-    /// the call trips instead of returning SendSlotsFull.
+    /// the call trips instead of returning SlotsKeptForAccepts.
     send_free_slots_full,
     /// The same with an accept in the slot kept for accepts as well, so the whole ring is
     /// in use: the peer is checked before the queue, so the call trips instead of
@@ -124,8 +124,8 @@ pub const RealCall = enum(u8) {
     send_free_queue_full,
     /// A send to the entry in use whose id is the first fill send's, still in flight, with
     /// every slot a send may take in use: the distinct-id check comes before the sends'
-    /// share, so the call trips instead of returning SendSlotsFull. Of the two refusals only
-    /// SendSlotsFull applies here, so this also fails if the check runs only on a full ring.
+    /// share, so the call trips instead of returning SlotsKeptForAccepts. Of the two refusals only
+    /// SlotsKeptForAccepts applies here, so this also fails if the check runs only on a full ring.
     send_duplicate_id_slots_full,
     /// The same with an accept in the slot kept for accepts as well, so the whole ring is
     /// in use: both refusals apply, so the call trips only if the distinct-id check comes
@@ -139,7 +139,7 @@ pub const RealCall = enum(u8) {
     /// A send to the entry in use: completes with its byte count, and the far end of the
     /// socketpair reads the same bytes.
     send_peer,
-    /// A send to the entry in use with every slot a send may take in use: SendSlotsFull,
+    /// A send to the entry in use with every slot a send may take in use: SlotsKeptForAccepts,
     /// and nothing changes.
     send_slots_full,
 };
@@ -171,7 +171,7 @@ pub const SimCall = enum(u8) {
     send_duplicate_id_queue_full,
     /// The same with only the slots a send may take in use: the distinct-id check comes
     /// before the sends' share, as on the real type, so the call trips instead of returning
-    /// SendSlotsFull, and a check run only on a full queue fails it.
+    /// SlotsKeptForAccepts, and a check run only on a full queue fails it.
     send_duplicate_id_slots_full,
     /// A poll that completes a send whose entry was released while it was in flight (the
     /// harness clears the entry's count first, so the release goes through): the

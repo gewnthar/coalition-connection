@@ -13,11 +13,13 @@
 //! completion finds its operation without a search. A submission with no free slot returns
 //! `error.QueueFull` and changes nothing.
 //!
-//! Slots kept for accepts: sends may hold at most `constants.io_sends_in_flight_max` slots,
-//! and a send past that returns `error.SendSlotsFull` and changes nothing, even with a slot
-//! free. The rest, `constants.accepts_in_flight_max`, stay for accepts, so clients that stop
-//! reading, each with a send stuck on a full socket buffer, can't take the whole ring and
-//! stop the server accepting anyone else.
+//! Slots kept for accepts: every operation but an accept (only sends on this type today;
+//! receives and cancels from core 3b) shares at most `constants.io_non_accepts_in_flight_max`
+//! slots, counted in `share` (`io.SlotShare`, shared with the simulator), and one past that
+//! returns `error.SlotsKeptForAccepts` and changes nothing, even with a slot free. The rest,
+//! `constants.accepts_in_flight_max`, stay for accepts, so clients that stop reading, each
+//! with a send stuck on a full socket buffer, can't take the whole ring and stop the server
+//! accepting anyone else.
 //!
 //! Sends: `IORING_OP_SEND` on the peer's socket from the connection table, with
 //! `MSG_NOSIGNAL`, so a peer that has gone away fails the send with `EPIPE` instead of
@@ -110,8 +112,8 @@ const clock_seconds_max: u64 = (std.math.maxInt(u64) - (ns_per_s - 1)) / ns_per_
 /// Operations in flight, and the ring's submission queue depth.
 const slots_count: u32 = constants.io_operations_in_flight_max;
 
-/// Slots sends may hold at once; the rest are kept for accepts.
-const send_slots_max: u32 = constants.io_sends_in_flight_max;
+/// Slots every operation but an accept may hold at once; the rest are kept for accepts.
+const shared_slots_max: u32 = constants.io_non_accepts_in_flight_max;
 
 /// One operation in flight: what its completion needs to be checked and handed back.
 const Slot = struct {
@@ -177,8 +179,11 @@ pub const Real = struct {
     /// Free slot indices, a stack: `free_slots[0..free_count]` are not in use.
     free_slots: [slots_count]u32,
     free_count: u32,
-    /// Slots in use that hold a send: never more than `send_slots_max`.
+    /// Slots in use that hold a send: never more than `shared_slots_max`.
     sends_in_flight: u32,
+    /// Slots in use that hold anything but an accept, counted against the share kept from
+    /// accepts through the same calls as in the simulator.
+    share: io.SlotShare,
     submitted: u64,
     completed: u64,
     /// Connections shut down by `drop`. For metrics.
@@ -229,6 +234,7 @@ pub const Real = struct {
             .free_slots = undefined,
             .free_count = slots_count,
             .sends_in_flight = 0,
+            .share = .{},
             .submitted = 0,
             .completed = 0,
             .dropped = 0,
@@ -296,12 +302,12 @@ pub const Real = struct {
     /// `submit` or `poll`, still naming the socket number read now. A send is therefore
     /// counted on its connection's entry until its completion, and the table refuses to
     /// release that entry meanwhile, so the number can't be closed and reused under it.
-    /// With every slot in use, returns `error.QueueFull`, for a send when sends hold every
-    /// slot they may (`send_slots_max`), `error.SendSlotsFull`, and for an accept while the
-    /// wait after a Backpressure runs, `error.AcceptTooSoon`. The first two change nothing,
-    /// the last only the wait's refusal count and the clock's latest reading, and a full ring
-    /// wins when it and another hold. An id already in flight breaks the contract
-    /// and stops the process, full ring or not.
+    /// With every slot in use, returns `error.QueueFull`; for anything but an accept when
+    /// those hold every slot they may (`shared_slots_max`), `error.SlotsKeptForAccepts`;
+    /// and for an accept while the wait after a Backpressure runs, `error.AcceptTooSoon`.
+    /// The first two change nothing, the last only the wait's refusal count and the clock's
+    /// latest reading, and a full ring wins when it and another hold. An id already in
+    /// flight breaks the contract and stops the process, full ring or not.
     pub fn submit(self: *Real, submission: io.Submission) io.SubmitError!void {
         comptime assertLinux();
         const submitted_before = self.submitted;
@@ -319,12 +325,10 @@ pub const Real = struct {
         // Looked up before anything changes: a peer not in the table is a caller's bug.
         const socket = self.socketFor(submission.operation);
         self.assertIdNotInFlight(submission.id);
-        assert(self.sends_in_flight <= send_slots_max);
+        assert(self.sends_in_flight <= shared_slots_max);
         if (self.free_count == 0) return error.QueueFull;
-        // The slots past send_slots_max are kept for accepts.
-        if (submission.operation == .send and self.sends_in_flight == send_slots_max) {
-            return error.SendSlotsFull;
-        }
+        // The slots past shared_slots_max are kept for accepts.
+        try self.share.admit(submission.operation, self.free_count);
         // Checked last, so a refusal above leaves the wait and the clock as they were. The
         // clock is read only while a wait runs.
         if (submission.operation == .accept and self.accept_wait.resume_at != null) {
@@ -342,6 +346,7 @@ pub const Real = struct {
         sqe.user_data = index;
         self.free_count -= 1;
         self.submitted += 1;
+        self.share.taken(submission.operation);
         // Counted before the kernel can see it, so no completion arrives uncounted.
         if (submission.operation == .send) {
             self.table.sendSubmitted(submission.operation.send.peer);
@@ -445,18 +450,21 @@ pub const Real = struct {
     fn assertIdNotInFlight(self: *const Real, id: io.OperationId) void {
         var occupied: u32 = 0;
         var sends: u32 = 0;
+        var accepts: u32 = 0;
         var index: u32 = 0;
         while (index < slots_count) : (index += 1) {
             const slot = &self.slots[index];
             if (!slot.in_use) continue;
             occupied += 1;
             if (slot.kind == .send) sends += 1;
+            if (slot.kind == .accept) accepts += 1;
             assert(slot.id != id); // An id already in flight.
         }
-        // The slots in use, the free stack and the send count are kept separately; they
-        // must agree.
+        // The slots in use, the free stack, the send count and the share kept from accepts
+        // are kept separately; they must agree.
         assert(occupied == self.inFlight());
         assert(sends == self.sends_in_flight);
+        assert(occupied - accepts == self.share.others_in_flight);
     }
 
     /// The socket an operation acts on, checked before anything changes: a send's peer from
@@ -491,6 +499,7 @@ pub const Real = struct {
         self.free_slots[self.free_count] = index;
         self.free_count += 1;
         self.completed += 1;
+        self.share.released(slot.kind);
         assert(self.free_count <= slots_count);
         assert(slot.kind != .execute); // `prepare` never writes one.
         const result: io.Result = switch (slot.kind) {
@@ -1149,13 +1158,13 @@ test "real: a refused submission counts no send on its peer" {
     try fixture.setUp();
     defer fixture.tearDown();
     var id: io.OperationId = 0;
-    while (id < send_slots_max) : (id += 1) try fixture.send(id, "q");
-    try testing.expectEqual(@as(connections.SendCount, send_slots_max), fixture.table.get(fixture.peer).sends_in_flight);
-    try testing.expectError(error.SendSlotsFull, fixture.send(id, "r"));
-    try testing.expectEqual(@as(connections.SendCount, send_slots_max), fixture.table.get(fixture.peer).sends_in_flight);
+    while (id < shared_slots_max) : (id += 1) try fixture.send(id, "q");
+    try testing.expectEqual(@as(connections.SendCount, shared_slots_max), fixture.table.get(fixture.peer).sends_in_flight);
+    try testing.expectError(error.SlotsKeptForAccepts, fixture.send(id, "r"));
+    try testing.expectEqual(@as(connections.SendCount, shared_slots_max), fixture.table.get(fixture.peer).sends_in_flight);
 
-    var completions: [send_slots_max]io.Completion = undefined;
-    try pollUntil(&fixture.real, &completions, send_slots_max, fixture.remote);
+    var completions: [shared_slots_max]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, shared_slots_max, fixture.remote);
     try testing.expectEqual(@as(connections.SendCount, 0), fixture.table.get(fixture.peer).sends_in_flight);
 }
 
@@ -1192,32 +1201,32 @@ test "real: a send to a closed peer completes with PeerDown" {
     try testing.expectEqual(@as(u32, 0), fixture.real.inFlight());
 }
 
-test "real: one send past the sends' share of the ring returns SendSlotsFull and changes nothing" {
+test "real: one send past the sends' share of the ring returns SlotsKeptForAccepts and changes nothing" {
     var fixture: Fixture = undefined;
     try fixture.setUp();
     defer fixture.tearDown();
     var id: io.OperationId = 0;
-    while (id < send_slots_max) : (id += 1) try fixture.send(id, "y");
-    try testing.expectEqual(send_slots_max, fixture.real.inFlight());
-    try testing.expectEqual(send_slots_max, fixture.real.sends_in_flight);
+    while (id < shared_slots_max) : (id += 1) try fixture.send(id, "y");
+    try testing.expectEqual(shared_slots_max, fixture.real.inFlight());
+    try testing.expectEqual(shared_slots_max, fixture.real.sends_in_flight);
     // The slots kept for accepts are still free.
-    try testing.expectEqual(slots_count - send_slots_max, fixture.real.free_count);
+    try testing.expectEqual(slots_count - shared_slots_max, fixture.real.free_count);
 
     const sqe_tail_before = fixture.real.ring.sq.sqe_tail;
     const slots_before = fixture.real.slots;
-    try testing.expectError(error.SendSlotsFull, fixture.send(id, "z"));
-    try testing.expectEqual(send_slots_max, fixture.real.inFlight());
-    try testing.expectEqual(send_slots_max, fixture.real.sends_in_flight);
-    try testing.expectEqual(@as(u64, send_slots_max), fixture.real.submitted);
+    try testing.expectError(error.SlotsKeptForAccepts, fixture.send(id, "z"));
+    try testing.expectEqual(shared_slots_max, fixture.real.inFlight());
+    try testing.expectEqual(shared_slots_max, fixture.real.sends_in_flight);
+    try testing.expectEqual(@as(u64, shared_slots_max), fixture.real.submitted);
     try testing.expectEqual(sqe_tail_before, fixture.real.ring.sq.sqe_tail);
     try testing.expectEqualSlices(Slot, &slots_before, &fixture.real.slots);
 
     // Every send completes exactly once, with its own id, and the slots come back free.
-    var completions: [send_slots_max]io.Completion = undefined;
-    try pollUntil(&fixture.real, &completions, send_slots_max, fixture.remote);
-    var seen: [send_slots_max]bool = @splat(false);
+    var completions: [shared_slots_max]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, shared_slots_max, fixture.remote);
+    var seen: [shared_slots_max]bool = @splat(false);
     for (completions) |completion| {
-        try testing.expect(completion.id < send_slots_max);
+        try testing.expect(completion.id < shared_slots_max);
         try testing.expect(!seen[@intCast(completion.id)]);
         seen[@intCast(completion.id)] = true;
         try testing.expectEqual(@as(u32, 1), try completion.result.send);
@@ -1400,10 +1409,10 @@ test "real: with every send slot held by a stuck send, an accept still goes in a
     defer loopback.close();
     _ = try fillSendBuffer(fixture.local);
     var id: io.OperationId = 0;
-    while (id < send_slots_max) : (id += 1) try fixture.send(id, "w");
+    while (id < shared_slots_max) : (id += 1) try fixture.send(id, "w");
     try expectStuck(&fixture.real);
-    try testing.expectError(error.SendSlotsFull, fixture.send(id, "w"));
-    try testing.expectEqual(send_slots_max, fixture.real.inFlight());
+    try testing.expectError(error.SlotsKeptForAccepts, fixture.send(id, "w"));
+    try testing.expectEqual(shared_slots_max, fixture.real.inFlight());
 
     // The slot kept for accepts takes the accept; then the ring is full for everything.
     const accept: io.Operation = .{ .accept = .{ .listener = loopback.listener } };
@@ -1423,16 +1432,78 @@ test "real: with every send slot held by a stuck send, an accept still goes in a
 
     // Dropping the stuck connection hands every send slot back.
     fixture.real.drop(fixture.peer);
-    try pollUntil(&fixture.real, completions[0..send_slots_max], send_slots_max, -1);
-    var seen: [send_slots_max]bool = @splat(false);
-    for (completions[0..send_slots_max]) |completion| {
-        try testing.expect(completion.id < send_slots_max);
+    try pollUntil(&fixture.real, completions[0..shared_slots_max], shared_slots_max, -1);
+    var seen: [shared_slots_max]bool = @splat(false);
+    for (completions[0..shared_slots_max]) |completion| {
+        try testing.expect(completion.id < shared_slots_max);
         try testing.expect(!seen[@intCast(completion.id)]); // Each send completes once.
         seen[@intCast(completion.id)] = true;
         try testing.expectError(error.PeerDown, completion.result.send);
     }
     try testing.expectEqual(@as(u32, 0), fixture.real.inFlight());
     try testing.expectEqual(@as(u32, 0), fixture.real.sends_in_flight);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.close(try fixture.table.release(accepted))));
+    try testing.expectEqual(fixture.local, try fixture.table.release(fixture.peer));
+    fixture.peer = try fixture.table.acquire(fixture.local);
+}
+
+test "real: an accept counts against no share, so a send takes the last free slot, and the accept's freed slot stays kept" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    var loopback: Loopback = undefined;
+    try loopback.open();
+    defer loopback.close();
+    _ = try fillSendBuffer(fixture.local);
+    // The accept goes in first, then one send fewer than the share, all stuck.
+    const accept: io.Operation = .{ .accept = .{ .listener = loopback.listener } };
+    try fixture.real.submit(.{ .id = 1000, .operation = accept });
+    var id: io.OperationId = 0;
+    while (id < shared_slots_max - 1) : (id += 1) try fixture.send(id, "w");
+    try expectStuck(&fixture.real);
+    try testing.expectEqual(@as(u32, 1), fixture.real.free_count);
+    try testing.expectEqual(shared_slots_max - 1, fixture.real.share.others_in_flight);
+    // The last free slot is not the kept one: the share counts operations, not free slots.
+    try fixture.send(id, "w");
+    id += 1;
+    try expectStuck(&fixture.real);
+    try testing.expectEqual(slots_count, fixture.real.inFlight());
+    try testing.expectEqual(shared_slots_max, fixture.real.share.others_in_flight);
+
+    // The accept completes; its slot is free again but kept, so a send is refused and
+    // changes nothing, and another accept takes it.
+    try loopback.connect();
+    var completions: [slots_count]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(io.OperationId, 1000), completions[0].id);
+    const accepted = try completions[0].result.accept;
+    const slots_before = fixture.real.slots;
+    const sends_before = fixture.table.get(fixture.peer).sends_in_flight;
+    try testing.expectError(error.SlotsKeptForAccepts, fixture.send(id, "w"));
+    try testing.expectEqualSlices(Slot, &slots_before, &fixture.real.slots);
+    try testing.expectEqual(sends_before, fixture.table.get(fixture.peer).sends_in_flight);
+    try testing.expectEqual(shared_slots_max, fixture.real.share.others_in_flight);
+    // A second listener, since the first one's client is connected already.
+    var other: Loopback = undefined;
+    try other.open();
+    defer other.close();
+    try fixture.real.submit(.{ .id = 1001, .operation = .{ .accept = .{ .listener = other.listener } } });
+    try testing.expectEqual(slots_count, fixture.real.inFlight());
+
+    // Dropping the stuck connection hands every send slot back; the second accept stays.
+    fixture.real.drop(fixture.peer);
+    try pollUntil(&fixture.real, completions[0..shared_slots_max], shared_slots_max, -1);
+    for (completions[0..shared_slots_max]) |completion| {
+        try testing.expect(completion.id < shared_slots_max);
+        try testing.expectError(error.PeerDown, completion.result.send);
+    }
+    try testing.expectEqual(@as(u32, 1), fixture.real.inFlight());
+    try testing.expectEqual(@as(u32, 0), fixture.real.share.others_in_flight);
+    try other.connect();
+    try pollUntil(&fixture.real, completions[0..1], 1, -1);
+    try testing.expectEqual(@as(io.OperationId, 1001), completions[0].id);
+    const second = try completions[0].result.accept;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.close(try fixture.table.release(second))));
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.close(try fixture.table.release(accepted))));
     try testing.expectEqual(fixture.local, try fixture.table.release(fixture.peer));
     fixture.peer = try fixture.table.acquire(fixture.local);
@@ -1930,7 +2001,7 @@ test "real: a full ring refuses an accept with QueueFull while the wait runs" {
     // every slot a send may take: every slot is in use until the next poll.
     try fixture.real.submit(.{ .id = 0, .operation = .{ .accept = .{ .listener = loopback.listener } } });
     var id: io.OperationId = 1;
-    while (id <= send_slots_max) : (id += 1) try fixture.send(id, "x");
+    while (id <= shared_slots_max) : (id += 1) try fixture.send(id, "x");
     try testing.expectEqual(@as(u32, 0), fixture.real.free_count);
     try testing.expectError(error.Backpressure, fixture.real.acceptResult(accept_short));
     // The wait just started, so it runs: both refusals hold.
@@ -1944,8 +2015,8 @@ test "real: a full ring refuses an accept with QueueFull while the wait runs" {
     // With the sends back, the ring has room. A fresh Backpressure starts the wait again,
     // so it surely runs, and the same accept meets AcceptTooSoon: both refusals held above.
     var completions: [slots_count]io.Completion = undefined;
-    try pollUntil(&fixture.real, &completions, send_slots_max, fixture.remote);
-    for (completions[0..send_slots_max]) |completion| try testing.expectEqual(@as(u32, 1), try completion.result.send);
+    try pollUntil(&fixture.real, &completions, shared_slots_max, fixture.remote);
+    for (completions[0..shared_slots_max]) |completion| try testing.expectEqual(@as(u32, 1), try completion.result.send);
     try testing.expectError(error.Backpressure, fixture.real.acceptResult(accept_short));
     try testing.expectError(error.AcceptTooSoon, fixture.real.submit(late));
     try testing.expectEqual(@as(u64, 1), fixture.real.accept_wait.refused);
@@ -2213,7 +2284,7 @@ const Soak = struct {
 
     /// Submits one send of random length to a random peer, and checks the slot it took.
     fn submitOne(self: *Soak) !void {
-        assert(self.real.inFlight() < send_slots_max);
+        assert(self.real.inFlight() < shared_slots_max);
         assert(self.submitted < soak_operations_max);
         const random = self.schedule.random();
         const peer = random.uintLessThan(u8, soak_peers_count);
@@ -2385,8 +2456,8 @@ const Soak = struct {
     /// With every send slot taken, one more send is refused and changes nothing, though the
     /// slots kept for accepts are free.
     fn expectFullRefusal(self: *Soak) !void {
-        assert(self.real.inFlight() == send_slots_max);
-        assert(self.real.free_count == slots_count - send_slots_max);
+        assert(self.real.inFlight() == shared_slots_max);
+        assert(self.real.free_count == slots_count - shared_slots_max);
         const submitted_before = self.real.submitted;
         const sqe_tail_before = self.real.ring.sq.sqe_tail;
         const slots_before = self.real.slots;
@@ -2394,29 +2465,29 @@ const Soak = struct {
             .id = self.submitted,
             .operation = .{ .send = .{ .peer = self.peers[0], .bytes = self.bytes[0..1] } },
         };
-        try testing.expectError(error.SendSlotsFull, self.real.submit(refused));
+        try testing.expectError(error.SlotsKeptForAccepts, self.real.submit(refused));
         try testing.expectEqual(submitted_before, self.real.submitted);
         try testing.expectEqual(sqe_tail_before, self.real.ring.sq.sqe_tail);
         try testing.expectEqualSlices(Slot, &slots_before, &self.real.slots);
-        try testing.expectEqual(send_slots_max, self.real.inFlight());
+        try testing.expectEqual(shared_slots_max, self.real.inFlight());
     }
 
     /// One round: top the ring up to a target, maybe close a far end, poll part of it back.
     fn round(self: *Soak, number: u32) !void {
         assert(number < soak_rounds_max);
-        assert(self.real.inFlight() < send_slots_max);
+        assert(self.real.inFlight() < shared_slots_max);
         const random = self.schedule.random();
         // At least one send a round, so there is always something to poll back.
         const target = if (number % soak_fill_every == 0)
-            send_slots_max
+            shared_slots_max
         else
-            random.intRangeAtMost(u32, self.real.inFlight() + 1, send_slots_max);
+            random.intRangeAtMost(u32, self.real.inFlight() + 1, shared_slots_max);
         var submissions: u32 = 0;
         while (self.real.inFlight() < target) : (submissions += 1) {
-            assert(submissions < send_slots_max);
+            assert(submissions < shared_slots_max);
             try self.submitOne();
         }
-        if (target == send_slots_max) try self.expectFullRefusal();
+        if (target == shared_slots_max) try self.expectFullRefusal();
         // Random closes, plus one before the second full round if none came yet, so every
         // seed sends to a closed far end.
         const forced = number == soak_fill_every - 1 and self.closes == 0;
@@ -2441,7 +2512,7 @@ const Soak = struct {
         try self.checkTotals();
     }
 
-    /// After the run: every operation completed once, `send_slots_max` slots were each
+    /// After the run: every operation completed once, `shared_slots_max` slots were each
     /// reused and the rest never taken, and each far end never closed read exactly the
     /// bytes its sends reported.
     fn checkTotals(self: *Soak) !void {
@@ -2453,9 +2524,9 @@ const Soak = struct {
         for (self.operations[0..self.submitted]) |operation| {
             try testing.expectEqual(@as(u8, 1), operation.completions);
         }
-        // Sends hold at most send_slots_max slots at once. The reserve is a count, not a
+        // Sends hold at most shared_slots_max slots at once. The reserve is a count, not a
         // slot, but the free stack hands back the slot freed last, so the one at its bottom
-        // is never reached and the same send_slots_max slots carry every send. A change to
+        // is never reached and the same shared_slots_max slots carry every send. A change to
         // the free list's order would change this count, not the reserve.
         var reused: u32 = 0;
         var unused: u32 = 0;
@@ -2463,8 +2534,8 @@ const Soak = struct {
             if (uses >= 2) reused += 1;
             if (uses == 0) unused += 1;
         }
-        try testing.expectEqual(send_slots_max, reused);
-        try testing.expectEqual(slots_count - send_slots_max, unused);
+        try testing.expectEqual(shared_slots_max, reused);
+        try testing.expectEqual(slots_count - shared_slots_max, unused);
         for (self.peers, self.peer_in_flight) |peer, in_flight| {
             try testing.expectEqual(@as(u32, 0), in_flight);
             try testing.expectEqual(@as(connections.SendCount, 0), self.table.get(peer).sends_in_flight);

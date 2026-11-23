@@ -22,10 +22,13 @@
 //! Each accepted operation completes exactly once, carrying the `id` the caller gave it, and
 //! ids in flight must be distinct; the simulator and the real type both check this. A
 //! submission refused with any `SubmitError` never completes.
-//! Sends may hold at most `constants.io_sends_in_flight_max` operations; the rest are kept
-//! for accepts, so clients that stop reading can't keep the server from accepting. A send
-//! past that share is refused with `error.SendSlotsFull`, even with operations free; the
-//! simulator and the real type both check this. `poll` takes a buffer of 1 to
+//! Every operation but an accept (a send or a statement today) shares at most
+//! `constants.io_non_accepts_in_flight_max` operations; the rest are kept for accepts, so
+//! clients that stop reading, or any other kind piling up, can't keep the server from
+//! accepting. Anything but an accept past that share is refused with
+//! `error.SlotsKeptForAccepts`, even with operations free, and an accept may still take
+//! any free operation; the simulator and the real type both check this through
+//! `SlotShare`. `poll` takes a buffer of 1 to
 //! `constants.io_operations_in_flight_max` completions. A send may complete short,
 //! reporting fewer bytes than it was given; the caller sends the rest. A send's peer stays
 //! in the connection table, with its socket open, until the send's completion arrives. The
@@ -95,13 +98,14 @@ pub const Socket = i32;
 /// Chosen by the caller and handed back with the completion, like io_uring's user_data.
 pub const OperationId = u64;
 
-/// `QueueFull`: every operation the I/O type holds is in flight. `SendSlotsFull`: a send,
-/// with sends already holding their whole share (`constants.io_sends_in_flight_max`); the
-/// operations left are kept for accepts. Either way, submit again after a completion.
+/// `QueueFull`: every operation the I/O type holds is in flight. `SlotsKeptForAccepts`:
+/// anything but an accept, with operations other than accepts already holding their whole
+/// share (`constants.io_non_accepts_in_flight_max`); the operations left are kept for
+/// accepts. Either way, submit again after a completion.
 /// `AcceptTooSoon`: an accept, less than `constants.io_accept_backpressure_wait_ns` after
 /// the latest accept that completed with `error.Backpressure`; submit it again once that
 /// time has passed. A full queue wins when it and `AcceptTooSoon` both hold.
-pub const SubmitError = error{ QueueFull, SendSlotsFull, AcceptTooSoon };
+pub const SubmitError = error{ QueueFull, SlotsKeptForAccepts, AcceptTooSoon };
 pub const SendError = error{ PeerDown, Backpressure };
 pub const DatabaseError = error{ Unavailable, Timeout };
 
@@ -151,6 +155,48 @@ pub const AcceptWait = struct {
             return error.AcceptTooSoon;
         }
         self.resume_at = null;
+    }
+};
+
+/// The operations kept for accepts, counted by every I/O type that meets the contract
+/// through the same calls, as with `AcceptWait`, so a check only one side makes can't let a
+/// bug pass every simulation. Every operation but an accept counts against one share of
+/// `constants.io_non_accepts_in_flight_max`; an accept counts against nothing here and may
+/// take any free operation. The I/O type checks its own full queue first.
+pub const SlotShare = struct {
+    /// Operations in flight that aren't accepts: never more than `others_max`.
+    others_in_flight: u32 = 0,
+
+    pub const others_max: u32 = constants.io_non_accepts_in_flight_max;
+
+    /// Refuses `kind` with `error.SlotsKeptForAccepts` when it isn't an accept and the
+    /// others already hold their whole share. Changes nothing. `free` is the operations the
+    /// I/O type has free, after its own full-queue check, so never 0.
+    pub fn admit(self: *const SlotShare, kind: Kind, free: u32) error{SlotsKeptForAccepts}!void {
+        // The full queue is checked first, as the contract orders the refusals.
+        assert(free > 0);
+        // Every operation counted here holds one that isn't free.
+        assert(self.others_in_flight + free <= constants.io_operations_in_flight_max);
+        if (kind == .accept) return;
+        if (self.others_in_flight == others_max) return error.SlotsKeptForAccepts;
+    }
+
+    /// Counts an operation of `kind` that `admit` let in and that now holds a slot.
+    pub fn taken(self: *SlotShare, kind: Kind) void {
+        assert(self.others_in_flight <= others_max);
+        if (kind == .accept) return;
+        // `admit` refused it otherwise.
+        assert(self.others_in_flight < others_max);
+        self.others_in_flight += 1;
+    }
+
+    /// Uncounts an operation of `kind` that has completed and given its slot back.
+    pub fn released(self: *SlotShare, kind: Kind) void {
+        assert(self.others_in_flight <= others_max);
+        if (kind == .accept) return;
+        // Counted by `taken` at submit.
+        assert(self.others_in_flight > 0);
+        self.others_in_flight -= 1;
     }
 };
 
@@ -554,4 +600,31 @@ test "AcceptWait: refuses until one wait past the latest Backpressure, then clea
     try testing.expectEqual(@as(?Instant, null), accept_wait.resume_at);
     try accept_wait.admit(1_500 + wait);
     try testing.expectEqual(@as(u64, 3), accept_wait.refused);
+}
+
+test "SlotShare: anything but an accept is refused once the share is held, and an accept never is" {
+    const others_max = SlotShare.others_max;
+    const total = constants.io_operations_in_flight_max;
+    // The constants keep at least one operation out of the share.
+    comptime assert(others_max < total);
+    var share: SlotShare = .{};
+    var held: u32 = 0;
+    while (held < others_max) : (held += 1) {
+        const kind: Kind = if (held % 2 == 0) .send else .execute;
+        try share.admit(kind, total - held);
+        share.taken(kind);
+    }
+    try testing.expectEqual(others_max, share.others_in_flight);
+    try testing.expectError(error.SlotsKeptForAccepts, share.admit(.send, total - held));
+    try testing.expectError(error.SlotsKeptForAccepts, share.admit(.execute, total - held));
+    // An accept is let in and taken without touching the count.
+    try share.admit(.accept, total - held);
+    share.taken(.accept);
+    try testing.expectEqual(others_max, share.others_in_flight);
+    // A finished accept frees nothing in the share; a finished send frees one place.
+    share.released(.accept);
+    try testing.expectError(error.SlotsKeptForAccepts, share.admit(.execute, total - held));
+    share.released(.send);
+    try testing.expectEqual(others_max - 1, share.others_in_flight);
+    try share.admit(.execute, total - held + 1);
 }
