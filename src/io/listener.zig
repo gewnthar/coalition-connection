@@ -36,9 +36,19 @@
 //! refuses with `SocketPathInUse`, leaving that server's socket alone. A file, a directory,
 //! a symlink or a live datagram socket at the path is never removed: opening refuses with
 //! `SocketPathOccupied`. (A dead socket file's type can't be learned: the kernel refuses a
-//! connect to it before it compares types, so it is stale like any other.) The lock file
-//! itself stays after `close`; removing it would let two starting servers lock two
-//! different files.
+//! connect to it before it compares types, so it is stale like any other.) A socket another
+//! user owns, live or stale, is neither probed nor removed: `SocketPathOccupied`. The lock file itself
+//! stays after `close`; removing it would let two starting servers lock two different
+//! files.
+//!
+//! None of that proves anything in a directory another user may change, since that user
+//! could put a socket, a symlink or a lock file of their own at either path. So before it
+//! takes the lock, `open` checks the socket's directory: owned by the server's user or root
+//! (`SocketDirectoryOwnerWrong`), writable by neither group nor others, so not a sticky
+//! directory such as /tmp either (`SocketDirectoryWritable`), and with no POSIX access ACL
+//! (`SocketDirectoryAclPresent`). Then the lock file it opened must be a regular file the
+//! server's user owns, with one link and no permission bits for group or others
+//! (`SocketLockUnsafe`), or it is refused before it is locked.
 //!
 //! The socket file is created with `listener_socket_mode` and no other: the umask is set
 //! for the one bind call so bind makes the file with exactly those bits, then put back.
@@ -114,17 +124,33 @@ pub const OpenError = CheckError || error{
     /// refuses Unix sockets.
     ListenerUnavailable,
     /// The path's directory is missing, isn't a directory, or the process may not create a
-    /// file there (permissions, a read-only file system, a symlink loop).
+    /// file there (permissions, a read-only file system, a symlink loop), or another
+    /// directory was put at its path while it was checked.
     SocketDirectoryUnusable,
+    /// The path's directory is owned by a user other than the server's or root. Its owner
+    /// could rename, remove or replace the socket file and the lock file, so neither would
+    /// be the server's.
+    SocketDirectoryOwnerWrong,
+    /// Group or others may write in the path's directory (a sticky directory such as /tmp
+    /// included), so another user could put files at the socket's and the lock's paths.
+    SocketDirectoryWritable,
+    /// The path's directory carries a POSIX access ACL, so its mode alone no longer says
+    /// who may change it.
+    SocketDirectoryAclPresent,
+    /// The lock file at `<path>.lock` isn't a regular file owned by the server's user, with
+    /// one link and no permission bits for group or others, so another user may have made
+    /// it, or may share it through a hard link.
+    SocketLockUnsafe,
     /// Another server holds the path's lock; or a live server, which took no lock, answers
-    /// on the socket at the path; or a socket there can't be probed (no permission to
+    /// on a socket of the server's user at the path; or a socket there can't be probed (no permission to
     /// connect), so it can't be shown stale; or a process that doesn't take the lock bound
     /// the path, or replaced the socket there, while the stale socket was being replaced;
     /// or such a process removed or replaced the socket file between bind and listen. A
     /// live socket, and any file this call didn't bind, is never removed.
     SocketPathInUse,
-    /// A file, a directory, a symlink or a live datagram socket is at the path. It is never
-    /// removed.
+    /// A file, a directory, a symlink, a live datagram socket, or a socket of any kind, live
+    /// or stale, owned by a user other than the server's, is at the path. It is never
+    /// removed, and another user's socket is never probed.
     SocketPathOccupied,
     /// The socket file bind made carries a POSIX access ACL (a default ACL on its directory
     /// gives it one), so its mode no longer says who may connect: the ACL's entries may let
@@ -133,6 +159,9 @@ pub const OpenError = CheckError || error{
     /// The kernel wouldn't say whether the socket file carries an access ACL; the errno is
     /// logged.
     SocketAclUnreadable,
+    /// The kernel wouldn't say whether the socket's directory carries an access ACL; the
+    /// errno is logged.
+    SocketDirectoryAclUnreadable,
     /// The socket file bind made doesn't have exactly `listener_socket_mode` (a default ACL
     /// with no named entries on the directory can narrow it), so the clients the mode names
     /// might not connect.
@@ -191,13 +220,24 @@ pub const Listener = struct {
 /// when its identity couldn't be read right after bind (statx failed), since then nothing
 /// tells it from a replacement. The next `open` replaces such a file as stale.
 pub fn open(socket_path: []const u8) OpenError!Listener {
-    return openPaused(socket_path, pauseNone);
+    const user = linux.geteuid();
+    return openPaused(socket_path, pauseNone, .{ .directory = user, .lock = user, .socket = user });
 }
+
+/// Who the directory, the lock file and a stale socket must belong to. `open` names the
+/// server's user, the effective user id, for all three; a test names another user for one
+/// of them, so each owner check can be seen to refuse without root or a second account.
+const Owners = struct {
+    directory: linux.uid_t,
+    lock: linux.uid_t,
+    socket: linux.uid_t,
+};
 
 /// Called by `openPaused` between reading the bound file's identity and checking it, with
 /// the socket path. `open` passes `pauseNone`; a test passes one that replaces the file at
-/// the path, as a process that doesn't take the lock could at that moment. The one test
-/// seam in this file: a comptime parameter, so no function pointer exists at run time.
+/// the path, as a process that doesn't take the lock could at that moment. A comptime
+/// parameter, so no function pointer exists at run time; with `Owners`, one of this file's
+/// two test seams.
 const Pause = fn (file_path: [:0]const u8) void;
 
 /// Does nothing, so it has no assertions: there is no state of its own to check, and
@@ -207,9 +247,9 @@ fn pauseNone(file_path: [:0]const u8) void {
 }
 
 /// `open`, with `pause` run once after bind, at the point where a replaced file is most
-/// easily mistaken for this call's own. `pause` is comptime, so `open` calls `pauseNone`
-/// directly, which compiles to nothing.
-fn openPaused(socket_path: []const u8, comptime pause: Pause) OpenError!Listener {
+/// easily mistaken for this call's own, and the files' owners checked against `owners`.
+/// `pause` is comptime, so `open` calls `pauseNone` directly, which compiles to nothing.
+fn openPaused(socket_path: []const u8, comptime pause: Pause, owners: Owners) OpenError!Listener {
     assert(socket_path.len > 0 and socket_path.len <= path_max);
     assert(socket_path[0] == '/');
     assert(std.mem.findScalar(u8, socket_path, 0) == null);
@@ -224,11 +264,17 @@ fn openPaused(socket_path: []const u8, comptime pause: Pause) OpenError!Listener
     @memcpy(listener.address.path[0..socket_path.len], socket_path);
     const file_path = listener.path();
 
-    listener.lock = try takeLock(file_path);
+    // First the directory both files live in: a user who may write there could put a file
+    // of their own at either path, so nothing below would prove anything. The lock file is
+    // opened through the checked directory's descriptor, so it is in that very directory.
+    const dir = try directoryCheck(file_path, owners.directory);
+    const locked = takeLock(dir, file_path, owners.lock);
+    closeLogged(dir, "socket directory");
+    listener.lock = try locked;
     errdefer closeLogged(listener.lock, "lock file");
     listener.socket = try unixSocket(.blocking);
     errdefer closeLogged(listener.socket, "socket");
-    try bindReplacingStale(listener.socket, &listener.address, file_path);
+    try bindReplacingStale(listener.socket, &listener.address, file_path, owners.socket);
     // The lock is held, so the socket at the path is the one bind just made, unless a
     // process that doesn't take the lock replaced it in between; boundFile refuses a path
     // that names no socket. A socket swapped in before boundFile's statx would be taken
@@ -308,16 +354,26 @@ fn socketOption(socket: io.Socket, name: u32) CheckError!u32 {
 /// an unnamed socket's address.
 const family_len: linux.socklen_t = @offsetOf(linux.sockaddr.un, "path");
 
-/// Opens `<socket_path>.lock` and locks it exclusively without waiting. A lock held by
-/// another process is `SocketPathInUse`.
-fn takeLock(socket_path: [:0]const u8) OpenError!linux.fd_t {
+/// Opens `<socket_path>.lock` in `dir`, the socket's directory as `directoryCheck` opened
+/// it, checks that it belongs to `owner` alone, and locks it exclusively without waiting. A
+/// lock held by another process is `SocketPathInUse`.
+fn takeLock(dir: linux.fd_t, socket_path: [:0]const u8, owner: linux.uid_t) OpenError!linux.fd_t {
+    assert(dir >= 0);
     assert(socket_path.len > 0 and socket_path.len <= path_max);
+    assert(socket_path[0] == '/');
+    // The full path, for the log lines.
     var bytes: [path_max + lock_suffix.len + 1]u8 = undefined;
+    // The buffer holds the longest path, the suffix and the NUL, so this can't overflow.
     const lock_path = std.fmt.bufPrintSentinel(&bytes, "{s}" ++ lock_suffix, .{socket_path}, 0) catch unreachable;
     assert(lock_path.len == socket_path.len + lock_suffix.len);
+    // The name inside `dir`: everything after the socket path's last slash, and the suffix.
+    // The path starts with a slash, as asserted above, so there is a last one.
+    const slash = std.mem.findScalarLast(u8, lock_path, '/') orelse unreachable;
+    const lock_name = lock_path[slash + 1 ..];
+    assert(lock_name.len >= lock_suffix.len and std.mem.findScalar(u8, lock_name, '/') == null);
     // No symlink is followed, and a FIFO can't stall startup in open.
     const flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true, .NOFOLLOW = true, .NOCTTY = true, .NONBLOCK = true };
-    const opened = linux.open(lock_path, flags, 0o600);
+    const opened = linux.openat(dir, lock_name, flags, 0o600);
     const lock: linux.fd_t = switch (pathErrno(linux.errno(opened))) {
         .success => @intCast(opened),
         .directory_unusable => return error.SocketDirectoryUnusable,
@@ -328,6 +384,8 @@ fn takeLock(socket_path: [:0]const u8) OpenError!linux.fd_t {
         },
     };
     errdefer closeLogged(lock, "lock file");
+    // Checked before it is locked, so a file another user made is never held.
+    try lockCheck(lock, lock_path, owner);
     const locked = linux.errno(linux.flock(lock, std.posix.LOCK.EX | std.posix.LOCK.NB));
     switch (locked) {
         .SUCCESS => {},
@@ -340,6 +398,219 @@ fn takeLock(socket_path: [:0]const u8) OpenError!linux.fd_t {
     }
     assert(lock >= 0);
     return lock;
+}
+
+/// Permission bits the socket's directory may not have: write for group or others.
+const directory_write_others: u32 = 0o022;
+
+/// Permission bits a lock file may have: the owner's alone.
+const lock_mode_allowed: u32 = 0o700;
+
+/// The directory `socket_path` names its file in, written into `bytes`: every byte before
+/// the last slash, or the root directory's own slash when that is the only one.
+fn directoryOf(socket_path: [:0]const u8, bytes: *[path_max + 1]u8) [:0]const u8 {
+    assert(socket_path.len > 0 and socket_path.len <= path_max);
+    assert(socket_path[0] == '/');
+    // The assertion above proves a slash exists.
+    const slash = std.mem.findScalarLast(u8, socket_path, '/') orelse unreachable;
+    const len: usize = if (slash == 0) 1 else slash;
+    // The directory ends where the file's name begins: at a slash, unless it is the root.
+    assert(len == 1 or socket_path[len] == '/');
+    @memcpy(bytes[0..len], socket_path[0..len]);
+    bytes[len] = 0;
+    return bytes[0..len :0];
+}
+
+/// What the socket directory's owner and mode allow. Pure, so tests can check owners a test
+/// can't make (another user; root, when the test isn't root).
+const DirectoryVerdict = enum { ok, owner_wrong, writable };
+
+/// `mode` is the directory's type and mode, `uid` its owner and `user` the server's. Root
+/// may own it, as root owns /run: root can already change anything the server has.
+fn directoryVerdict(mode: u16, uid: linux.uid_t, user: linux.uid_t) DirectoryVerdict {
+    assert(linux.S.ISDIR(mode));
+    const owner_ok = uid == user or uid == 0;
+    const verdict: DirectoryVerdict = if (!owner_ok)
+        .owner_wrong
+    else if (mode & directory_write_others != 0)
+        .writable
+    else
+        .ok;
+    // The owner is judged first: another user's directory is refused for its owner, never
+    // for its mode, so the log names the problem that matters.
+    assert(verdict != .writable or owner_ok);
+    return verdict;
+}
+
+/// Refuses the directory `socket_path` names its file in unless only `owner`, the server's
+/// user, or root may change it: owned by one of them, writable by neither group nor others,
+/// and carrying no POSIX access ACL. Returns the directory, opened with O_PATH (which needs
+/// no permission on it), for the lock file to be opened in; the caller closes it. Its owner
+/// and mode are read through that descriptor. Its ACL is read by path, since fgetxattr
+/// refuses an O_PATH descriptor and /proc may not be mounted, so afterwards the path must
+/// still name the directory opened, or `SocketDirectoryUnusable`. Only the socket's own
+/// directory is checked: a user who may write in one above it could swap the whole
+/// directory at any time, and nothing here can stop that, since bind takes only a path.
+fn directoryCheck(socket_path: [:0]const u8, owner: linux.uid_t) OpenError!linux.fd_t {
+    assert(socket_path.len > 0 and socket_path.len <= path_max);
+    assert(socket_path[0] == '/');
+    var bytes: [path_max + 1]u8 = undefined;
+    const dir_path = directoryOf(socket_path, &bytes);
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true, .CLOEXEC = true };
+    const opened = linux.open(dir_path, flags, 0);
+    const dir: linux.fd_t = switch (pathErrno(linux.errno(opened))) {
+        .success => @intCast(opened),
+        .directory_unusable => return error.SocketDirectoryUnusable,
+        .resources => return error.ListenerUnavailable,
+        .failed => {
+            std.log.err("listener {s}: open of the directory failed, errno {d}", .{ dir_path, @backingInt(linux.errno(opened)) });
+            return error.ListenFailed;
+        },
+    };
+    errdefer closeLogged(dir, "socket directory");
+    const status = try directoryStatus(dir, dir_path);
+    switch (directoryVerdict(status.mode, status.uid, owner)) {
+        .ok => {},
+        .owner_wrong => {
+            std.log.info("listener {s}: the directory's owner is user {d}, not the server's user or root", .{ dir_path, status.uid });
+            return error.SocketDirectoryOwnerWrong;
+        },
+        .writable => {
+            std.log.info("listener {s}: group or others may write in the directory, mode {o}", .{ dir_path, status.mode & 0o7777 });
+            return error.SocketDirectoryWritable;
+        },
+    }
+    try directoryAclCheck(dir_path);
+    if (!try sameDirectory(dir_path, status)) {
+        std.log.info("listener {s}: another directory was put at the path while it was checked", .{dir_path});
+        return error.SocketDirectoryUnusable;
+    }
+    assert(dir >= 0);
+    return dir;
+}
+
+/// The type, mode, owner and identity of the directory `dir`, opened at `dir_path`.
+fn directoryStatus(dir: linux.fd_t, dir_path: [:0]const u8) OpenError!linux.Statx {
+    assert(dir >= 0);
+    assert(dir_path.len > 0);
+    var status: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true, .INO = true };
+    const err = linux.errno(linux.statx(dir, "", linux.AT.EMPTY_PATH, mask, &status));
+    try statusErrno(err, dir_path, "the directory");
+    if (!status.mask.TYPE or !status.mask.MODE or !status.mask.UID or !status.mask.INO) {
+        std.log.err("listener {s}: can't read back the directory", .{dir_path});
+        return error.ListenFailed;
+    }
+    // O_DIRECTORY opened it, so only a kernel that broke that promise reports another type.
+    assert(linux.S.ISDIR(status.mode));
+    return status;
+}
+
+/// Maps a failed statx of `what` at `file_path`: out of memory is `ListenerUnavailable`,
+/// anything else `ListenFailed`, with the errno logged. A descriptor's own statx can't be
+/// refused for the path, so no errno means the directory is unusable.
+fn statusErrno(err: linux.E, file_path: [:0]const u8, what: []const u8) OpenError!void {
+    assert(file_path.len > 0);
+    assert(what.len > 0);
+    switch (pathErrno(err)) {
+        .success => {},
+        .resources => return error.ListenerUnavailable,
+        .directory_unusable, .failed => {
+            std.log.err("listener {s}: statx of {s} failed, errno {d}", .{ file_path, what, @backingInt(err) });
+            return error.ListenFailed;
+        },
+    }
+}
+
+/// Refuses a directory at `dir_path` that carries a POSIX access ACL. getxattr follows a
+/// symlink, as the open of the directory did, so both read the same directory. Like the
+/// socket file's query, it passes a size of 0 and copies nothing. A default ACL isn't
+/// refused here: it changes who may use the files made in the directory, not the directory,
+/// and the socket file it would give an access ACL is refused before listen.
+fn directoryAclCheck(dir_path: [:0]const u8) OpenError!void {
+    assert(dir_path.len > 0);
+    assert(dir_path[0] == '/');
+    var unused: [1]u8 = undefined;
+    const rc = linux.getxattr(dir_path, acl_access_name, &unused, 0);
+    const err = linux.errno(rc);
+    // On success rc is the size; a size past u32 is past xattr_size_max, so it saturates.
+    const len: u32 = if (err == .SUCCESS) std.math.lossyCast(u32, rc) else 0;
+    switch (aclOutcome(err, len)) {
+        .none => {},
+        .present => return error.SocketDirectoryAclPresent,
+        .gone => return error.SocketDirectoryUnusable,
+        .unreadable => {
+            std.log.err("listener {s}: can't read the directory's ACL, errno {d}, size {d}", .{ dir_path, @backingInt(err), len });
+            return error.SocketDirectoryAclUnreadable;
+        },
+    }
+}
+
+/// Whether `dir_path`, following symlinks as the open did, still names the directory whose
+/// status `opened` is. A path that names nothing now is false; a statx that fails for any
+/// other reason is an error, with its errno logged.
+fn sameDirectory(dir_path: [:0]const u8, opened: linux.Statx) OpenError!bool {
+    assert(dir_path.len > 0);
+    assert(opened.mask.INO and linux.S.ISDIR(opened.mode));
+    var status: linux.Statx = undefined;
+    const err = linux.errno(linux.statx(linux.AT.FDCWD, dir_path, 0, .{ .TYPE = true, .INO = true }, &status));
+    if (err == .NOENT or err == .NOTDIR) return false;
+    try statusErrno(err, dir_path, "the directory");
+    if (!status.mask.TYPE or !status.mask.INO) {
+        std.log.err("listener {s}: can't read back the directory", .{dir_path});
+        return error.ListenFailed;
+    }
+    return linux.S.ISDIR(status.mode) and status.ino == opened.ino and
+        status.dev_major == opened.dev_major and status.dev_minor == opened.dev_minor;
+}
+
+/// What a lock file's status shows. Pure, so tests can check owners and link counts a test
+/// can't make.
+const LockVerdict = enum { ok, not_regular, owner_wrong, linked, mode_wide };
+
+/// `mode` is the lock file's type and mode, `uid` its owner, `links` its link count and
+/// `user` the server's. Unlike the directory, root's lock file isn't the server's: the
+/// server makes its own, and a file it can't have made is someone else's.
+fn lockVerdict(mode: u16, uid: linux.uid_t, links: u32, user: linux.uid_t) LockVerdict {
+    // statx reported the type, so a mode with no type bits is a bug in the caller.
+    assert(mode & linux.S.IFMT != 0);
+    const verdict: LockVerdict = if (!linux.S.ISREG(mode))
+        .not_regular
+    else if (uid != user)
+        .owner_wrong
+    else if (links != 1)
+        .linked
+    else if (mode & 0o7777 & ~lock_mode_allowed != 0)
+        .mode_wide
+    else
+        .ok;
+    // The kind and the owner are judged before the links and the mode: a file that isn't
+    // the server's is refused for that, whatever its mode says.
+    assert(verdict != .linked or (linux.S.ISREG(mode) and uid == user));
+    assert(verdict != .mode_wide or (uid == user and links == 1));
+    return verdict;
+}
+
+/// Refuses the lock file `lock`, just opened at `lock_path`, unless it is a regular file
+/// `owner` owns, with one link and no permission bits for group or others. Read through the
+/// descriptor, so it is the file open returned, whatever is at the path now.
+fn lockCheck(lock: linux.fd_t, lock_path: [:0]const u8, owner: linux.uid_t) OpenError!void {
+    assert(lock >= 0);
+    assert(std.mem.endsWith(u8, lock_path, lock_suffix));
+    var status: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .NLINK = true, .UID = true };
+    const err = linux.errno(linux.statx(lock, "", linux.AT.EMPTY_PATH, mask, &status));
+    try statusErrno(err, lock_path, "the lock file");
+    if (!status.mask.TYPE or !status.mask.MODE or !status.mask.NLINK or !status.mask.UID) {
+        std.log.err("listener {s}: can't read back the lock file", .{lock_path});
+        return error.ListenFailed;
+    }
+    const verdict = lockVerdict(status.mode, status.uid, status.nlink, owner);
+    if (verdict == .ok) return;
+    std.log.info("listener {s}: lock file refused ({t}): mode {o}, owner {d}, links {d}", .{
+        lock_path, verdict, status.mode & 0o7777, status.uid, status.nlink,
+    });
+    return error.SocketLockUnsafe;
 }
 
 const Blocking = enum { blocking, nonblocking };
@@ -386,7 +657,7 @@ fn pathErrno(err: linux.E) PathOutcome {
 
 /// Binds `socket` to `address`. A stale socket at the path is removed and the path bound
 /// once more; anything else at the path refuses.
-fn bindReplacingStale(socket: io.Socket, address: *const linux.sockaddr.un, file_path: [:0]const u8) OpenError!void {
+fn bindReplacingStale(socket: io.Socket, address: *const linux.sockaddr.un, file_path: [:0]const u8, owner: linux.uid_t) OpenError!void {
     assert(socket >= 0);
     assert(file_path.len > 0 and address.path[file_path.len] == 0);
     // The family, the path and its NUL, as unix(7) counts an address's length.
@@ -399,7 +670,7 @@ fn bindReplacingStale(socket: io.Socket, address: *const linux.sockaddr.un, file
             // Taken a second time, after the stale socket went: a process that doesn't take
             // the lock is binding the path.
             if (attempts == bind_attempts_max) break;
-            try removeStale(address, address_len, file_path);
+            try removeStale(address, address_len, file_path, owner);
             continue;
         }
         switch (pathErrno(err)) {
@@ -503,13 +774,15 @@ fn probe(address: *const linux.sockaddr.un, address_len: linux.socklen_t, file_p
     }
 }
 
-/// Removes a stale socket at `file_path`: one nothing listens on, as a probe connect shows.
-/// Refuses for a live socket and for a file of any other kind.
-fn removeStale(address: *const linux.sockaddr.un, address_len: linux.socklen_t, file_path: [:0]const u8) OpenError!void {
+/// Removes a stale socket at `file_path`: one `owner`, the server's user, owns and nothing
+/// listens on, as a probe connect shows. Refuses for a live socket, another user's socket
+/// and a file of any other kind.
+fn removeStale(address: *const linux.sockaddr.un, address_len: linux.socklen_t, file_path: [:0]const u8, owner: linux.uid_t) OpenError!void {
     assert(file_path.len > 0);
     assert(file_path[0] == '/');
     var status: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, file_path, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .INO = true }, &status);
+    const mask: linux.STATX = .{ .TYPE = true, .INO = true, .UID = true };
+    const rc = linux.statx(linux.AT.FDCWD, file_path, linux.AT.SYMLINK_NOFOLLOW, mask, &status);
     const err = linux.errno(rc);
     // Gone since bind saw it: bind again.
     if (err == .NOENT) return;
@@ -525,7 +798,14 @@ fn removeStale(address: *const linux.sockaddr.un, address_len: linux.socklen_t, 
     // A symlink is reported as one, not followed, so a link to a socket elsewhere is
     // never removed or taken.
     if (!status.mask.TYPE or !linux.S.ISSOCK(status.mode)) return error.SocketPathOccupied;
-    if (!status.mask.INO) return error.ListenFailed;
+    if (!status.mask.INO or !status.mask.UID) return error.ListenFailed;
+    // Read in the same statx as the type, so the owner is the socket's that was checked:
+    // a socket another user left is never this server's to remove, stale or not, and is
+    // judged before the probe, so it is never connected to either.
+    if (status.uid != owner) {
+        std.log.info("listener {s}: the socket at the path is user {d}'s, not the server's", .{ file_path, status.uid });
+        return error.SocketPathOccupied;
+    }
     const probed: FileId = .{ .dev_major = status.dev_major, .dev_minor = status.dev_minor, .ino = status.ino };
     // Only now, with a socket and not a symlink at the path, is the probe's connect aimed
     // at it; connect follows symlinks, so the path must still name the same socket file
@@ -1349,6 +1629,238 @@ test "listener: a missing directory is SocketDirectoryUnusable" {
     var buffer: [path_max + 1]u8 = undefined;
     try expectOpenError(error.SocketDirectoryUnusable, dir.file(&buffer, "absent/app.sock"));
     try testing.expect(!try exists(dir.file(&buffer, "absent")));
+
+    // A regular file where the directory should be.
+    const regular = dir.file(&buffer, "file");
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true };
+    const created = linux.open(regular, flags, 0o600);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(created));
+    closeLogged(@intCast(created), "test file");
+    try expectOpenError(error.SocketDirectoryUnusable, dir.file(&buffer, "file/app.sock"));
+}
+
+/// Sets the mode of `file_path` (following a symlink) and fails the test if it can't.
+fn setMode(file_path: [:0]const u8, mode: u32) !void {
+    assert(file_path.len > 0 and file_path[0] == '/');
+    assert(mode & ~@as(u32, 0o7777) == 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(file_path, mode)));
+}
+
+test "listener: a directory group or others may write in is refused before anything is made there" {
+    var dir: TestDir = undefined;
+    try dir.create("dirmode");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+    const file_path = dir.file(&buffer, "app.sock");
+    var lock_buffer: [path_max + 1]u8 = undefined;
+    const lock_path = dir.file(&lock_buffer, "app.sock.lock");
+    // Put back before dir.remove runs, whatever fails in between; a failure is logged and
+    // fails the test through that log line.
+    defer setMode(dir.path(), 0o700) catch std.log.err("test dir {s}: mode not put back", .{dir.path()});
+
+    // World-writable, group-writable, writable by others alone, and sticky like /tmp.
+    for ([_]u32{ 0o777, 0o770, 0o730, 0o702, 0o1777, 0o1733 }) |mode| {
+        try setMode(dir.path(), mode);
+        try expectOpenError(error.SocketDirectoryWritable, file_path);
+        // Refused before the lock: neither the lock file nor the socket was made.
+        try testing.expect(!try exists(lock_path));
+        try testing.expect(!try exists(file_path));
+    }
+    // Readable and searchable by others is fine: only writing lets them put files there.
+    for ([_]u32{ 0o700, 0o750, 0o755, 0o711 }) |mode| {
+        try setMode(dir.path(), mode);
+        var listener = try open(file_path);
+        defer listener.close();
+        try check(listener.socket);
+    }
+}
+
+test "listener: a directory that carries an access ACL is refused, even one that grants no write" {
+    var dir: TestDir = undefined;
+    try dir.create("diracl");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+    const file_path = dir.file(&buffer, "app.sock");
+
+    // Nobody gets r-x through a r-x mask, so the mode reads 0750 and the writable check
+    // alone would pass the directory: only the ACL check refuses it.
+    const entries = [_]AclEntry{
+        .{ .tag = .user_obj, .perm = 7 },
+        .{ .tag = .user, .perm = 5, .id = 65534 },
+        .{ .tag = .group_obj, .perm = 5 },
+        .{ .tag = .mask, .perm = 5 },
+        .{ .tag = .other, .perm = 0 },
+    };
+    var acl_buffer: [test_acl_size_max]u8 = undefined;
+    const acl = testAclBytes(&entries, &acl_buffer);
+    const set = linux.errno(linux.setxattr(dir.path(), acl_access_name, acl.ptr, acl.len, 0));
+    if (set != .SUCCESS) std.log.warn("test dir {s}: setxattr of an access ACL failed, errno {d}", .{ dir.path(), @backingInt(set) });
+    try testing.expectEqual(linux.E.SUCCESS, set);
+    var status: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, dir.path(), 0, .{ .MODE = true }, &status);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try testing.expectEqual(@as(u32, 0o750), @as(u32, status.mode) & 0o7777);
+
+    try expectOpenError(error.SocketDirectoryAclPresent, file_path);
+    try testing.expect(!try exists(file_path));
+
+    // With the ACL gone, the same directory opens.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.removexattr(dir.path(), acl_access_name)));
+    var listener = try open(file_path);
+    defer listener.close();
+    try check(listener.socket);
+}
+
+test "listener: every directory owner and mode has a verdict, and only the server's or root's private one passes" {
+    const user: linux.uid_t = 1000;
+    const other: linux.uid_t = 1001;
+    const Case = struct { uid: linux.uid_t, mode: u16, user: linux.uid_t, expected: DirectoryVerdict };
+    const cases = [_]Case{
+        .{ .uid = user, .mode = 0o700, .user = user, .expected = .ok },
+        .{ .uid = user, .mode = 0o755, .user = user, .expected = .ok },
+        .{ .uid = 0, .mode = 0o755, .user = user, .expected = .ok },
+        .{ .uid = 0, .mode = 0o700, .user = 0, .expected = .ok },
+        .{ .uid = other, .mode = 0o700, .user = user, .expected = .owner_wrong },
+        // The owner is checked first: a writable directory of another user's is that user's.
+        .{ .uid = other, .mode = 0o777, .user = user, .expected = .owner_wrong },
+        // Running as root, another user's directory is still theirs.
+        .{ .uid = user, .mode = 0o700, .user = 0, .expected = .owner_wrong },
+        .{ .uid = user, .mode = 0o720, .user = user, .expected = .writable },
+        .{ .uid = user, .mode = 0o702, .user = user, .expected = .writable },
+        .{ .uid = 0, .mode = 0o1777, .user = user, .expected = .writable },
+        .{ .uid = 0, .mode = 0o775, .user = 0, .expected = .writable },
+    };
+    for (cases) |case| {
+        const mode: u16 = @intCast(linux.S.IFDIR | case.mode);
+        try testing.expectEqual(case.expected, directoryVerdict(mode, case.uid, case.user));
+    }
+}
+
+test "listener: the socket's directory is every byte before the last slash, or the root" {
+    var bytes: [path_max + 1]u8 = undefined;
+    try testing.expectEqualStrings("/run/coalition-connection", directoryOf("/run/coalition-connection/app.sock", &bytes));
+    try testing.expectEqualStrings("/", directoryOf("/app.sock", &bytes));
+    try testing.expectEqualStrings("/", directoryOf("/", &bytes));
+    try testing.expectEqualStrings("/run/", directoryOf("/run//app.sock", &bytes));
+    try testing.expectEqualStrings("/run/cc", directoryOf("/run/cc/", &bytes));
+    var at_max: [path_max:0]u8 = @splat('d');
+    at_max[0] = '/';
+    at_max[path_max - 2] = '/';
+    try testing.expectEqual(@as(usize, path_max - 2), directoryOf(&at_max, &bytes).len);
+}
+
+test "listener: a directory swapped in at the path after it was opened is not the same directory" {
+    var dir: TestDir = undefined;
+    try dir.create("dirswap");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+    const inner = dir.file(&buffer, "run");
+    var moved_buffer: [path_max + 1]u8 = undefined;
+    const moved = dir.file(&moved_buffer, "moved");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(inner, 0o700)));
+    const opened = linux.open(inner, .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(opened));
+    const fd: linux.fd_t = @intCast(opened);
+    defer closeLogged(fd, "test directory");
+    const status = try directoryStatus(fd, inner);
+    try testing.expect(try sameDirectory(inner, status));
+
+    // Moved away and a new directory made at the path: the path names another one now.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.rename(inner, moved)));
+    try testing.expect(!try sameDirectory(inner, status));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(inner, 0o700)));
+    try testing.expect(!try sameDirectory(inner, status));
+    try testing.expect(try sameDirectory(moved, status));
+}
+
+/// Makes a regular file at `file_path` with exactly `mode`, whatever the umask.
+fn makeFile(file_path: [:0]const u8, mode: u32) !void {
+    assert(file_path.len > 0 and file_path[0] == '/');
+    assert(mode & ~@as(u32, 0o777) == 0);
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true };
+    const created = linux.open(file_path, flags, 0o600);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(created));
+    const fd: linux.fd_t = @intCast(created);
+    defer closeLogged(fd, "test file");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fchmod(fd, mode)));
+}
+
+/// Expects `open` to refuse `file_path` with `SocketLockUnsafe` while `lock_path` holds a
+/// lock file made beforehand, leaving that file, and making no socket file.
+fn expectLockRefused(file_path: [:0]const u8, lock_path: [:0]const u8) !void {
+    assert(file_path.len > 0);
+    assert(lock_path.len > file_path.len);
+    try expectOpenError(error.SocketLockUnsafe, file_path);
+    try testing.expect(try exists(lock_path));
+    try testing.expect(!try exists(file_path));
+}
+
+test "listener: a lock file made beforehand that isn't the server's private one is refused and kept" {
+    var dir: TestDir = undefined;
+    try dir.create("lockfile");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+    const file_path = dir.file(&buffer, "app.sock");
+    var lock_buffer: [path_max + 1]u8 = undefined;
+    const lock_path = dir.file(&lock_buffer, "app.sock.lock");
+
+    // Open to group or others: someone else may have made it, or may use it.
+    for ([_]u32{ 0o666, 0o640, 0o604 }) |mode| {
+        try makeFile(lock_path, mode);
+        try expectLockRefused(file_path, lock_path);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(lock_path)));
+    }
+    // A FIFO, which the nonblocking open gets through without waiting.
+    const fifo = linux.mknod(lock_path, linux.S.IFIFO | 0o600, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(fifo));
+    try expectLockRefused(file_path, lock_path);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(lock_path)));
+
+    // A hard link to another file: whoever holds the other name shares the lock's file.
+    var other_buffer: [path_max + 1]u8 = undefined;
+    const other = dir.file(&other_buffer, "other");
+    try makeFile(other, 0o600);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.link(other, lock_path)));
+    try expectLockRefused(file_path, lock_path);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(other)));
+
+    // With the other name gone it is a private lock file again, and the path opens.
+    var listener = try open(file_path);
+    defer listener.close();
+    try check(listener.socket);
+}
+
+test "listener: every lock file status has a verdict, and only the server's private regular file passes" {
+    const user: linux.uid_t = 1000;
+    const reg = linux.S.IFREG;
+    const Case = struct { mode: u32, uid: linux.uid_t, links: u32, expected: LockVerdict };
+    // Owned by another user and linked twice: refused for the owner, which is judged first.
+    const cases = [_]Case{
+        .{ .mode = reg | 0o600, .uid = user, .links = 1, .expected = .ok },
+        .{ .mode = reg | 0o700, .uid = user, .links = 1, .expected = .ok },
+        // Made under a umask of 0777.
+        .{ .mode = reg | 0o000, .uid = user, .links = 1, .expected = .ok },
+        .{ .mode = linux.S.IFIFO | 0o600, .uid = user, .links = 1, .expected = .not_regular },
+        .{ .mode = linux.S.IFDIR | 0o700, .uid = user, .links = 1, .expected = .not_regular },
+        .{ .mode = linux.S.IFSOCK | 0o600, .uid = user, .links = 1, .expected = .not_regular },
+        .{ .mode = linux.S.IFCHR | 0o600, .uid = user, .links = 1, .expected = .not_regular },
+        // Root's file isn't a server's that runs as another user.
+        .{ .mode = reg | 0o600, .uid = 0, .links = 1, .expected = .owner_wrong },
+        .{ .mode = reg | 0o600, .uid = 1001, .links = 1, .expected = .owner_wrong },
+        .{ .mode = reg | 0o600, .uid = user, .links = 2, .expected = .linked },
+        .{ .mode = reg | 0o600, .uid = user, .links = 0, .expected = .linked },
+        .{ .mode = reg | 0o640, .uid = user, .links = 1, .expected = .mode_wide },
+        .{ .mode = reg | 0o601, .uid = user, .links = 1, .expected = .mode_wide },
+        .{ .mode = reg | 0o4600, .uid = user, .links = 1, .expected = .mode_wide },
+        .{ .mode = reg | 0o1600, .uid = user, .links = 1, .expected = .mode_wide },
+        .{ .mode = reg | 0o666, .uid = 1001, .links = 2, .expected = .owner_wrong },
+        .{ .mode = reg | 0o666, .uid = user, .links = 2, .expected = .linked },
+        .{ .mode = linux.S.IFIFO | 0o666, .uid = 1001, .links = 2, .expected = .not_regular },
+    };
+    for (cases) |case| {
+        const mode: u16 = @intCast(case.mode);
+        try testing.expectEqual(case.expected, lockVerdict(mode, case.uid, case.links, user));
+    }
 }
 
 test "listener: the lock file stays after close, and the path opens again" {
@@ -1443,7 +1955,7 @@ fn expectReplacedRefused(replacement: Replacement, file_path: [:0]const u8) !voi
     assert(ReplaceDuringOpen.socket == -1);
     ReplaceDuringOpen.replacement = replacement;
     ReplaceDuringOpen.failed = false;
-    const result = openPaused(file_path, ReplaceDuringOpen.pause);
+    const result = openPaused(file_path, ReplaceDuringOpen.pause, serverOwners());
     try testing.expect(!ReplaceDuringOpen.failed);
     if (result) |opened| {
         var listener = opened;
@@ -1611,4 +2123,118 @@ test "listener: every path errno has an outcome" {
     // An errno no call here documents, and a number std has no name for.
     try testing.expectEqual(PathOutcome.failed, pathErrno(.CONNRESET));
     try testing.expectEqual(PathOutcome.failed, pathErrno(@fromBackingInt(@intCast(4000))));
+}
+
+/// The owners `open` itself checks against: the server's user for all three.
+fn serverOwners() Owners {
+    const user = linux.geteuid();
+    const owners: Owners = .{ .directory = user, .lock = user, .socket = user };
+    assert(owners.directory == owners.lock and owners.lock == owners.socket);
+    return owners;
+}
+
+/// A user id that isn't this process's, nor root's: the "other user" of the owner tests.
+fn foreignUser() linux.uid_t {
+    const user = linux.geteuid();
+    const foreign: linux.uid_t = if (user == 65534) 65533 else 65534;
+    assert(foreign != user and foreign != 0);
+    return foreign;
+}
+
+/// Expects `openPaused` with `owners` to refuse `file_path` with `expected`, closing a
+/// listener opened by mistake.
+fn expectOwnersRefused(expected: OpenError, file_path: [:0]const u8, owners: Owners) !void {
+    assert(file_path.len > 0);
+    assert(file_path[0] == '/');
+    if (openPaused(file_path, pauseNone, owners)) |opened| {
+        var listener = opened;
+        listener.close();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(expected, err);
+}
+
+test "listener: a directory another user owns is refused, before the lock file is made" {
+    var dir: TestDir = undefined;
+    try dir.create("dirowner");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+    const file_path = dir.file(&buffer, "app.sock");
+    var lock_buffer: [path_max + 1]u8 = undefined;
+    const lock_path = dir.file(&lock_buffer, "app.sock.lock");
+    const foreign = foreignUser();
+    var owners = serverOwners();
+    if (linux.geteuid() == 0) {
+        // Root's directories always pass, so as root the directory is given to the other
+        // user instead, and given back before dir.remove runs.
+        const chowned = linux.chown(dir.path(), foreign, foreign);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(chowned));
+    } else {
+        owners.directory = foreign;
+    }
+    defer if (linux.geteuid() == 0) {
+        _ = linux.chown(dir.path(), 0, 0);
+    };
+    try expectOwnersRefused(error.SocketDirectoryOwnerWrong, file_path, owners);
+    try testing.expect(!try exists(lock_path));
+    try testing.expect(!try exists(file_path));
+}
+
+test "listener: a lock file another user owns is refused, even while someone holds its lock" {
+    var dir: TestDir = undefined;
+    try dir.create("lockown");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+    const file_path = dir.file(&buffer, "app.sock");
+    var lock_buffer: [path_max + 1]u8 = undefined;
+    const lock_path = dir.file(&lock_buffer, "app.sock.lock");
+    var owners = serverOwners();
+    owners.lock = foreignUser();
+    // The lock file this test's user made is another user's as far as the server can tell.
+    try expectOwnersRefused(error.SocketLockUnsafe, file_path, owners);
+    try testing.expect(try exists(lock_path));
+    try testing.expect(!try exists(file_path));
+
+    // A 0666 lock file someone holds the lock on: the file is judged before the lock is
+    // tried, so it is SocketLockUnsafe, not SocketPathInUse.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(lock_path)));
+    try makeFile(lock_path, 0o666);
+    const held = linux.open(lock_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(held));
+    const holder: linux.fd_t = @intCast(held);
+    defer closeLogged(holder, "test lock holder");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(holder, std.posix.LOCK.EX | std.posix.LOCK.NB)));
+    try expectLockRefused(file_path, lock_path);
+}
+
+test "listener: another user's socket at the path, stale or live, is SocketPathOccupied and kept" {
+    var dir: TestDir = undefined;
+    try dir.create("sockown");
+    defer dir.remove();
+    var buffer: [path_max + 1]u8 = undefined;
+    var owners = serverOwners();
+    owners.socket = foreignUser();
+
+    const stale = dir.file(&buffer, "stale.sock");
+    try leaveStaleSocket(stale);
+    const stale_file = fileId(stale) orelse return error.TestUnexpectedResult;
+    try expectOwnersRefused(error.SocketPathOccupied, stale, owners);
+    try testing.expect(sameFile(stale, stale_file));
+    // The server's own stale socket is still replaced.
+    {
+        var listener = try open(stale);
+        defer listener.close();
+        // A new socket, though it may get the freed inode's number: this one takes
+        // connections.
+        try testing.expectEqual(linux.E.SUCCESS, try connectTo(stale));
+    }
+
+    // A live one is refused before the probe connects to it: SocketPathOccupied, not the
+    // SocketPathInUse a probe would give.
+    var live_buffer: [path_max + 1]u8 = undefined;
+    const live = dir.file(&live_buffer, "live.sock");
+    const other = try bindUnlocked(live, linux.SOCK.STREAM, true);
+    defer closeLogged(other, "test socket");
+    try expectOwnersRefused(error.SocketPathOccupied, live, owners);
+    try testing.expectEqual(linux.E.SUCCESS, try connectTo(live));
+    try expectOpenError(error.SocketPathInUse, live);
 }

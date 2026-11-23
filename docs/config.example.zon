@@ -5,7 +5,9 @@
 // the server with such a copy of this file, so it is always one the server accepts. Every field is required and unknown fields are refused; src/config.zig has the
 // limits.
 .{
-    // The local socket nginx reaches; the server doesn't open it yet.
+    // The local socket nginx reaches; the server doesn't open it yet. Its directory must be
+    // owned by the server's user or root, writable by neither group nor others (so not
+    // /tmp), and carry no ACL, or the server refuses to listen there.
     .socket_path = "/run/coalition-connection/app.sock",
     // The most client connections at once, at most http_connections_max.
     .connections_max = 1024,
