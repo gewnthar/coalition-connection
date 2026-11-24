@@ -33,11 +33,13 @@
 //! Every field is required and unknown fields are refused, so a typo can't silently fall
 //! back to a default.
 //!
-//! The file decides where the server listens, so a file owned by another user, or writable
-//! by its group or by others, is refused before a byte of it is read. (Root, and anyone who
-//! may write its directory, can still replace it; the directory is the deployment's to
-//! guard.) The socket path must be valid UTF-8 with no control character in it: no byte
-//! below 0x20, no 0x7f and no C1 control (U+0080 to U+009F), any of which a ZON escape could
+//! The file decides where the server listens, so it must be owned by the server's user or
+//! by root, and writable by neither its group nor others; anything else is refused before a
+//! byte of it is read. Root may own it because root can already replace the server
+//! itself, and a file a container runtime hands in (a secret, a file copied into an image)
+//! shows as root's. Anyone who may write the file's directory can still replace it; the
+//! directory is the deployment's to guard. The socket path must be valid UTF-8 with no
+//! control character in it: no byte below 0x20, no 0x7f and no C1 control (U+0080 to U+009F), any of which a ZON escape could
 //! otherwise put into a file name and into every log line that prints the path.
 //!
 //! Before the standard library's ZON parser sees the file, `prescan` checks it has exactly
@@ -74,8 +76,8 @@ pub const ReadError = error{
     /// directory, device or FIFO, or the process is out of descriptors or memory; or the
     /// kernel couldn't say its type, mode or owner.
     ConfigUnavailable,
-    /// The file belongs to a user other than the one the server runs as, who could change
-    /// where it listens.
+    /// The file belongs to a user other than the one the server runs as and other than
+    /// root: someone who could change where it listens.
     ConfigOwnerWrong,
     /// The file is writable by its group or by others, any of whom could change where the
     /// server listens.
@@ -183,6 +185,15 @@ pub fn load(startup: std.mem.Allocator, path: [:0]const u8) LoadError!Config {
 pub fn readFile(path: [:0]const u8, buffer: []u8) ReadError![:0]const u8 {
     assert(path.len > 0);
     assert(buffer.len == file_buffer_size);
+    return readFileAs(path, buffer, linux.geteuid());
+}
+
+/// `readFile` for a server running as `server_uid`, so tests can check the owner rule
+/// against a user other than their own without changing who they run as.
+fn readFileAs(path: [:0]const u8, buffer: []u8, server_uid: linux.uid_t) ReadError![:0]const u8 {
+    assert(path.len > 0);
+    assert(buffer.len == file_buffer_size);
+    assert(server_uid != uid_none);
     // Non-blocking, so a FIFO at the path can't stall startup in open.
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOCTTY = true, .NONBLOCK = true };
     const open_rc = linux.open(path, flags, 0);
@@ -191,7 +202,7 @@ pub fn readFile(path: [:0]const u8, buffer: []u8) ReadError![:0]const u8 {
         else => return error.ConfigUnavailable,
     };
     defer _ = linux.close(fd);
-    try checkFile(fd);
+    try checkFile(fd, server_uid);
 
     const room = buffer[0 .. file_size_max + 1];
     const len = try readAll(fd, room);
@@ -202,11 +213,12 @@ pub fn readFile(path: [:0]const u8, buffer: []u8) ReadError![:0]const u8 {
 }
 
 /// Checks the open file `fd`: a regular file (not a directory, FIFO, socket or device, any
-/// of which could block or never end), owned by the user the server runs as (its effective
-/// user ID, the one it acts as) and writable by no one else. The checks run on the
-/// descriptor, so the file checked is the file read.
-fn checkFile(fd: linux.fd_t) ReadError!void {
+/// of which could block or never end), owned by `server_uid` (the server's effective user
+/// ID, the one it acts as) or by root, and writable by neither its group nor others
+/// (`fileVerdict`). The checks run on the descriptor, so the file checked is the file read.
+fn checkFile(fd: linux.fd_t, server_uid: linux.uid_t) ReadError!void {
     assert(fd >= 0);
+    assert(server_uid != uid_none);
     var status: linux.Statx = undefined;
     const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .MODE = true, .UID = true }, &status);
     if (linux.errno(rc) != .SUCCESS) return error.ConfigUnavailable;
@@ -214,15 +226,46 @@ fn checkFile(fd: linux.fd_t) ReadError!void {
     // The kernel filled in the type it said it did.
     assert(status.mode & linux.S.IFMT != 0);
     if (!linux.S.ISREG(status.mode)) return error.ConfigUnavailable;
-    const server_uid = linux.geteuid();
-    if (status.uid != server_uid) {
-        std.log.info("config: owned by user {d}, but the server runs as user {d}", .{ status.uid, server_uid });
-        return error.ConfigOwnerWrong;
+    switch (fileVerdict(status.mode, status.uid, server_uid)) {
+        .ok => {},
+        .owner_wrong => {
+            std.log.info("config: owned by user {d}; only root or user {d}, the server's, may own it", .{ status.uid, server_uid });
+            return error.ConfigOwnerWrong;
+        },
+        .writable => {
+            std.log.info("config: mode {o} lets its group or others write it", .{status.mode & 0o7777});
+            return error.ConfigWritableByOthers;
+        },
     }
-    if (status.mode & (linux.S.IWGRP | linux.S.IWOTH) != 0) {
-        std.log.info("config: mode {o} lets its group or others write it", .{status.mode & 0o7777});
-        return error.ConfigWritableByOthers;
-    }
+}
+
+/// The user ID of root, the one owner besides the server's user that a config file may have.
+const root_uid: linux.uid_t = 0;
+
+/// The kernel's "no user" value (-1 as a uid_t), which no process runs as.
+const uid_none: linux.uid_t = std.math.maxInt(linux.uid_t);
+
+/// What a config file's owner and mode allow. Pure, so tests can check owners a test can't
+/// make (another user; root, when the test isn't root).
+const FileVerdict = enum { ok, owner_wrong, writable };
+
+/// `mode` is the file's type and mode, `uid` its owner and `server_uid` the server's user.
+/// Only the server's user or root may own it: the one already acts as the server, and the
+/// other can replace it.
+fn fileVerdict(mode: u32, uid: linux.uid_t, server_uid: linux.uid_t) FileVerdict {
+    assert(linux.S.ISREG(mode));
+    assert(server_uid != uid_none);
+    const owner_ok = uid == server_uid or uid == root_uid;
+    const verdict: FileVerdict = if (!owner_ok)
+        .owner_wrong
+    else if (mode & (linux.S.IWGRP | linux.S.IWOTH) != 0)
+        .writable
+    else
+        .ok;
+    // The owner is judged first: another user's file is refused for its owner, never for
+    // its mode, so the log names the problem that matters.
+    assert(verdict != .writable or owner_ok);
+    return verdict;
 }
 
 /// Reads from `fd` until end of file or until `room` is full, and returns the bytes read.
@@ -874,25 +917,81 @@ test "config: a file writable by its group or others is ConfigWritableByOthers" 
     }
 }
 
-test "config: a file another user owns is ConfigOwnerWrong" {
-    if (linux.geteuid() == 0) {
-        // Root may give a file away: a memfd owned by nobody.
-        var file = try TestFile.init(valid_source);
-        defer file.deinit();
-        const chowned = linux.errno(linux.fchown(file.fd, 65534, 65534));
-        if (chowned == .SUCCESS) {
-            return testing.expectError(error.ConfigOwnerWrong, readFile(file.path(), &test_buffer));
-        }
-        // A user namespace that maps root alone has no other user to give a file to.
-        try testing.expectEqual(linux.E.INVAL, chowned);
-    }
+/// A user id that isn't this process's, nor root's: the "other user" of the owner tests.
+fn foreignUser() linux.uid_t {
+    const user = linux.geteuid();
+    const foreign: linux.uid_t = if (user == 65534) 65533 else 65534;
+    assert(foreign != user and foreign != root_uid);
+    return foreign;
+}
+
+test "config: only the server's user or root may own the file, and the owner is judged first" {
+    const file: u32 = linux.S.IFREG | 0o600;
+    const writable: u32 = linux.S.IFREG | 0o620;
+    const cases = [_]struct { mode: u32, file: linux.uid_t, server: linux.uid_t, verdict: FileVerdict }{
+        .{ .mode = file, .file = 1000, .server = 1000, .verdict = .ok },
+        .{ .mode = file, .file = root_uid, .server = 1000, .verdict = .ok },
+        .{ .mode = file, .file = root_uid, .server = root_uid, .verdict = .ok },
+        .{ .mode = file, .file = 1001, .server = 1000, .verdict = .owner_wrong },
+        .{ .mode = file, .file = 65534, .server = 1000, .verdict = .owner_wrong },
+        .{ .mode = file, .file = 1000, .server = root_uid, .verdict = .owner_wrong },
+        .{ .mode = file, .file = 65534, .server = root_uid, .verdict = .owner_wrong },
+        // The largest uid, and the one next to root's, are other users too.
+        .{ .mode = file, .file = uid_none, .server = 1000, .verdict = .owner_wrong },
+        .{ .mode = file, .file = 1, .server = 1000, .verdict = .owner_wrong },
+        // A writable file is refused for its mode only when its owner may own it.
+        .{ .mode = writable, .file = 1000, .server = 1000, .verdict = .writable },
+        .{ .mode = writable, .file = root_uid, .server = 1000, .verdict = .writable },
+        .{ .mode = writable, .file = 1001, .server = 1000, .verdict = .owner_wrong },
+    };
+    for (cases) |case| try testing.expectEqual(case.verdict, fileVerdict(case.mode, case.file, case.server));
+}
+
+test "config: a root-owned file passes the checks for a server running as another user" {
     // /etc/passwd, a regular file mode 0644, is owned by root, or, where root is a
-    // namespace's only user, by the overflow user: either way not by this process.
+    // namespace's only user, by the overflow user. Only its owner and mode are checked
+    // here, so its size doesn't matter.
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true };
+    const opened = linux.open("/etc/passwd", flags, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(opened));
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
     var status: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, "/etc/passwd", 0, .{ .UID = true }, &status);
+    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .UID = true, .MODE = true }, &status);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-    try testing.expect(status.uid != linux.geteuid());
-    try testing.expectError(error.ConfigOwnerWrong, readFile("/etc/passwd", &test_buffer));
+    try testing.expect(status.mask.UID and status.mask.MODE);
+    try testing.expect(status.mode & (linux.S.IWGRP | linux.S.IWOTH) == 0);
+    const server = foreignUser();
+    if (status.uid == root_uid) {
+        try checkFile(fd, server);
+    } else {
+        // The overflow user owns it: the server, as another user still, refuses it.
+        try testing.expect(status.uid != server);
+        try testing.expectError(error.ConfigOwnerWrong, checkFile(fd, server));
+    }
+}
+
+test "config: a file another user owns is ConfigOwnerWrong, and its owner's server reads it" {
+    var file = try TestFile.init(valid_source);
+    defer file.deinit();
+    const self_uid = linux.geteuid();
+    const foreign = foreignUser();
+    if (self_uid == root_uid) {
+        // Root's file is read by a server running as another user...
+        try testing.expectEqualStrings(valid_source, try readFileAs(file.path(), &test_buffer, foreign));
+        // ...and given away, it becomes another user's. A user namespace that maps root
+        // alone has no other user to give a file to; the verdict table covers that case.
+        const chowned = linux.errno(linux.fchown(file.fd, foreign, foreign));
+        if (chowned == .INVAL) return;
+        try testing.expectEqual(linux.E.SUCCESS, chowned);
+    }
+    const owner: linux.uid_t = if (self_uid == root_uid) foreign else self_uid;
+    // A server running as neither the owner nor root refuses the file.
+    const other: linux.uid_t = if (owner == 65533) 65532 else 65533;
+    try testing.expect(other != owner and other != root_uid);
+    try testing.expectError(error.ConfigOwnerWrong, readFileAs(file.path(), &test_buffer, other));
+    // The same file is read by a server running as its owner.
+    try testing.expectEqualStrings(valid_source, try readFileAs(file.path(), &test_buffer, owner));
 }
 
 test "config: an I/O error part way through is ConfigReadFailed" {

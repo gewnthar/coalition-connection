@@ -35,10 +35,10 @@ chmod 600 zig-out/config.zon
 zig-out/bin/coalition-connection zig-out/config.zon
 ```
 
-The config file must be owned by the user the server runs as, and the server refuses one
-that its group or others can write. A checkout made under a umask such as 002 leaves the
-example group-writable, hence the copy. `zig build test` starts the server on its own 0600
-copy of the example, so the tests don't depend on your umask.
+The config file must be owned by the user the server runs as or by root, and the server
+refuses one that its group or others can write. A checkout made under a umask such as 002
+leaves the example group-writable, hence the copy. `zig build test` starts the server on
+its own 0600 copy of the example, so the tests don't depend on your umask.
 
 For now the server checks the config, prints its version and exits; it serves nothing yet,
 and it builds only for Linux. In the first block, the last three lines compile every target
