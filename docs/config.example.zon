@@ -1,6 +1,7 @@
-// An example config for the server. The server refuses a config file owned by another
-// user or writable by its group or others, and a checkout can leave this file 0664, so run
-// it from a copy only you can write: `cp docs/config.example.zon config.zon`,
+// An example config for the server. The server refuses a config file owned by a user
+// other than its own or root, or writable by its group or others, and a checkout can
+// leave this file 0664, so run it from a copy only you can write:
+// `cp docs/config.example.zon config.zon`,
 // `chmod 600 config.zon`, then `coalition-connection config.zon`. `zig build test` starts
 // the server with such a copy of this file, so it is always one the server accepts. Every field is required and unknown fields are refused; src/config.zig has the
 // limits.
