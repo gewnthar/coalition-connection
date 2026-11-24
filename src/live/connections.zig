@@ -71,6 +71,7 @@ const assert = std.debug.assert;
 const constants = @import("../constants.zig");
 const io = @import("../io/root.zig");
 const http_request = @import("http_request.zig");
+const connection_state = @import("connection_state.zig");
 
 pub const PeerId = io.PeerId;
 
@@ -118,21 +119,16 @@ pub const DropCount = u8;
 
 pub const InitError = error{OutOfMemory};
 
-/// Where a connection is in its request and response.
-pub const State = enum(u8) {
-    /// Not in use: the entry's index is on the free stack.
-    free,
-    /// Reading a request head or body.
-    reading,
-    /// Writing a response.
-    writing,
-};
+/// Where a connection is in its life: the states of `connection_state.zig`, whose
+/// transitions say which events move an entry between them.
+pub const State = connection_state.State;
 
 pub const Entry = struct {
     /// Meaningful only while `state` is not `free`.
     socket: Socket,
     state: State,
-    /// Empty whenever `state` is `free`; the request parser advances it while reading.
+    /// Empty whenever `state` is `free`; the request parser advances it while the head is
+    /// read (`idle` and `reading_head`).
     scan: HeadScan = .{},
     /// The generation every live id for this entry carries. Kept while the entry is free:
     /// `release` advances it, and the next `acquire` hands it out.
@@ -167,6 +163,8 @@ comptime {
     assert(releases_per_wrap / releases_per_year >= generation_wrap_years_min);
     // Every operation in flight could be a send on one connection; its count still fits.
     assert(constants.io_operations_in_flight_max <= std.math.maxInt(SendCount));
+    // An accept moves a free entry to idle, which acquire does directly.
+    assert(connection_state.moves(.free, .idle));
     // Every failed drop the bound allows fits an entry's count.
     assert(constants.io_drop_attempts_max <= std.math.maxInt(DropCount));
 }
@@ -225,7 +223,7 @@ pub const Table = struct {
     }
 
     /// Takes a free entry for `socket` and returns its id, which carries the entry's
-    /// current generation. The entry starts in `reading`, with an empty head scan. When
+    /// current generation. The entry starts in `idle`, with an empty head scan. When
     /// every entry is in use, returns `error.TableFull` and changes nothing.
     pub fn acquire(self: *Table, socket: Socket) AcquireError!PeerId {
         assert(socket >= 0);
@@ -244,7 +242,7 @@ pub const Table = struct {
         assert(entry.sends_in_flight == 0); // release refuses an entry with sends in flight.
         assert(entry.drops_failed == 0); // release clears the failed drops of every entry.
         entry.socket = socket;
-        entry.state = .reading;
+        entry.state = .idle;
         const id: PeerId = @bitCast(IdParts{ .index = index, .generation = entry.generation });
         assert(self.count() == count_before + 1);
         return id;
@@ -297,25 +295,30 @@ pub const Table = struct {
         return entry;
     }
 
-    /// The head scan of `id`'s connection, which must be live and reading, for the request
-    /// parser to advance. `acquire` and `release` empty it; nothing else in the table
-    /// touches it.
+    /// The head scan of `id`'s connection, which must be live and reading a head (`idle` or
+    /// `reading_head`), for the request parser to advance. `acquire` and `release` empty
+    /// it; nothing else in the table touches it.
     pub fn headScan(self: *Table, id: PeerId) *HeadScan {
         const entry = &self.entries[self.liveIndex(id)];
-        assert(entry.state == .reading); // Only a connection reading a head is parsed.
+        // Only a connection reading a head is parsed.
+        assert(entry.state == .idle or entry.state == .reading_head);
         // The parser backs off three bytes from the end of a buffer of at most
         // http_request_size_max bytes, so it never resumes past that.
         assert(entry.scan.resume_at <= constants.http_request_size_max - 3);
         return &entry.scan;
     }
 
-    /// Moves `id`'s connection between reading and writing. Only `release` frees an entry,
-    /// so the free stack and the entries always agree.
+    /// Moves `id`'s connection to `state`, which some event of the state machine must lead
+    /// to from where the connection is (`connection_state.moves`). Only `release` frees an
+    /// entry, so the free stack and the entries always agree.
     pub fn setState(self: *Table, id: PeerId, state: State) void {
         assert(state != .free); // Free an entry through release.
         const entry = &self.entries[self.liveIndex(id)];
-        // A parsed head empties the scan, so a connection never writes with a scan part way.
-        assert(state != .writing or entry.scan.resume_at == 0);
+        assert(connection_state.moves(entry.state, state)); // A move no event leads to.
+        // A parsed head empties the scan, so a connection never reads a body or writes with
+        // a scan part way, and a connection kept alive goes back to idle with it empty.
+        const scan_empty = entry.scan.resume_at == 0;
+        assert(scan_empty or (state != .writing and state != .reading_body and state != .idle));
         entry.state = state;
     }
 
@@ -499,7 +502,7 @@ test "connections: release hands back the socket, then acquire reuses the entry 
     // The old id is stale: lookup refuses it, and the new one finds the same entry.
     try testing.expectEqual(@as(?*const Entry, null), table.lookup(first));
     try testing.expectEqual(table.get(reused), table.lookup(reused).?);
-    try testing.expectEqual(State.reading, table.get(reused).state);
+    try testing.expectEqual(State.idle, table.get(reused).state);
     try testing.expectEqual(@as(Socket, 12), table.get(reused).socket);
     try testing.expectEqual(@as(Socket, 11), table.get(second).socket);
     try testing.expectEqual(@as(u32, 2), table.count());
