@@ -227,9 +227,11 @@ pub const ResponseCall = enum(u8) {
 /// A call to the in-place response writer (`cc.live.http_response.writeInPlace`) on a
 /// buffer of `head_room` plus the body's length (cut shorter where a case says so), from
 /// the middle of a larger array, with the body already rendered after the room. Each
-/// response has status 200 and one header field outside the buffer. Each trip case breaks
-/// exactly one of the writer's three preconditions by one, and holds the other two at
-/// their bounds or inside them, so no other check in the writer can stop it.
+/// response has status 200 and one header field, outside the buffer unless a case says
+/// otherwise. Each bounds case breaks exactly one of the writer's three preconditions by
+/// one, and holds the other two at their bounds or inside them, so no other check in the
+/// writer can stop it. Each value case meets every bound exactly, as `exact_fit` does, and
+/// moves only the header value.
 pub const InPlaceCall = enum(u8) {
     /// The body starts one byte past the room (`head_room + 1`) and ends exactly at the
     /// buffer's end, so it still fits: only the room assertion can stop it.
@@ -241,6 +243,19 @@ pub const InPlaceCall = enum(u8) {
     /// (the room assertion's bound) with length 0: only the offset-inside-the-buffer
     /// assertion can stop it.
     offset_past_buffer,
+    /// The header value lies in the room, the bytes the head is written into. The check of
+    /// every value against the buffer and the room's cursor both assert against it, so it
+    /// pins neither alone, only both together.
+    value_in_room,
+    /// The header value lies over the body, after the room, which the room's cursor never
+    /// sees: only the check of every value against the buffer can stop it.
+    value_in_body,
+    /// The header name lies over the body: only the check of every name against the
+    /// buffer can stop it.
+    name_in_body,
+    /// The header value starts on the buffer's last byte and runs past its end: it shares
+    /// a byte without lying inside, so a check for a value wholly inside lets it through.
+    value_straddles_end,
     // Controls.
     /// The body starts at `head_room` and ends exactly at the buffer's end: the room and
     /// the body's bounds met exactly, so the write must succeed and return the exact
@@ -253,6 +268,11 @@ pub const InPlaceCall = enum(u8) {
     /// The body starts one byte before `head_room` and ends one byte before the buffer's
     /// end: inside every bound, so a check tightened to equality trips it.
     inside_bounds,
+    /// The header value ends exactly where the buffer begins: touching is not sharing a
+    /// byte, so an overlap check one byte too wide at the buffer's start trips it.
+    value_before_buffer,
+    /// The header value starts exactly where the buffer ends: the same at its end.
+    value_after_buffer,
 };
 
 /// How a tripping case must stop: on a failed assertion, or on the real type's panic for a
@@ -400,133 +420,149 @@ pub fn expectedExit(case: Case) u8 {
     return if (case.trips) exit_tripped else exit_finished;
 }
 
-pub const cases_max: u32 = 96;
+/// Cases in the list. Each is one child process `zig build test` starts, and the compile
+/// time checks over the list grow with it (their branch quotas are counted from this).
+pub const cases_max: u32 = 128;
 
-pub const cases = [_]Case{
-    // Every call the running phase forbids.
-    onAllocator("alloc_running", .running, .alloc, .trips),
-    onAllocator("resize_grow_running", .running, .resize_grow, .trips),
-    onAllocator("resize_shrink_running", .running, .resize_shrink, .trips),
-    onAllocator("resize_zero_running", .running, .resize_zero, .trips),
-    onAllocator("remap_grow_running", .running, .remap_grow, .trips),
-    onAllocator("remap_shrink_running", .running, .remap_shrink, .trips),
-    onAllocator("free_running", .running, .free, .trips),
-    onAllocator("get_allocator_running", .running, .get_allocator, .trips),
-    onAllocator("finish_startup_running", .running, .finish_startup, .trips),
-    // Shutdown allows frees only, and only of bytes that are live.
-    onAllocator("alloc_shutdown", .shutdown, .alloc, .trips),
-    onAllocator("resize_grow_shutdown", .shutdown, .resize_grow, .trips),
-    onAllocator("resize_shrink_shutdown", .shutdown, .resize_shrink, .trips),
-    onAllocator("remap_grow_shutdown", .shutdown, .remap_grow, .trips),
-    onAllocator("remap_shrink_shutdown", .shutdown, .remap_shrink, .trips),
-    onAllocator("free_oversize_shutdown", .shutdown, .free_oversize, .trips),
-    onAllocator("begin_shutdown_shutdown", .shutdown, .begin_shutdown, .trips),
-    onAllocator("get_allocator_shutdown", .shutdown, .get_allocator, .trips),
-    onAllocator("finish_startup_shutdown", .shutdown, .finish_startup, .trips),
-    // Startup allows frees too, but only of bytes that are live.
-    onAllocator("free_oversize_startup", .startup, .free_oversize, .trips),
-    // Phases move one step at a time: startup can't jump to shutdown.
-    onAllocator("begin_shutdown_startup", .startup, .begin_shutdown, .trips),
-    // Controls: the same calls where the phase allows them, so a harness bug on any call
-    // path shows up as a failed control instead of a false trip.
-    onAllocator("alloc_startup", .startup, .alloc, .finishes),
-    onAllocator("resize_grow_startup", .startup, .resize_grow, .finishes),
-    onAllocator("resize_shrink_startup", .startup, .resize_shrink, .finishes),
-    onAllocator("remap_grow_startup", .startup, .remap_grow, .finishes),
-    onAllocator("remap_shrink_startup", .startup, .remap_shrink, .finishes),
-    onAllocator("free_startup", .startup, .free, .finishes),
-    onAllocator("free_shutdown", .shutdown, .free, .finishes),
-    onAllocator("resize_zero_shutdown", .shutdown, .resize_zero, .finishes),
-    // The connection table: an entry not in use, or an id gone stale, can't be released,
-    // read or moved, and only release frees an entry. The stale-socket pair pins the state
-    // check even with a valid-looking socket; the stale trio pins the generation check.
-    onTable("table_release_free", .release_free, .trips),
-    onTable("table_get_free", .get_free, .trips),
-    onTable("table_set_state_free", .set_state_free, .trips),
-    onTable("table_release_free_stale_socket", .release_free_stale_socket, .trips),
-    onTable("table_get_free_stale_socket", .get_free_stale_socket, .trips),
-    onTable("table_set_state_to_free", .set_state_to_free, .trips),
-    onTable("table_release_out_of_range", .release_out_of_range, .trips),
-    onTable("table_get_out_of_range", .get_out_of_range, .trips),
-    onTable("table_set_state_out_of_range", .set_state_out_of_range, .trips),
-    onTable("table_lookup_out_of_range", .lookup_out_of_range, .trips),
-    onTable("table_lookup_index_max", .lookup_index_max, .trips),
-    onTable("table_release_stale", .release_stale, .trips),
-    onTable("table_get_stale", .get_stale, .trips),
-    onTable("table_set_state_stale", .set_state_stale, .trips),
-    onTable("table_get_stale_top_bit", .get_stale_top_bit, .trips),
-    onTable("table_send_completed_stale", .send_completed_stale, .trips),
-    onTable("table_send_completed_free", .send_completed_free, .trips),
-    onTable("table_send_completed_uncounted", .send_completed_uncounted, .trips),
-    // Controls: the same calls on entries in use, reading and writing.
-    onTable("table_release_reading", .release_reading, .finishes),
-    onTable("table_get_reading", .get_reading, .finishes),
-    onTable("table_set_state_to_writing", .set_state_to_writing, .finishes),
-    onTable("table_release_writing", .release_writing, .finishes),
-    onTable("table_get_writing", .get_writing, .finishes),
-    onTable("table_set_state_to_reading", .set_state_to_reading, .finishes),
-    // The real I/O type: its clock never steps back, it refuses an execute, a send must
-    // name an entry in use (checked before the queue), an id in flight is refused before
-    // the sends' share and the queue, and it is set up during startup only.
-    onReal("real_now_after_max", .now_after_max, .trips),
-    onReal("real_submit_execute", .submit_execute, .trips),
-    onReal("real_send_free", .send_free, .trips),
-    onReal("real_send_free_stale_socket", .send_free_stale_socket, .trips),
-    onReal("real_send_out_of_range", .send_out_of_range, .trips),
-    onReal("real_send_free_slots_full", .send_free_slots_full, .trips),
-    onReal("real_send_free_queue_full", .send_free_queue_full, .trips),
-    onReal("real_send_duplicate_id_slots_full", .send_duplicate_id_slots_full, .trips),
-    onReal("real_send_duplicate_id_queue_full", .send_duplicate_id_queue_full, .trips),
-    onReal("real_init_running", .init_running, .trips),
-    // Controls: the clock read once, a send to the entry in use, and that send on a full
-    // ring.
-    onReal("real_now_fresh", .now_fresh, .finishes),
-    onReal("real_send_peer", .send_peer, .finishes),
-    onReal("real_send_slots_full", .send_slots_full, .finishes),
-    // The simulator: a send must name a live entry, checked through the table before the
-    // queue, as on the real type: a stale id, the free entry, or an index past the table;
-    // a send needs a table to check it against; an id in flight is refused before the
-    // sends' share and the queue; and a send that outlived its entry stops when it
-    // completes.
-    onSim("sim_send_stale", .send_stale, .trips),
-    onSim("sim_send_free", .send_free, .trips),
-    onSim("sim_send_out_of_range", .send_out_of_range, .trips),
-    onSim("sim_send_stale_queue_full", .send_stale_queue_full, .trips),
-    onSim("sim_send_no_table", .send_no_table, .trips),
-    onSim("sim_send_duplicate_id_queue_full", .send_duplicate_id_queue_full, .trips),
-    onSim("sim_send_duplicate_id_slots_full", .send_duplicate_id_slots_full, .trips),
-    onSim("sim_complete_released", .complete_released, .trips),
-    // Controls: a send to the entry in use, and that send with every slot in use.
-    onSim("sim_send_peer", .send_peer, .finishes),
-    onSim("sim_send_queue_full", .send_queue_full, .finishes),
-    // The response writer: the body, a header name or a header value that shares a byte
-    // with the buffer being written would be read while it is overwritten. The `_head` and
-    // `_refused` cases pin the earliest check, which no later copy backs up.
-    onResponse("response_body_inside", .body_inside, .trips),
-    onResponse("response_body_inside_head", .body_inside_head, .trips),
-    onResponse("response_body_straddles_start", .body_straddles_start, .trips),
-    onResponse("response_name_inside", .name_inside, .trips),
-    onResponse("response_name_straddles_end", .name_straddles_end, .trips),
-    onResponse("response_value_inside", .value_inside, .trips),
-    onResponse("response_name_inside_refused", .name_inside_refused, .trips),
-    onResponse("response_value_inside_refused", .value_inside_refused, .trips),
-    onResponse("response_value_inside_second_refused", .value_inside_second_refused, .trips),
-    // Controls: all three outside, all three touching the buffer's edges from outside, and
-    // an empty body inside it. Each must write the exact response and nothing else.
-    onResponse("response_outside", .outside, .finishes),
-    onResponse("response_adjacent", .adjacent, .finishes),
-    onResponse("response_empty_body_inside", .empty_body_inside, .finishes),
-    // The in-place writer: a body offset past the room, a body past the buffer's end, and
-    // an offset past a buffer shorter than the room, each one byte past its bound.
-    onInPlace("response_in_place_offset_past_room", .offset_past_room, .trips),
-    onInPlace("response_in_place_body_past_end", .body_past_end, .trips),
-    onInPlace("response_in_place_offset_past_buffer", .offset_past_buffer, .trips),
-    // Controls: the bounds met exactly, with a body that ends the buffer and with an empty
-    // body at the buffer's end, and a body inside every bound. Each must write the exact
-    // response.
-    onInPlace("response_in_place_exact_fit", .exact_fit, .finishes),
-    onInPlace("response_in_place_empty_at_buffer_end", .empty_at_buffer_end, .finishes),
-    onInPlace("response_in_place_inside_bounds", .inside_bounds, .finishes),
+pub const cases = cases: {
+    // Each entry's constructor checks its name at compile time: under 64 bytes, so at most
+    // 64 branches an entry.
+    @setEvalBranchQuota(64 * cases_max);
+    break :cases [_]Case{
+        // Every call the running phase forbids.
+        onAllocator("alloc_running", .running, .alloc, .trips),
+        onAllocator("resize_grow_running", .running, .resize_grow, .trips),
+        onAllocator("resize_shrink_running", .running, .resize_shrink, .trips),
+        onAllocator("resize_zero_running", .running, .resize_zero, .trips),
+        onAllocator("remap_grow_running", .running, .remap_grow, .trips),
+        onAllocator("remap_shrink_running", .running, .remap_shrink, .trips),
+        onAllocator("free_running", .running, .free, .trips),
+        onAllocator("get_allocator_running", .running, .get_allocator, .trips),
+        onAllocator("finish_startup_running", .running, .finish_startup, .trips),
+        // Shutdown allows frees only, and only of bytes that are live.
+        onAllocator("alloc_shutdown", .shutdown, .alloc, .trips),
+        onAllocator("resize_grow_shutdown", .shutdown, .resize_grow, .trips),
+        onAllocator("resize_shrink_shutdown", .shutdown, .resize_shrink, .trips),
+        onAllocator("remap_grow_shutdown", .shutdown, .remap_grow, .trips),
+        onAllocator("remap_shrink_shutdown", .shutdown, .remap_shrink, .trips),
+        onAllocator("free_oversize_shutdown", .shutdown, .free_oversize, .trips),
+        onAllocator("begin_shutdown_shutdown", .shutdown, .begin_shutdown, .trips),
+        onAllocator("get_allocator_shutdown", .shutdown, .get_allocator, .trips),
+        onAllocator("finish_startup_shutdown", .shutdown, .finish_startup, .trips),
+        // Startup allows frees too, but only of bytes that are live.
+        onAllocator("free_oversize_startup", .startup, .free_oversize, .trips),
+        // Phases move one step at a time: startup can't jump to shutdown.
+        onAllocator("begin_shutdown_startup", .startup, .begin_shutdown, .trips),
+        // Controls: the same calls where the phase allows them, so a harness bug on any call
+        // path shows up as a failed control instead of a false trip.
+        onAllocator("alloc_startup", .startup, .alloc, .finishes),
+        onAllocator("resize_grow_startup", .startup, .resize_grow, .finishes),
+        onAllocator("resize_shrink_startup", .startup, .resize_shrink, .finishes),
+        onAllocator("remap_grow_startup", .startup, .remap_grow, .finishes),
+        onAllocator("remap_shrink_startup", .startup, .remap_shrink, .finishes),
+        onAllocator("free_startup", .startup, .free, .finishes),
+        onAllocator("free_shutdown", .shutdown, .free, .finishes),
+        onAllocator("resize_zero_shutdown", .shutdown, .resize_zero, .finishes),
+        // The connection table: an entry not in use, or an id gone stale, can't be released,
+        // read or moved, and only release frees an entry. The stale-socket pair pins the state
+        // check even with a valid-looking socket; the stale trio pins the generation check.
+        onTable("table_release_free", .release_free, .trips),
+        onTable("table_get_free", .get_free, .trips),
+        onTable("table_set_state_free", .set_state_free, .trips),
+        onTable("table_release_free_stale_socket", .release_free_stale_socket, .trips),
+        onTable("table_get_free_stale_socket", .get_free_stale_socket, .trips),
+        onTable("table_set_state_to_free", .set_state_to_free, .trips),
+        onTable("table_release_out_of_range", .release_out_of_range, .trips),
+        onTable("table_get_out_of_range", .get_out_of_range, .trips),
+        onTable("table_set_state_out_of_range", .set_state_out_of_range, .trips),
+        onTable("table_lookup_out_of_range", .lookup_out_of_range, .trips),
+        onTable("table_lookup_index_max", .lookup_index_max, .trips),
+        onTable("table_release_stale", .release_stale, .trips),
+        onTable("table_get_stale", .get_stale, .trips),
+        onTable("table_set_state_stale", .set_state_stale, .trips),
+        onTable("table_get_stale_top_bit", .get_stale_top_bit, .trips),
+        onTable("table_send_completed_stale", .send_completed_stale, .trips),
+        onTable("table_send_completed_free", .send_completed_free, .trips),
+        onTable("table_send_completed_uncounted", .send_completed_uncounted, .trips),
+        // Controls: the same calls on entries in use, reading and writing.
+        onTable("table_release_reading", .release_reading, .finishes),
+        onTable("table_get_reading", .get_reading, .finishes),
+        onTable("table_set_state_to_writing", .set_state_to_writing, .finishes),
+        onTable("table_release_writing", .release_writing, .finishes),
+        onTable("table_get_writing", .get_writing, .finishes),
+        onTable("table_set_state_to_reading", .set_state_to_reading, .finishes),
+        // The real I/O type: its clock never steps back, it refuses an execute, a send must
+        // name an entry in use (checked before the queue), an id in flight is refused before
+        // the sends' share and the queue, and it is set up during startup only.
+        onReal("real_now_after_max", .now_after_max, .trips),
+        onReal("real_submit_execute", .submit_execute, .trips),
+        onReal("real_send_free", .send_free, .trips),
+        onReal("real_send_free_stale_socket", .send_free_stale_socket, .trips),
+        onReal("real_send_out_of_range", .send_out_of_range, .trips),
+        onReal("real_send_free_slots_full", .send_free_slots_full, .trips),
+        onReal("real_send_free_queue_full", .send_free_queue_full, .trips),
+        onReal("real_send_duplicate_id_slots_full", .send_duplicate_id_slots_full, .trips),
+        onReal("real_send_duplicate_id_queue_full", .send_duplicate_id_queue_full, .trips),
+        onReal("real_init_running", .init_running, .trips),
+        // Controls: the clock read once, a send to the entry in use, and that send on a full
+        // ring.
+        onReal("real_now_fresh", .now_fresh, .finishes),
+        onReal("real_send_peer", .send_peer, .finishes),
+        onReal("real_send_slots_full", .send_slots_full, .finishes),
+        // The simulator: a send must name a live entry, checked through the table before the
+        // queue, as on the real type: a stale id, the free entry, or an index past the table;
+        // a send needs a table to check it against; an id in flight is refused before the
+        // sends' share and the queue; and a send that outlived its entry stops when it
+        // completes.
+        onSim("sim_send_stale", .send_stale, .trips),
+        onSim("sim_send_free", .send_free, .trips),
+        onSim("sim_send_out_of_range", .send_out_of_range, .trips),
+        onSim("sim_send_stale_queue_full", .send_stale_queue_full, .trips),
+        onSim("sim_send_no_table", .send_no_table, .trips),
+        onSim("sim_send_duplicate_id_queue_full", .send_duplicate_id_queue_full, .trips),
+        onSim("sim_send_duplicate_id_slots_full", .send_duplicate_id_slots_full, .trips),
+        onSim("sim_complete_released", .complete_released, .trips),
+        // Controls: a send to the entry in use, and that send with every slot in use.
+        onSim("sim_send_peer", .send_peer, .finishes),
+        onSim("sim_send_queue_full", .send_queue_full, .finishes),
+        // The response writer: the body, a header name or a header value that shares a byte
+        // with the buffer being written would be read while it is overwritten. The `_head` and
+        // `_refused` cases pin the earliest check, which no later copy backs up.
+        onResponse("response_body_inside", .body_inside, .trips),
+        onResponse("response_body_inside_head", .body_inside_head, .trips),
+        onResponse("response_body_straddles_start", .body_straddles_start, .trips),
+        onResponse("response_name_inside", .name_inside, .trips),
+        onResponse("response_name_straddles_end", .name_straddles_end, .trips),
+        onResponse("response_value_inside", .value_inside, .trips),
+        onResponse("response_name_inside_refused", .name_inside_refused, .trips),
+        onResponse("response_value_inside_refused", .value_inside_refused, .trips),
+        onResponse("response_value_inside_second_refused", .value_inside_second_refused, .trips),
+        // Controls: all three outside, all three touching the buffer's edges from outside, and
+        // an empty body inside it. Each must write the exact response and nothing else.
+        onResponse("response_outside", .outside, .finishes),
+        onResponse("response_adjacent", .adjacent, .finishes),
+        onResponse("response_empty_body_inside", .empty_body_inside, .finishes),
+        // The in-place writer: a body offset past the room, a body past the buffer's end, and
+        // an offset past a buffer shorter than the room, each one byte past its bound.
+        onInPlace("response_in_place_offset_past_room", .offset_past_room, .trips),
+        onInPlace("response_in_place_body_past_end", .body_past_end, .trips),
+        onInPlace("response_in_place_offset_past_buffer", .offset_past_buffer, .trips),
+        // A header field inside the buffer: a value in the room and over the body, a name over
+        // the body, and a value from the buffer's last byte on.
+        onInPlace("response_in_place_value_in_room", .value_in_room, .trips),
+        onInPlace("response_in_place_value_in_body", .value_in_body, .trips),
+        onInPlace("response_in_place_name_in_body", .name_in_body, .trips),
+        onInPlace("response_in_place_value_straddles_end", .value_straddles_end, .trips),
+        // Controls: the bounds met exactly, with a body that ends the buffer and with an empty
+        // body at the buffer's end, and a body inside every bound. Each must write the exact
+        // response.
+        onInPlace("response_in_place_exact_fit", .exact_fit, .finishes),
+        onInPlace("response_in_place_empty_at_buffer_end", .empty_at_buffer_end, .finishes),
+        onInPlace("response_in_place_inside_bounds", .inside_bounds, .finishes),
+        // Controls: a header value right before the buffer, and right after it.
+        onInPlace("response_in_place_value_before_buffer", .value_before_buffer, .finishes),
+        onInPlace("response_in_place_value_after_buffer", .value_after_buffer, .finishes),
+    };
 };
 
 /// The index of the case with exactly this name, or null.
@@ -575,6 +611,10 @@ pub const bad_arguments = [_]BadArguments{
 pub const bad_arguments_max: u32 = 10;
 
 comptime {
+    // Each `find` compares a name against every case: with names under 64 bytes, at most
+    // 64 branches a case, for each bad list.
+    @setEvalBranchQuota(64 * cases_max * bad_arguments_max);
+    for (cases) |case| assert(case.name.len < 64);
     assert(bad_arguments.len > 0);
     assert(bad_arguments.len <= bad_arguments_max);
     // Each list really names no case: one argument that matches a case would make that

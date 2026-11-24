@@ -100,6 +100,19 @@
 //! room's size), so a check made one byte too strict trips one of them; a third sits one
 //! byte inside the room and one byte short of the buffer's end, so a check tightened to
 //! equality trips it.
+//!
+//! `writeInPlace` also asserts that no header name or value shares a byte with the buffer,
+//! since a field there would change while it is copied. Four trip cases meet every bound
+//! exactly and move one field into the buffer: a value over the body, a name over the
+//! body, and a value from the buffer's last byte on past its end. The room's cursor never
+//! sees any of these, so only the buffer-wide check for that field can stop each one;
+//! without it, the call writes and returns (exit 2). A test that the field lies wholly
+//! inside the buffer, rather than shares a byte with it, lets the straddling value through.
+//! The fourth case puts a value in the room the head is written into; the room's cursor
+//! asserts against that too, so it pins neither check alone, only both together. Two
+//! controls put the value right before the buffer and right after it, so an overlap check
+//! one byte too wide trips one. The cases can't see when the fields are checked, before
+//! the head is written or after: the head never writes over a field that passes.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -134,6 +147,9 @@ comptime {
     for (codes, 0..) |a, i| {
         for (codes[i + 1 ..]) |b| assert(a != b);
     }
+    // Every case's checks below run at compile time: under 50 branches each today (the
+    // 101-case list needs more than the default 1,000), so 100 a case leaves room.
+    @setEvalBranchQuota(100 * trip.cases_max);
     // Every case is checked here, not just the one a run picks: the running phase forbids
     // every call, so a running case that doesn't trip is a mistake in the list, and every
     // control's call needs an expectation in `bytesExpected`.
@@ -1504,12 +1520,20 @@ comptime {
     assert(response_expected.len - response_body.len < http_response.head_room - 1);
     // The fill byte is in none of the bytes the control writes, so a moved byte would show.
     assert(std.mem.findScalar(u8, response_expected, response_fill) == null);
-    // Each trip case breaks exactly one of the writer's three preconditions, and a control
-    // breaks none. Checked here once for every call, not again in each run.
+    // Each trip case breaks exactly one precondition, a bound or a value outside the
+    // buffer, and a control breaks none. Checked here once for every call, not again in
+    // each run.
     for (std.enums.values(trip.InPlaceCall)) |call| {
         const broken = inPlaceBoundsBroken(inPlaceShape(call));
-        assert(broken == @intFromBool(!inPlaceCallAllowed(call)));
+        const field_inside = if (inPlaceFieldAt(call)) |at| @intFromBool(at.inside()) else 0;
+        assert(broken + field_inside == @intFromBool(!inPlaceCallAllowed(call)));
     }
+    // The room case's value lies wholly inside the room, `response_margin` bytes clear of
+    // the body; the controls' values fit the margins either side of the buffer; and the
+    // value's bytes, lowercase letters, also make a valid name, so only the overlap check can refuse a field.
+    assert(http_response.head_room >= 2 * response_margin + response_value.len);
+    assert(response_value.len <= response_margin);
+    for (response_value) |byte| assert(std.ascii.isLower(byte));
 }
 
 /// Whether the in-place writer allows `call`: the controls. The cases file says the same
@@ -1517,7 +1541,15 @@ comptime {
 fn inPlaceCallAllowed(call: trip.InPlaceCall) bool {
     const allowed = switch (call) {
         .exact_fit, .empty_at_buffer_end, .inside_bounds => true,
-        .offset_past_room, .body_past_end, .offset_past_buffer => false,
+        .value_before_buffer, .value_after_buffer => true,
+        .offset_past_room,
+        .body_past_end,
+        .offset_past_buffer,
+        .value_in_room,
+        .value_in_body,
+        .value_straddles_end,
+        .name_in_body,
+        => false,
     };
     const shape = inPlaceShape(call);
     // A control's body is the whole fixed body or none, so its exact output is known.
@@ -1541,13 +1573,64 @@ fn inPlaceShape(call: trip.InPlaceCall) InPlaceShape {
         .offset_past_room => .{ .buffer_len = full, .body_offset = room + 1, .body_len = body - 1 },
         .body_past_end => .{ .buffer_len = full, .body_offset = room, .body_len = body + 1 },
         .offset_past_buffer => .{ .buffer_len = room - 1, .body_offset = room, .body_len = 0 },
-        .exact_fit => .{ .buffer_len = full, .body_offset = room, .body_len = body },
+        .exact_fit,
+        .value_in_room,
+        .value_in_body,
+        .value_straddles_end,
+        .name_in_body,
+        .value_before_buffer,
+        .value_after_buffer,
+        => .{ .buffer_len = full, .body_offset = room, .body_len = body },
         .empty_at_buffer_end => .{ .buffer_len = room, .body_offset = room, .body_len = 0 },
         .inside_bounds => .{ .buffer_len = full, .body_offset = room - 1, .body_len = body },
     };
     assert(shape.buffer_len <= full);
     assert(shape.body_offset <= room + 1);
     return shape;
+}
+
+/// Where an in-place case puts its header field: which of the field's two slices moves,
+/// and where its bytes start in the storage array (whose buffer starts at
+/// `response_margin`). The other cases pass the fixed name and value, outside the array.
+const FieldAt = struct {
+    field: enum { name, value },
+    start: u32,
+    len: u32,
+
+    /// Whether the field shares a byte with the full-size buffer.
+    fn inside(at: FieldAt) bool {
+        const buffer_end: u32 = response_margin + in_place_buffer_len;
+        assert(at.len > 0);
+        assert(at.start + at.len <= in_place_storage_len);
+        return at.start < buffer_end and response_margin < at.start + at.len;
+    }
+};
+
+fn inPlaceFieldAt(call: trip.InPlaceCall) ?FieldAt {
+    const len: u32 = response_value.len;
+    // Where the room ends and the body begins, in the storage array.
+    const body_start: u32 = response_margin + http_response.head_room;
+    const buffer_end: u32 = response_margin + in_place_buffer_len;
+    const at: ?FieldAt = switch (call) {
+        // The last bytes of the room but `response_margin`: where the head is moved up to.
+        .value_in_room => .{ .field = .value, .start = body_start - response_margin - len, .len = len },
+        .value_in_body => .{ .field = .value, .start = body_start, .len = len },
+        .name_in_body => .{ .field = .name, .start = body_start, .len = len },
+        .value_straddles_end => .{ .field = .value, .start = buffer_end - 1, .len = len },
+        .value_before_buffer => .{ .field = .value, .start = response_margin - len, .len = len },
+        .value_after_buffer => .{ .field = .value, .start = buffer_end, .len = len },
+        .offset_past_room,
+        .body_past_end,
+        .offset_past_buffer,
+        .exact_fit,
+        .empty_at_buffer_end,
+        .inside_bounds,
+        => null,
+    };
+    // Only a full-size buffer has the room and the body these places are counted from.
+    assert(at == null or inPlaceShape(call).buffer_len == in_place_buffer_len);
+    assert(at == null or at.?.start + at.?.len <= in_place_storage_len);
+    return at;
 }
 
 /// How many of `writeInPlace`'s three preconditions `shape` breaks: the offset at most the
@@ -1578,7 +1661,18 @@ fn runInPlaceCase(startup: *cc.StartupAllocator, call: trip.InPlaceCall, case: t
     if (shape.body_len > 0 and shape.body_offset + shape.body_len <= shape.buffer_len) {
         @memcpy(buffer[shape.body_offset..][0..shape.body_len], response_body[0..shape.body_len]);
     }
-    const headers = [_]http_response.Header{.{ .name = response_name, .value = response_value }};
+    var name: []const u8 = response_name;
+    var value: []const u8 = response_value;
+    if (inPlaceFieldAt(call)) |at| {
+        // The value's bytes, wherever the case puts the field, over the body if it is there.
+        const bytes = storage[at.start..][0..at.len];
+        @memcpy(bytes, response_value);
+        switch (at.field) {
+            .name => name = bytes,
+            .value => value = bytes,
+        }
+    }
+    const headers = [_]http_response.Header{.{ .name = name, .value = value }};
     const response: http_response.InPlace = .{
         .status = .ok,
         .headers = &headers,
