@@ -56,8 +56,15 @@
 //! when the first fails with `PeerDown`), so it is an error to handle, not a bug: the
 //! caller stops sending on that connection and releases it after its last completion. A
 //! send to a client that stops reading never completes on its own, so the caller first
-//! drops the connection through the I/O type (`io.real.Real.drop`), which fails every send
-//! still pending on its socket.
+//! drops the connection through the I/O type (`drop` in the I/O contract), which fails
+//! every send still pending on its socket.
+//!
+//! Failed drops: a drop can fail (an errno shutdown(2) doesn't document), leaving the sends
+//! pending. The I/O type counts each failure on the entry (`dropFailed`) and asks the entry
+//! before each drop (`dropAdmit`); once `constants.io_drop_attempts_max` have failed, both
+//! return `error.DropsExhausted`, so a socket that keeps failing can't be retried for ever.
+//! The real type and the simulator make the same two calls. `release` clears the count, so
+//! a reused entry starts with none.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -106,6 +113,9 @@ pub const ReleaseError = error{SendsInFlight};
 /// Sends in flight on one connection. Never more than the I/O type has slots for.
 pub const SendCount = u16;
 
+/// Failed drops of one connection. Never more than `constants.io_drop_attempts_max`.
+pub const DropCount = u8;
+
 pub const InitError = error{OutOfMemory};
 
 /// Where a connection is in its request and response.
@@ -130,6 +140,9 @@ pub const Entry = struct {
     /// Sends submitted on this connection whose completions haven't come back. Zero
     /// whenever `state` is `free`: `release` refuses while it is above zero.
     sends_in_flight: SendCount = 0,
+    /// Drops of this connection that failed, leaving its sends pending. Zero whenever
+    /// `state` is `free`: `release` clears it.
+    drops_failed: DropCount = 0,
 };
 
 /// Bytes of table state one connection costs: its entry plus its slot on the free stack.
@@ -154,6 +167,8 @@ comptime {
     assert(releases_per_wrap / releases_per_year >= generation_wrap_years_min);
     // Every operation in flight could be a send on one connection; its count still fits.
     assert(constants.io_operations_in_flight_max <= std.math.maxInt(SendCount));
+    // Every failed drop the bound allows fits an entry's count.
+    assert(constants.io_drop_attempts_max <= std.math.maxInt(DropCount));
 }
 
 pub const Table = struct {
@@ -227,6 +242,7 @@ pub const Table = struct {
         assert(entry.scan.resume_at == 0); // release empties the scan of every entry it frees.
         assert(entry.socket == -1); // release clears the socket of every entry it frees.
         assert(entry.sends_in_flight == 0); // release refuses an entry with sends in flight.
+        assert(entry.drops_failed == 0); // release clears the failed drops of every entry.
         entry.socket = socket;
         entry.state = .reading;
         const id: PeerId = @bitCast(IdParts{ .index = index, .generation = entry.generation });
@@ -324,6 +340,29 @@ pub const Table = struct {
         entry.sends_in_flight -= 1;
     }
 
+    /// Refuses a drop of `id`'s connection, which must be live, with `error.DropsExhausted`
+    /// once `constants.io_drop_attempts_max` of its drops have failed. Changes nothing. The
+    /// I/O type calls it before it tries the drop.
+    pub fn dropAdmit(self: *const Table, id: PeerId) io.DropError!void {
+        const entry = &self.entries[self.liveIndex(id)];
+        assert(entry.socket >= 0);
+        // dropFailed counts no failure past the bound.
+        assert(entry.drops_failed <= constants.io_drop_attempts_max);
+        if (entry.drops_failed == constants.io_drop_attempts_max) return error.DropsExhausted;
+    }
+
+    /// Counts a failed drop of `id`'s connection, which must be live and admitted by
+    /// `dropAdmit`; returns `error.DropsExhausted` when that failure was the last one allowed,
+    /// so the caller learns at once that it must cancel instead.
+    pub fn dropFailed(self: *Table, id: PeerId) io.DropError!void {
+        const entry = &self.entries[self.liveIndex(id)];
+        assert(entry.socket >= 0);
+        // dropAdmit refused a drop past the bound, so no failure is counted past it.
+        assert(entry.drops_failed < constants.io_drop_attempts_max);
+        entry.drops_failed += 1;
+        if (entry.drops_failed == constants.io_drop_attempts_max) return error.DropsExhausted;
+    }
+
     /// The index of `id`'s entry, checking that `id` is live: inside the table, naming an
     /// entry in use, and carrying that entry's generation. For callers holding a live id;
     /// completions, which may hold a stale one, go through `lookup`.
@@ -349,6 +388,7 @@ pub const Table = struct {
             assert(self.entries[index].scan.resume_at == 0); // A free entry holds no scan.
             assert(self.entries[index].socket == -1);
             assert(self.entries[index].sends_in_flight == 0); // release refuses those.
+            assert(self.entries[index].drops_failed == 0); // release clears them.
             assert(!stacked.isSet(index)); // An index on the free stack twice.
             stacked.set(index);
         }
@@ -921,6 +961,46 @@ test "connections: a generation wraps to zero, and only the newest id is live" {
     try testing.expectEqual(@as(?*const Entry, null), table.lookup(before_wrap));
 
     _ = try table.release(id);
+    startup.beginShutdown();
+    table.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "connections: failed drops are counted to the bound, per connection, and release clears them" {
+    var startup = StartupAllocator.init(testing.allocator, 2 * entry_bytes);
+    const gpa = startup.allocator();
+    var table = try Table.init(gpa, 2);
+    startup.finishStartup();
+
+    const failing = try table.acquire(10);
+    const other = try table.acquire(11);
+    const bound = constants.io_drop_attempts_max;
+    var failures: DropCount = 0;
+    // Every failure before the last is admitted again; the last says so at once.
+    while (failures < bound - 1) : (failures += 1) {
+        try table.dropAdmit(failing);
+        try table.dropFailed(failing);
+    }
+    try table.dropAdmit(failing);
+    try testing.expectError(error.DropsExhausted, table.dropFailed(failing));
+    try testing.expectEqual(@as(DropCount, bound), table.get(failing).drops_failed);
+    // From then on every drop is refused, and the refusal changes nothing.
+    const entry_before = table.get(failing).*;
+    try testing.expectError(error.DropsExhausted, table.dropAdmit(failing));
+    try testing.expectEqual(entry_before, table.get(failing).*);
+    // The other connection's count is its own.
+    try table.dropAdmit(other);
+    try testing.expectEqual(@as(DropCount, 0), table.get(other).drops_failed);
+
+    // A reused entry starts with no failed drops.
+    try testing.expectEqual(@as(Socket, 10), try table.release(failing));
+    const reused = try table.acquire(12);
+    try testing.expectEqual(@as(DropCount, 0), table.get(reused).drops_failed);
+    try table.dropAdmit(reused);
+    table.assertInvariants();
+
+    _ = try table.release(reused);
+    _ = try table.release(other);
     startup.beginShutdown();
     table.deinit(gpa);
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);

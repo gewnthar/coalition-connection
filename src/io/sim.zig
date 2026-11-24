@@ -6,12 +6,14 @@
 //! contract names, and short sends, are drawn from a seeded PRNG and counted. A failing seed
 //! replays exactly.
 //!
-//! Three seeded streams keep each kind of draw independent of the others:
+//! Five seeded streams keep each kind of draw independent of the others:
 //!   outcomes   each operation's delay and result, drawn when it is submitted
 //!   schedule   which free slot an operation takes and where each poll starts its scan
 //!   random     the bytes `randomBytes` hands out
-//! So how often a workload polls, or how many nonces it draws, never changes which
-//! operations fail.
+//!   stick      whether a send sticks, drawn for every send while sticking is on
+//!   drops      which drops fail, and how a drop ends each pending send
+//! So how often a workload polls, how many nonces it draws, or when it drops a connection
+//! never changes any operation's own drawn result, or which sends stick by draw.
 //!
 //! Accepts: an accept's delay is the wait for a connection to arrive. When it completes, the
 //! arrival takes an entry in the connection table attached with `attachTable`, under a fake
@@ -30,6 +32,18 @@
 //! (`Table.sendSubmitted`) until its completion uncounts it (`Table.sendCompleted`), so the
 //! table refuses to release that entry with `error.SendsInFlight` meanwhile. Code that
 //! releases early or sends on a stale id fails in simulation, not first on the real type.
+//!
+//! Sticking and dropping: after `setDropFaults`, each send may stick, drawn at submit: it
+//! never completes on its own, as a send to a client that stopped reading never does on the
+//! real type, and every later send to that connection sticks too. `drop` ends it as the real type's shutdown does: every stuck send to that
+//! connection completes with `error.PeerDown` within the longest delay, every send to it
+//! still pending ends that way or keeps its own result (drawn), and every send submitted to
+//! it afterwards completes with `error.PeerDown`. A drop can fail, drawn too, leaving the
+//! sends stuck; once one has worked, dropping again changes nothing and never fails, as a
+//! second shutdown on the real type returns success or ENOTCONN. Each drop goes through the table's `dropAdmit` and each failure through its
+//! `dropFailed`, the calls the real type makes, so `error.DropsExhausted` comes at the same
+//! count. A connection the table has since released and handed out again is a new one: its
+//! id carries the entry's next generation, so the drop of the old one doesn't reach it.
 //!
 //! Inputs: a seed, a fault rate in percent (at most `constants.sim_fault_percent_max`) and,
 //! for sends and accepts, a connection table.
@@ -64,6 +78,18 @@ const arrivals_max: u64 = std.math.maxInt(io.Socket) - socket_first;
 /// Salts that separate the schedule and random streams from the outcome stream.
 const schedule_salt: u64 = 0x9e37_79b9_7f4a_7c15;
 const random_salt: u64 = 0xc2b2_ae3d_27d4_eb4f;
+const drop_salt: u64 = 0x1656_67b1_9e37_79f9;
+const stick_salt: u64 = 0x27d4_eb2f_1656_67c5;
+
+/// An entry's slot in `Sim.dropped_ids` when no drop of it has worked: index 0xffff, past
+/// any table, so it never equals a live id.
+const no_drop: io.PeerId = std.math.maxInt(io.PeerId);
+
+comptime {
+    // The sentinel's index is past every entry the table may have.
+    const parts: connections.IdParts = @bitCast(no_drop);
+    assert(parts.index >= constants.http_connections_max);
+}
 
 /// Faults injected so far, one counter per error the contract names.
 pub const Faults = struct {
@@ -104,13 +130,33 @@ const Slot = struct {
     drawn: Drawn,
     /// Hash of the operation's bytes at submit; they must be unchanged at completion.
     bytes_hash: u64,
+    /// A send that completes only once its connection is dropped; `due_tick` waits till then.
+    stuck: bool = false,
+    /// A send whose connection was dropped: it completes with `error.PeerDown`, counted in
+    /// `sends_dropped`, not as an injected fault.
+    by_drop: bool = false,
 };
 
 pub const Sim = struct {
     outcomes: std.Random.DefaultPrng,
     schedule: std.Random.DefaultPrng,
     random_source: std.Random.DefaultPrng,
+    stick_source: std.Random.DefaultPrng,
+    drop_source: std.Random.DefaultPrng,
     fault_percent: u8,
+    /// Chance, in percent, that a send sticks until its connection is dropped.
+    stick_percent: u8,
+    /// Chance, in percent, that a drop fails and leaves its connection's sends stuck.
+    drop_fail_percent: u8,
+    /// By entry index, the id of the connection whose drop last worked, or `no_drop`. Only
+    /// an equal id counts as dropped, so a reused entry starts undropped.
+    dropped_ids: [constants.http_connections_max]io.PeerId,
+    /// Sends that stuck, sends a drop ended with PeerDown, drops tried (failed or not, as
+    /// the real type counts its shutdowns) and drops that failed.
+    sends_stuck: u32,
+    sends_dropped: u32,
+    dropped: u64,
+    drops_failed: u64,
     ticks: u32,
     now_ns: io.Instant,
     slots: [slots_count]?Slot,
@@ -143,7 +189,16 @@ pub const Sim = struct {
             .outcomes = .init(seed),
             .schedule = .init(seed ^ schedule_salt),
             .random_source = .init(seed ^ random_salt),
+            .stick_source = .init(seed ^ stick_salt),
+            .drop_source = .init(seed ^ drop_salt),
             .fault_percent = fault_percent,
+            .stick_percent = 0,
+            .drop_fail_percent = 0,
+            .dropped_ids = @splat(no_drop),
+            .sends_stuck = 0,
+            .sends_dropped = 0,
+            .dropped = 0,
+            .drops_failed = 0,
             .ticks = 0,
             .now_ns = 0,
             .slots = @splat(null),
@@ -177,6 +232,18 @@ pub const Sim = struct {
         self.table = table;
     }
 
+    /// Lets sends stick and drops fail, each at its chance in percent: sticking at most
+    /// `constants.sim_fault_percent_max`, failing drops at most 100, so a test can make
+    /// every drop fail and reach the bound. Call it before the first submission, so a seed
+    /// replays the same run; both start at 0, and then nothing sticks or fails to drop.
+    pub fn setDropFaults(self: *Sim, stick_percent: u8, drop_fail_percent: u8) void {
+        assert(self.submitted == 0);
+        assert(stick_percent <= constants.sim_fault_percent_max);
+        assert(drop_fail_percent <= 100);
+        self.stick_percent = stick_percent;
+        self.drop_fail_percent = drop_fail_percent;
+    }
+
     /// Advances simulated time by one tick.
     pub fn tick(self: *Sim) void {
         assert(self.ticks < constants.sim_ticks_max);
@@ -198,7 +265,8 @@ pub const Sim = struct {
     /// accept while the wait after a Backpressure runs `error.AcceptTooSoon`, as on the real
     /// type, in that order when more than one holds; each draws nothing and takes no slot,
     /// and only the last changes a count, the wait's refusals. An id already in flight
-    /// breaks the contract and crashes, full table or not.
+    /// breaks the contract and crashes, full table or not. The one exception to the delay:
+    /// a send that sticks (`setDropFaults`) completes only once its connection is dropped.
     pub fn submit(self: *Sim, submission: io.Submission) io.SubmitError!void {
         comptime assertSimulationAllowed();
         assert(self.in_flight <= slots_count);
@@ -222,12 +290,12 @@ pub const Sim = struct {
         // Never due after the run's last tick, so every accepted operation can complete.
         const due_tick = @min(self.ticks + delay, constants.sim_ticks_max);
         assert(due_tick >= self.ticks);
-        self.slots[index] = .{
+        self.slots[index] = self.fated(.{
             .submission = submission,
             .due_tick = due_tick,
             .drawn = self.draw(submission.operation),
             .bytes_hash = hashOperation(submission.operation),
-        };
+        });
         self.in_flight += 1;
         self.share.taken(submission.operation);
         if (submission.operation == .send) self.sends_in_flight += 1;
@@ -268,7 +336,7 @@ pub const Sim = struct {
         while (step < slots_count and count < completions.len) : (step += 1) {
             const index = (start + step) % slots_count;
             const slot = self.slots[index] orelse continue;
-            if (slot.due_tick > self.ticks) continue;
+            if (slot.stuck or slot.due_tick > self.ticks) continue;
             self.slots[index] = null;
             completions[count] = self.complete(slot);
             count += 1;
@@ -291,6 +359,155 @@ pub const Sim = struct {
         self.random_source.random().bytes(buffer);
         self.random_bytes += drawn;
         assert(self.random_bytes == before + drawn);
+    }
+
+    /// Drops `peer`'s connection, which must be live, as the real type's shutdown does: see
+    /// "Sticking and dropping" above. Takes no slot and completes nothing itself. A drawn
+    /// failure leaves every send as it was and counts on the entry; the failure that reaches
+    /// `constants.io_drop_attempts_max`, and every drop after it, returns
+    /// `error.DropsExhausted`, the later ones drawing nothing.
+    pub fn drop(self: *Sim, peer: io.PeerId) io.DropError!void {
+        comptime assertSimulationAllowed();
+        assert(self.table != null); // Only a connection in a table can be dropped.
+        const table = self.table.?;
+        const entry = table.get(peer);
+        // The checks the real type makes: every send counted on the entry is in flight here.
+        assert(entry.sends_in_flight <= self.sends_in_flight);
+        assert(self.sends_in_flight <= self.in_flight);
+        try table.dropAdmit(peer);
+        self.dropped += 1;
+        // Shut down already: on the real type a second shutdown returns success or
+        // ENOTCONN, neither a failure, and every send was settled by the first.
+        if (self.isDropped(peer)) return;
+        if (self.chance(self.drop_fail_percent)) {
+            self.drops_failed += 1;
+            return table.dropFailed(peer);
+        }
+        const parts: connections.IdParts = @bitCast(peer);
+        self.dropped_ids[parts.index] = peer;
+        self.endSends(peer);
+        // Nothing sent to a dropped connection waits any more.
+        assert(self.stuckSendsTo(peer) == 0);
+    }
+
+    /// Ends the sends to a just dropped `peer`: each stuck one completes with PeerDown
+    /// within the longest delay, capped at the run's last tick; each one still pending
+    /// either keeps its own result or completes with PeerDown on its own tick, drawn. One
+    /// due already had finished before the drop, and keeps its result. At most
+    /// `slots_count` steps.
+    fn endSends(self: *Sim, peer: io.PeerId) void {
+        assert(self.isDropped(peer));
+        const ended_before = self.sendsEndedBy(peer);
+        var index: u32 = 0;
+        while (index < slots_count) : (index += 1) {
+            const slot = if (self.slots[index]) |*slot| slot else continue;
+            if (slot.submission.operation != .send) continue;
+            if (slot.submission.operation.send.peer != peer) continue;
+            if (slot.stuck) {
+                const delay = self.drop_source.random().uintAtMost(u32, constants.sim_completion_delay_ticks_max);
+                slot.due_tick = @min(self.ticks + delay, constants.sim_ticks_max);
+                slot.stuck = false;
+            } else if (slot.by_drop or slot.due_tick <= self.ticks or self.drop_source.random().boolean()) {
+                continue;
+            }
+            slot.drawn = .{ .send = error.PeerDown };
+            slot.by_drop = true;
+        }
+        assert(index == slots_count);
+        // A drop only ever adds sends it ends, never takes one back.
+        assert(self.sendsEndedBy(peer) >= ended_before);
+    }
+
+    /// Sends in flight to `peer` that a drop has ended. At most `slots_count` steps.
+    fn sendsEndedBy(self: *const Sim, peer: io.PeerId) u32 {
+        assert(self.table != null);
+        var ended: u32 = 0;
+        for (self.slots) |maybe| {
+            const slot = maybe orelse continue;
+            if (slot.by_drop and slot.submission.operation.send.peer == peer) ended += 1;
+        }
+        // Each is a send in flight, counted on the peer's entry.
+        assert(ended <= self.table.?.get(peer).sends_in_flight);
+        return ended;
+    }
+
+    /// Whether `peer`'s connection has been dropped, a drop of it having worked.
+    fn isDropped(self: *const Sim, peer: io.PeerId) bool {
+        const parts: connections.IdParts = @bitCast(peer);
+        assert(parts.index < constants.http_connections_max);
+        const dropped_id = self.dropped_ids[parts.index];
+        // Only a working drop records an id, and only its entry's own index.
+        assert(dropped_id == no_drop or @as(connections.IdParts, @bitCast(dropped_id)).index == parts.index);
+        return dropped_id == peer;
+    }
+
+    /// Sends in flight that are stuck. At most `slots_count` steps.
+    fn stuckSends(self: *const Sim) u32 {
+        var stuck: u32 = 0;
+        for (self.slots) |maybe| {
+            const slot = maybe orelse continue;
+            if (slot.stuck) stuck += 1;
+        }
+        assert(stuck <= self.sends_in_flight);
+        assert(stuck <= self.sends_stuck);
+        return stuck;
+    }
+
+    /// Stuck sends in flight to `peer`. At most `slots_count` steps.
+    fn stuckSendsTo(self: *const Sim, peer: io.PeerId) u32 {
+        assert(self.table != null); // Sends name peers in a table.
+        var stuck: u32 = 0;
+        for (self.slots) |maybe| {
+            const slot = maybe orelse continue;
+            if (slot.stuck and slot.submission.operation.send.peer == peer) stuck += 1;
+        }
+        assert(stuck <= self.table.?.get(peer).sends_in_flight);
+        return stuck;
+    }
+
+    /// A new slot as its connection's state leaves it: a send to a dropped connection is
+    /// PeerDown; a send to a connection with a send stuck already sticks too, as every
+    /// later send on a socket whose client stopped reading waits on the real type; any
+    /// other send sticks at the drawn chance. The stick roll comes from its own stream,
+    /// drawn for every send while sticking is on, so neither drops nor other connections'
+    /// states change which sends stick.
+    fn fated(self: *Sim, slot: Slot) Slot {
+        var result = slot;
+        const send = switch (slot.submission.operation) {
+            .send => |send| send,
+            .execute, .accept => return result,
+        };
+        const stuck_before = self.sends_stuck;
+        const rolled = self.stickRoll();
+        if (self.isDropped(send.peer)) {
+            result.drawn = .{ .send = error.PeerDown };
+            result.by_drop = true;
+        } else if (rolled or self.stuckSendsTo(send.peer) > 0) {
+            result.stuck = true;
+            self.sends_stuck += 1;
+        }
+        assert(result.by_drop == self.isDropped(send.peer));
+        assert(self.sends_stuck == stuck_before + @intFromBool(result.stuck));
+        return result;
+    }
+
+    /// One roll of the stick stream at `stick_percent`; draws nothing while it is 0, so a
+    /// run that never sticks leaves the stream untouched.
+    fn stickRoll(self: *Sim) bool {
+        assert(self.stick_percent <= constants.sim_fault_percent_max);
+        if (self.stick_percent == 0) return false;
+        const roll = self.stick_source.random().uintLessThan(u8, 100);
+        assert(roll < 100);
+        return roll < self.stick_percent;
+    }
+
+    /// One roll of the drop stream at `percent`, at most 100; draws nothing at 0.
+    fn chance(self: *Sim, percent: u8) bool {
+        assert(percent <= 100);
+        if (percent == 0) return false;
+        const roll = self.drop_source.random().uintLessThan(u8, 100);
+        assert(roll < 100);
+        return roll < percent;
     }
 
     /// The contract says ids in flight are distinct, so a caller that reuses one has a bug:
@@ -397,7 +614,11 @@ pub const Sim = struct {
                 const sends_before = table.get(send.peer).sends_in_flight;
                 table.sendCompleted(send.peer);
                 assert(table.get(send.peer).sends_in_flight == sends_before - 1);
-                self.countSend(sent, send);
+                if (slot.by_drop) {
+                    // A drop ends a send only with PeerDown, never with bytes sent.
+                    assert(std.meta.isError(sent));
+                    self.sends_dropped += 1;
+                } else self.countSend(sent, send);
                 break :sent .{ .send = sent };
             },
             .execute => |executed| executed: {
@@ -1386,5 +1607,372 @@ test "sim: seeded sends, releases and reconnects keep the table's counts with th
         try testing.expect(counts.releases_refused > 0);
         try testing.expect(counts.reconnects > 0);
         try testing.expectEqual(counts, try sendSoak(seed));
+    }
+}
+
+/// Submits sends of "stuck?" to `peer` from id `first` until one sticks, at most `tries`,
+/// and returns its id. Fails the test if none sticks.
+fn submitUntilStuck(sim: *Sim, peer: io.PeerId, first: io.OperationId, tries: u32) !io.OperationId {
+    assert(sim.stick_percent > 0);
+    assert(tries <= shared_slots_max);
+    var id = first;
+    while (id < first + tries) : (id += 1) {
+        const stuck_before = sim.sends_stuck;
+        try sim.submit(.{ .id = id, .operation = .{ .send = .{ .peer = peer, .bytes = "stuck?" } } });
+        if (sim.sends_stuck > stuck_before) return id;
+    }
+    return error.TestNothingStuck;
+}
+
+test "sim: a stuck send completes only once its connection is dropped, then with PeerDown" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(31, 0);
+    sim.setDropFaults(constants.sim_fault_percent_max, 0);
+    sim.attachTable(&fixture.table);
+    const peer: io.PeerId = 2;
+    const stuck_id = try submitUntilStuck(&sim, peer, 0, 32);
+    var completions: [slots_count]io.Completion = undefined;
+    var ticks: u32 = 0;
+    var done: u32 = 0;
+    // Far past the longest delay, only the stuck send is left, still holding its entry.
+    while (ticks < 4 * constants.sim_completion_delay_ticks_max) : (ticks += 1) {
+        sim.tick();
+        done += sim.poll(completions[done..]);
+    }
+    for (completions[0..done]) |completion| try testing.expect(completion.id != stuck_id);
+    try testing.expectEqual(sim.stuckSends(), sim.in_flight);
+    try testing.expect(sim.in_flight >= 1);
+    try testing.expectError(error.SendsInFlight, fixture.table.release(peer));
+
+    try sim.drop(peer);
+    try testing.expectEqual(@as(u32, 0), sim.stuckSends());
+    // A send after the drop can't stick or succeed either.
+    try sim.submit(.{ .id = 100, .operation = .{ .send = .{ .peer = peer, .bytes = "late" } } });
+    const pending = sim.in_flight;
+    try testing.expectEqual(pending, drainAll(&sim, completions[0..pending]));
+    for (completions[0..pending]) |completion| try testing.expectError(error.PeerDown, completion.result.send);
+    try testing.expectEqual(pending, sim.sends_dropped);
+    // Ended by the drop, not injected: no fault is counted.
+    try testing.expectEqual(@as(u64, 0), sim.faults.total());
+    try testing.expectEqual(@as(u64, 1), sim.dropped);
+    try testing.expectEqual(peerSocket(2), try fixture.table.release(peer));
+    _ = try fixture.table.acquire(peerSocket(2));
+}
+
+test "sim: a drop reaches only its connection, and a reused entry starts undropped" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(32, 0);
+    sim.attachTable(&fixture.table);
+    try sim.submit(.{ .id = 1, .operation = .{ .send = .{ .peer = 4, .bytes = "other" } } });
+    try sim.drop(5);
+    // Dropping again works and changes nothing more.
+    try sim.drop(5);
+    try testing.expectEqual(@as(u64, 2), sim.dropped);
+    var completions: [2]io.Completion = undefined;
+    try testing.expectEqual(@as(u32, 1), drainAll(&sim, completions[0..1]));
+    try testing.expectEqual(@as(u32, 5), try completions[0].result.send);
+
+    // The entry, released and taken again, carries its next generation: not dropped.
+    try testing.expectEqual(peerSocket(5), try fixture.table.release(5));
+    const reused = try fixture.table.acquire(peerSocket(5));
+    const parts: connections.IdParts = @bitCast(reused);
+    try testing.expectEqual(@as(connections.Index, 5), parts.index);
+    try testing.expect(!sim.isDropped(reused));
+    try sim.submit(.{ .id = 2, .operation = .{ .send = .{ .peer = reused, .bytes = "new" } } });
+    try testing.expectEqual(@as(u32, 1), drainAll(&sim, completions[0..1]));
+    try testing.expectEqual(@as(u32, 3), try completions[0].result.send);
+    try testing.expectEqual(@as(u32, 0), sim.sends_dropped);
+    try testing.expectEqual(peerSocket(5), try fixture.table.release(reused));
+    _ = try fixture.table.acquire(peerSocket(5));
+}
+
+test "sim: drops draw only from their own stream, and never change what sticks" {
+    // A table each, as each simulator counts its sends on its own entries.
+    var plain_fixture: TableFixture = undefined;
+    try plain_fixture.setUpPeers(test_peers);
+    defer plain_fixture.tearDown();
+    var dropping_fixture: TableFixture = undefined;
+    try dropping_fixture.setUpPeers(test_peers);
+    defer dropping_fixture.tearDown();
+    var plain = Sim.init(33, 20);
+    var dropping = Sim.init(33, 20);
+    // A low stick rate, so when each connection's first send sticks is what a leak changes.
+    plain.setDropFaults(10, constants.sim_fault_percent_max);
+    dropping.setDropFaults(10, constants.sim_fault_percent_max);
+    plain.attachTable(&plain_fixture.table);
+    dropping.attachTable(&dropping_fixture.table);
+    var id: io.OperationId = 0;
+    var drops_drew = false;
+    while (id < 128) : (id += 1) {
+        // Sends to the even-numbered peers and statements; peer 2 is dropped midway, with
+        // sends pending and stuck, and dropped again every fourth submission after.
+        if (id >= 24 and id % 4 == 0) {
+            const drops_before = dropping.drop_source.s;
+            dropping.drop(2) catch |err| switch (err) {
+                error.DropsExhausted => {},
+            };
+            if (!std.meta.eql(drops_before, dropping.drop_source.s)) drops_drew = true;
+        }
+        const plain_stuck = plain.sends_stuck;
+        const dropping_stuck = dropping.sends_stuck;
+        try plain.submit(testSubmission(id));
+        try dropping.submit(testSubmission(id));
+        // Each send to a connection nothing drops sticks in both runs or in neither.
+        const to_peer_2 = id % 2 == 0 and id % test_peers == 2;
+        if (!to_peer_2) {
+            try testing.expectEqual(plain.sends_stuck - plain_stuck, dropping.sends_stuck - dropping_stuck);
+        }
+        try testing.expectEqual(plain.outcomes.s, dropping.outcomes.s);
+        try testing.expectEqual(plain.stick_source.s, dropping.stick_source.s);
+        try testing.expectEqual(plain.schedule.s, dropping.schedule.s);
+    }
+    try testing.expect(drops_drew);
+    try testing.expect(dropping.sends_stuck > 0);
+    try testing.expectEqual(plain.submitted, dropping.submitted);
+    // Only peer 2's sends differ: every other peer has the same sends stuck in both runs.
+    var peer: io.PeerId = 0;
+    while (peer < test_peers) : (peer += 2) {
+        if (peer == 2) continue;
+        try testing.expectEqual(plain.stuckSendsTo(peer), dropping.stuckSendsTo(peer));
+    }
+    try testing.expectEqual(test_peers, peer);
+}
+
+// Every drop of a connection with a stuck send fails, till the bound: each failure leaves
+// the send stuck, the one that reaches the bound says so, and every drop after it is
+// refused before any draw, as the real type calls no shutdown then.
+test "sim: failed drops count to the bound through the table, and past it nothing is drawn" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(34, 0);
+    sim.setDropFaults(constants.sim_fault_percent_max, 100);
+    sim.attachTable(&fixture.table);
+    const peer: io.PeerId = 1;
+    _ = try submitUntilStuck(&sim, peer, 0, 32);
+    const stuck = sim.stuckSendsTo(peer);
+    const bound = constants.io_drop_attempts_max;
+    var attempts: u32 = 0;
+    while (attempts < bound - 1) : (attempts += 1) {
+        try sim.drop(peer);
+        const failed: connections.DropCount = @intCast(attempts + 1);
+        try testing.expectEqual(failed, fixture.table.get(peer).drops_failed);
+        try testing.expectEqual(stuck, sim.stuckSendsTo(peer));
+    }
+    try testing.expectError(error.DropsExhausted, sim.drop(peer));
+    try testing.expectEqual(@as(connections.DropCount, bound), fixture.table.get(peer).drops_failed);
+    try testing.expectEqual(@as(u64, bound), sim.drops_failed);
+    try testing.expectEqual(@as(u64, bound), sim.dropped);
+    try testing.expectEqual(stuck, sim.stuckSendsTo(peer));
+    // Refused from then on before any draw, and the send stays stuck.
+    const drops_before = sim.drop_source.s;
+    try testing.expectError(error.DropsExhausted, sim.drop(peer));
+    try testing.expectEqual(drops_before, sim.drop_source.s);
+    try testing.expectEqual(@as(u64, bound), sim.dropped);
+    try testing.expectEqual(stuck, sim.stuckSendsTo(peer));
+}
+
+/// Drops each connection, with a stuck send, until a drop works or its drops run out, at a
+/// 50% failure rate; returns how many failed drops left a stuck send stuck.
+fn dropUntilWorks(seed: u64) !u32 {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(seed, 0);
+    sim.setDropFaults(constants.sim_fault_percent_max, constants.sim_fault_percent_max);
+    sim.attachTable(&fixture.table);
+    var failed_while_stuck: u32 = 0;
+    var peer: io.PeerId = 0;
+    while (peer < test_peers) : (peer += 1) {
+        _ = try submitUntilStuck(&sim, peer, peer * 32, 32);
+        var attempts: u32 = 0;
+        while (attempts < constants.io_drop_attempts_max) : (attempts += 1) {
+            const stuck_before = sim.stuckSendsTo(peer);
+            sim.drop(peer) catch |err| switch (err) {
+                error.DropsExhausted => {},
+            };
+            if (sim.isDropped(peer)) break;
+            try testing.expectEqual(stuck_before, sim.stuckSendsTo(peer));
+            failed_while_stuck += 1;
+        }
+        if (!sim.isDropped(peer)) continue;
+        try testing.expectEqual(@as(u32, 0), sim.stuckSendsTo(peer));
+        // Dropping again changes nothing more and never fails, as on the real type.
+        const slots_before = sim.slots;
+        const drops_before = sim.drop_source.s;
+        const failed_before = sim.drops_failed;
+        try sim.drop(peer);
+        try testing.expectEqualDeep(slots_before, sim.slots);
+        try testing.expectEqual(drops_before, sim.drop_source.s);
+        try testing.expectEqual(failed_before, sim.drops_failed);
+    }
+    try testing.expectEqual(test_peers, peer);
+    return failed_while_stuck;
+}
+
+test "sim: a drop that works after failures ends the stuck sends, and dropping again changes nothing" {
+    // Which drops fail is drawn, so two seeds show failures that leave a send stuck.
+    var failed_while_stuck: u32 = 0;
+    for ([_]u64{ 34, 35 }) |seed| failed_while_stuck += try dropUntilWorks(seed);
+    try testing.expect(failed_while_stuck > 0);
+}
+
+/// What `dropSoak` did, for the test to check that every path ran and that a seed replays.
+const DropSoakCounts = struct {
+    sends: u32 = 0,
+    refused_share: u32 = 0,
+    accepts: u32 = 0,
+    /// Accepts that completed while sends held the whole share kept from them.
+    accepts_while_share_full: u32 = 0,
+    stuck: u32 = 0,
+    dropped: u32 = 0,
+    /// FNV-1a over every completion's id, in order.
+    trace: u64 = 0xcbf29ce484222325,
+};
+
+const drop_soak_ticks: u32 = 640;
+const drop_soak_accept_id: io.OperationId = 1 << 32;
+
+/// The model `dropSoak` checks the table against: each peer's sends in flight, by the
+/// entry each send id went to.
+const DropSoak = struct {
+    sim: Sim,
+    table: *connections.Table,
+    sends: [test_peers]u32 = @splat(0),
+    send_entry: [drop_soak_ticks * 2]u8 = undefined,
+    accept_in_flight: bool = false,
+    accepts_submitted: u64 = 0,
+    counts: DropSoakCounts = .{},
+
+    /// Keeps one accept in flight; a refusal waits for a later tick.
+    fn keepAccepting(soak: *DropSoak) !void {
+        assert(soak.sim.table != null);
+        if (soak.accept_in_flight) return;
+        const id = drop_soak_accept_id + soak.accepts_submitted;
+        const accept: io.Operation = .{ .accept = .{ .listener = test_listener } };
+        soak.sim.submit(.{ .id = id, .operation = accept }) catch |err| switch (err) {
+            error.QueueFull, error.AcceptTooSoon => return,
+            // Never for an accept.
+            error.SlotsKeptForAccepts => return error.TestUnexpectedResult,
+        };
+        soak.accepts_submitted += 1;
+        soak.accept_in_flight = true;
+        // Every accept counted as completed was submitted first.
+        assert(soak.counts.accepts < soak.accepts_submitted);
+    }
+
+    /// A send to `entry`; the share kept from accepts may refuse it.
+    fn send(soak: *DropSoak, id: io.OperationId, entry: u32) !void {
+        assert(entry < test_peers);
+        assert(id < soak.send_entry.len);
+        const operation: io.Send = .{ .peer = entry, .bytes = "soak" };
+        soak.sim.submit(.{ .id = id, .operation = .{ .send = operation } }) catch |err| switch (err) {
+            error.SlotsKeptForAccepts, error.QueueFull => {
+                soak.counts.refused_share += 1;
+                return;
+            },
+            error.AcceptTooSoon => return error.TestUnexpectedResult, // Only for an accept.
+        };
+        soak.send_entry[@intCast(id)] = @intCast(entry);
+        soak.sends[entry] += 1;
+        soak.counts.sends += 1;
+    }
+
+    /// One tick, then every completion due: sends uncounted from the model, accepted
+    /// connections released at once.
+    fn tick(soak: *DropSoak) !void {
+        assert(soak.sim.table == soak.table);
+        const in_flight_before = soak.sim.in_flight;
+        soak.sim.tick();
+        const share_full = soak.sim.share.others_in_flight == shared_slots_max;
+        var completions: [slots_count]io.Completion = undefined;
+        const count = soak.sim.poll(&completions);
+        for (completions[0..count]) |completion| {
+            soak.counts.trace = (soak.counts.trace ^ completion.id) *% 0x100000001b3;
+            switch (completion.result) {
+                .send => {
+                    const entry = soak.send_entry[@intCast(completion.id)];
+                    try testing.expect(soak.sends[entry] > 0);
+                    soak.sends[entry] -= 1;
+                },
+                .accept => |accepted| {
+                    try testing.expect(completion.id >= drop_soak_accept_id);
+                    soak.accept_in_flight = false;
+                    const peer = accepted catch |err| switch (err) {
+                        error.PeerDown, error.Backpressure => continue,
+                        // Accepted connections are released at once, so the table has room.
+                        error.TableFull => return error.TestUnexpectedResult,
+                    };
+                    _ = try soak.table.release(peer);
+                    soak.counts.accepts += 1;
+                    if (share_full) soak.counts.accepts_while_share_full += 1;
+                },
+                .execute => return error.TestUnexpectedResult,
+            }
+        }
+        var entry: u32 = 0;
+        while (entry < test_peers) : (entry += 1) {
+            try testing.expectEqual(soak.sends[entry], soak.table.get(entry).sends_in_flight);
+        }
+        // Every completion taken left the simulator: none lost, none taken twice.
+        assert(soak.sim.in_flight == in_flight_before - count);
+    }
+};
+
+/// Seeded ticks over `test_peers` connections whose sends stick half the time, with one
+/// accept kept in flight: the stuck sends fill the share kept from accepts while accepts
+/// keep completing. Then every connection is dropped, the sends drain, and every entry is
+/// released.
+fn dropSoak(seed: u64) !DropSoakCounts {
+    var fixture: TableFixture = undefined;
+    try fixture.setUp(2 * test_peers);
+    defer fixture.tearDown();
+    var peer: u32 = 0;
+    while (peer < test_peers) : (peer += 1) assert(try fixture.table.acquire(peerSocket(peer)) == peer);
+    var prng: std.Random.DefaultPrng = .init(seed ^ 0xd209_50a4);
+    var soak: DropSoak = .{ .sim = .init(seed, 10), .table = &fixture.table };
+    soak.sim.setDropFaults(constants.sim_fault_percent_max, 0);
+    soak.sim.attachTable(&fixture.table);
+    var ticks: u32 = 0;
+    while (ticks < drop_soak_ticks) : (ticks += 1) {
+        try soak.send(ticks * 2, prng.random().uintLessThan(u32, test_peers));
+        try soak.send(ticks * 2 + 1, prng.random().uintLessThan(u32, test_peers));
+        try soak.keepAccepting();
+        try soak.tick();
+    }
+    soak.counts.stuck = soak.sim.sends_stuck;
+    // Only sends that went in can stick.
+    assert(soak.counts.stuck <= soak.counts.sends);
+    peer = 0;
+    while (peer < test_peers) : (peer += 1) try soak.sim.drop(peer);
+    ticks = 0;
+    while (ticks <= constants.sim_completion_delay_ticks_max) : (ticks += 1) try soak.tick();
+    soak.counts.dropped = soak.sim.sends_dropped;
+    // Only sends that went in can be ended by a drop.
+    assert(soak.counts.dropped <= soak.counts.sends);
+    try testing.expectEqual(@as(u32, 0), soak.sim.in_flight);
+    try testing.expectEqual(@as(u32, 0), soak.sim.sends_in_flight);
+    peer = 0;
+    while (peer < test_peers) : (peer += 1) try testing.expectEqual(peerSocket(peer), try fixture.table.release(peer));
+    try testing.expectEqual(@as(u32, 0), fixture.table.count());
+    fixture.table.assertInvariants();
+    return soak.counts;
+}
+
+test "sim: seeded stuck sends fill the share while accepts keep completing; drops free every entry" {
+    const seeds = [_]u64{ 1, 2, 0x5eed };
+    for (seeds) |seed| {
+        const counts = try dropSoak(seed);
+        // Stuck sends complete only when dropped, so the share caps them.
+        try testing.expect(counts.stuck > shared_slots_max / 2);
+        try testing.expect(counts.stuck <= shared_slots_max);
+        try testing.expect(counts.refused_share > 0);
+        try testing.expect(counts.accepts_while_share_full > 0);
+        try testing.expect(counts.dropped > 0);
+        try testing.expectEqual(counts, try dropSoak(seed));
     }
 }

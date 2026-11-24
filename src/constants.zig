@@ -71,9 +71,9 @@ pub const http_connections_max: u32 = 4_096;
 /// request head scan and count of sends in flight) plus its slot on the free-index stack.
 /// Reason: the table is sized once at startup and counted in the memory table;
 /// `src/live/connections.zig` checks at compile time that its entry fits. The entry and its
-/// slot take at most all 26 bytes: 17 bytes of fields (19 as stored, since the 48-bit
+/// slot take at most all 26 bytes: 18 bytes of fields (20 as stored, since the 48-bit
 /// generation takes 8), padded to 24 by that generation's 8-byte alignment (to 20 where it aligns to 4, as on 32-bit x86), plus a
-/// 2-byte slot. Five more bytes of fields still fit in the padding; anything past that
+/// 2-byte slot. Four more bytes of fields still fit in the padding; anything past that
 /// means raising this number in review.
 pub const http_connection_entry_size_max: u32 = 26;
 
@@ -247,6 +247,17 @@ pub const io_random_attempts_max: u32 = 8;
 /// and the simulator refuse an accept submitted sooner with `error.AcceptTooSoon`.
 /// Provisional: the server loop (roadmap core 3) confirms it.
 pub const io_accept_backpressure_wait_ns: u64 = 100 * 1_000_000;
+
+/// Failed drops one connection may have over its life, counted on its entry, before the I/O
+/// type stops trying and refuses every further drop of it with `error.DropsExhausted`. A
+/// drop fails only on an errno shutdown(2) doesn't document, a fact about the kernel this
+/// code didn't know, and the sends stuck on that connection stay pending. Reason: the server
+/// loop drops a stuck connection again at each of its write deadlines, so four attempts ride
+/// out a failure that clears within a few deadlines, while a socket that keeps failing costs
+/// at most four system calls, not one per deadline for as long as it stays open. Past the
+/// bound its stuck sends still hold their slots until the cancel (roadmap core 3b) frees
+/// them. Provisional: the server loop confirms it.
+pub const io_drop_attempts_max: u32 = 4;
 
 /// Connections the kernel queues on the local listener before the server accepts them.
 /// Reason: nginx is the only client and opens a few connections per worker, so a queue of
@@ -479,6 +490,8 @@ comptime {
     // ticks, at least one. The accept workload sizes its phases from the wait (sim/).
     assert(io_accept_backpressure_wait_ns % tick_ns == 0);
     assert(io_accept_backpressure_wait_ns >= tick_ns);
+    // A connection is tried at least twice before its drops are given up.
+    assert(io_drop_attempts_max >= 2);
     // A simulated run must leave room to drain every delayed completion.
     assert(sim_completion_delay_ticks_max < sim_ticks_max);
 }

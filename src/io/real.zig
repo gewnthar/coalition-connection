@@ -46,6 +46,11 @@
 //! sends (`shutdownErrno`): a connection already gone is dropped already, a bad descriptor
 //! stops the process, and an undocumented errno is counted in
 //! `drop_errno_undocumented_count`, with the latest one in `drop_errno_undocumented_last`.
+//! An undocumented errno also leaves the connection's sends pending, so it counts as a
+//! failed drop on the connection's entry (`Table.dropFailed`). Each drop first asks the
+//! entry (`Table.dropAdmit`), so once `constants.io_drop_attempts_max` have failed, drop
+//! returns `error.DropsExhausted` without calling shutdown again, and the caller cancels the
+//! connection's operations instead (core 3b). The simulator makes the same two calls.
 //!
 //! Accepts: `IORING_OP_ACCEPT` on the caller's listening socket, with `SOCK_CLOEXEC` on the
 //! new socket. The completion takes an entry in the connection table for the new socket and
@@ -186,7 +191,8 @@ pub const Real = struct {
     share: io.SlotShare,
     submitted: u64,
     completed: u64,
-    /// Connections shut down by `drop`. For metrics.
+    /// Shutdowns `drop` has called, failed or not; a drop refused before calling one is
+    /// not counted. For metrics.
     dropped: u64,
     /// Times the kernel refused submissions for a moment (short of memory, or a signal);
     /// they stay queued and go in at the next `submit` or `poll`. For metrics.
@@ -409,24 +415,40 @@ pub const Real = struct {
     /// Dropping a connection again changes nothing more. Takes no slot and completes nothing
     /// itself. The entry stays in use, and its socket open, until the caller releases it,
     /// which the table refuses while a send is still counted; the caller closes the socket
-    /// release hands back. `peer` must be live. Never waits.
-    pub fn drop(self: *Real, peer: io.PeerId) void {
+    /// release hands back. `peer` must be live. Never waits. A shutdown that fails with an
+    /// errno shutdown(2) doesn't document counts against the connection's
+    /// `constants.io_drop_attempts_max`; the drop that reaches it, and every later one,
+    /// returns `error.DropsExhausted`, the later ones without calling shutdown.
+    pub fn drop(self: *Real, peer: io.PeerId) io.DropError!void {
         comptime assertLinux();
+        assert(self.ring.fd >= 0); // Not after deinit.
+        assert(self.table.lookup(peer) != null); // A live connection only.
+        var kernel: ShutdownKernel = .{};
+        return self.dropThrough(ShutdownKernel, &kernel, peer);
+    }
+
+    /// Everything `drop` does, with shutdown(2) taken from `shutdown`, so tests can inject
+    /// the errnos a real socket never returns on cue. Production passes `ShutdownKernel`.
+    fn dropThrough(self: *Real, comptime Shutdown: type, shutdown: *Shutdown, peer: io.PeerId) io.DropError!void {
         const entry = self.table.get(peer);
         // Every send counted on the entry holds one of this type's send slots, and every
         // send slot is in flight.
         assert(entry.sends_in_flight <= self.sends_in_flight);
         assert(self.sends_in_flight <= self.inFlight());
-        self.shutdownResult(linux.errno(linux.shutdown(entry.socket, linux.SHUT.RDWR)));
+        // Asked before shutdown, so an exhausted connection costs no system call.
+        try self.table.dropAdmit(peer);
+        const failed = self.shutdownResult(shutdown.shutdown(entry.socket));
         self.dropped += 1;
+        if (failed) try self.table.dropFailed(peer);
     }
 
     /// Handles a drop's shutdown errno: nothing for a connection shut down or gone already,
-    /// a stop for a bug, a count for an errno shutdown(2) doesn't document. A connection
-    /// whose shutdown failed that way may still have sends pending; the caller drops it
-    /// again later (the server loop's write deadline), and the count says it happened.
-    fn shutdownResult(self: *Real, err: linux.E) void {
-        if (err == .SUCCESS) return;
+    /// a stop for a bug, a count for an errno shutdown(2) doesn't document. Returns whether
+    /// the drop failed, which only an undocumented errno means: that connection may still
+    /// have sends pending, so the caller drops it again later (the server loop's write
+    /// deadline), and the count says it happened.
+    fn shutdownResult(self: *Real, err: linux.E) bool {
+        if (err == .SUCCESS) return false;
         const undocumented_before = self.drop_errno_undocumented_count;
         // The count and the latest errno change together, so neither is set without the other.
         assert((undocumented_before == 0) == (self.drop_errno_undocumented_last == .SUCCESS));
@@ -442,6 +464,7 @@ pub const Real = struct {
         // Only an undocumented errno is counted, once each.
         const counted: u64 = @intFromBool(outcome == .undocumented);
         assert(self.drop_errno_undocumented_count == undocumented_before + counted);
+        return outcome == .undocumented;
     }
 
     /// The contract says ids in flight are distinct; a caller that reuses one has a bug, as
@@ -821,6 +844,19 @@ fn shutdownErrno(err: linux.E) DropOutcome {
         else => .undocumented,
     };
 }
+
+/// The kernel's shutdown(2), both ways, as the source `drop` passes to `dropThrough`.
+const ShutdownKernel = struct {
+    pub fn shutdown(self: *ShutdownKernel, socket: io.Socket) linux.E {
+        _ = self;
+        assert(socket >= 0);
+        const rc = linux.shutdown(socket, linux.SHUT.RDWR);
+        const err = linux.errno(rc);
+        // shutdown(2) returns 0 or a failure, never a count.
+        assert((rc == 0) == (err == .SUCCESS));
+        return err;
+    }
+};
 
 /// Reads `CLOCK_MONOTONIC` as nanoseconds.
 fn monotonicNow() io.Instant {
@@ -1319,10 +1355,10 @@ test "real: drop fails a send stuck on a client that stopped reading, and the en
     // The stuck send holds the entry, and nothing would ever release it.
     try testing.expectError(error.SendsInFlight, fixture.table.release(fixture.peer));
 
-    fixture.real.drop(fixture.peer);
+    try fixture.real.drop(fixture.peer);
     try testing.expectEqual(@as(u64, 1), fixture.real.dropped);
     // A second drop of the same connection is harmless.
-    fixture.real.drop(fixture.peer);
+    try fixture.real.drop(fixture.peer);
     try testing.expectEqual(@as(u64, 2), fixture.real.dropped);
     try testing.expectEqual(@as(u64, 0), fixture.real.drop_errno_undocumented_count);
     // drop completes nothing itself; the send comes back through poll, having sent nothing.
@@ -1363,7 +1399,7 @@ test "real: dropping one connection leaves another connection's stuck send pendi
     try fixture.real.submit(.{ .id = 32, .operation = .{ .send = send_other } });
     try expectStuck(&fixture.real);
 
-    fixture.real.drop(fixture.peer);
+    try fixture.real.drop(fixture.peer);
     var completions: [2]io.Completion = undefined;
     try pollUntil(&fixture.real, completions[0..1], 1, -1);
     try testing.expectEqual(@as(io.OperationId, 31), completions[0].id);
@@ -1431,7 +1467,7 @@ test "real: with every send slot held by a stuck send, an accept still goes in a
     const accepted = try completions[0].result.accept;
 
     // Dropping the stuck connection hands every send slot back.
-    fixture.real.drop(fixture.peer);
+    try fixture.real.drop(fixture.peer);
     try pollUntil(&fixture.real, completions[0..shared_slots_max], shared_slots_max, -1);
     var seen: [shared_slots_max]bool = @splat(false);
     for (completions[0..shared_slots_max]) |completion| {
@@ -1491,7 +1527,7 @@ test "real: an accept counts against no share, so a send takes the last free slo
     try testing.expectEqual(slots_count, fixture.real.inFlight());
 
     // Dropping the stuck connection hands every send slot back; the second accept stays.
-    fixture.real.drop(fixture.peer);
+    try fixture.real.drop(fixture.peer);
     try pollUntil(&fixture.real, completions[0..shared_slots_max], shared_slots_max, -1);
     for (completions[0..shared_slots_max]) |completion| {
         try testing.expect(completion.id < shared_slots_max);
@@ -1509,6 +1545,87 @@ test "real: an accept counts against no share, so a send takes the last free slo
     fixture.peer = try fixture.table.acquire(fixture.local);
 }
 
+/// A shutdown that finds the connection gone already (ENOTCONN), as a stand-in for
+/// `ShutdownKernel`: a drop, not a failure.
+const GoneShutdown = struct {
+    calls: u32 = 0,
+
+    pub fn shutdown(self: *GoneShutdown, socket: io.Socket) linux.E {
+        assert(socket >= 0);
+        assert(self.calls < std.math.maxInt(u32));
+        self.calls += 1;
+        return .NOTCONN;
+    }
+};
+
+test "real: a shutdown that finds the connection gone counts no failed drop, however often" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    var gone: GoneShutdown = .{};
+    var attempt: u32 = 0;
+    // Past the bound: a drop that works is never refused.
+    while (attempt < 2 * constants.io_drop_attempts_max) : (attempt += 1) {
+        try fixture.real.dropThrough(GoneShutdown, &gone, fixture.peer);
+    }
+    try testing.expectEqual(2 * constants.io_drop_attempts_max, gone.calls);
+    try testing.expectEqual(@as(connections.DropCount, 0), fixture.table.get(fixture.peer).drops_failed);
+    try testing.expectEqual(@as(u64, 0), fixture.real.drop_errno_undocumented_count);
+    try testing.expectEqual(@as(u64, 2 * constants.io_drop_attempts_max), fixture.real.dropped);
+}
+
+/// A shutdown that always fails with an errno shutdown(2) doesn't document, as a stand-in
+/// for `ShutdownKernel`, counting its calls.
+const FailingShutdown = struct {
+    calls: u32 = 0,
+
+    pub fn shutdown(self: *FailingShutdown, socket: io.Socket) linux.E {
+        assert(socket >= 0);
+        // dropThrough asks the entry first, so it never calls past the bound.
+        assert(self.calls < constants.io_drop_attempts_max);
+        self.calls += 1;
+        return .IO;
+    }
+};
+
+test "real: an undocumented shutdown errno counts against the bound, and past it drop calls no shutdown" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    _ = try fillSendBuffer(fixture.local);
+    try fixture.send(41, "stuck");
+    try expectStuck(&fixture.real);
+    const bound = constants.io_drop_attempts_max;
+    var failing: FailingShutdown = .{};
+    var attempt: u32 = 0;
+    while (attempt < bound - 1) : (attempt += 1) {
+        try fixture.real.dropThrough(FailingShutdown, &failing, fixture.peer);
+        const failed: connections.DropCount = @intCast(attempt + 1);
+        try testing.expectEqual(failed, fixture.table.get(fixture.peer).drops_failed);
+    }
+    // The failure that reaches the bound says so at once.
+    try testing.expectError(error.DropsExhausted, fixture.real.dropThrough(FailingShutdown, &failing, fixture.peer));
+    try testing.expectEqual(bound, failing.calls);
+    try testing.expectEqual(@as(connections.DropCount, bound), fixture.table.get(fixture.peer).drops_failed);
+    try testing.expectEqual(@as(u64, bound), fixture.real.drop_errno_undocumented_count);
+    try testing.expectEqual(linux.E.IO, fixture.real.drop_errno_undocumented_last);
+    try testing.expectEqual(@as(u64, bound), fixture.real.dropped);
+    // From then on the real drop is refused too, before any shutdown: the socket is still
+    // open both ways, and the send still waits.
+    try testing.expectError(error.DropsExhausted, fixture.real.drop(fixture.peer));
+    try testing.expectEqual(@as(u64, bound), fixture.real.dropped);
+    try expectStuck(&fixture.real);
+
+    // Ended here by hand, as the cancel will (core 3b); the entry's count goes with it.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.shutdown(fixture.local, linux.SHUT.RDWR)));
+    var completions: [1]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectError(error.PeerDown, completions[0].result.send);
+    try testing.expectEqual(fixture.local, try fixture.table.release(fixture.peer));
+    fixture.peer = try fixture.table.acquire(fixture.local);
+    try testing.expectEqual(@as(connections.DropCount, 0), fixture.table.get(fixture.peer).drops_failed);
+}
+
 test "real: every shutdown errno has an outcome, and only an undocumented one is counted" {
     try testing.expectEqual(DropOutcome.dropped, shutdownErrno(.NOTCONN));
     for ([_]linux.E{ .BADF, .NOTSOCK, .INVAL }) |err| {
@@ -1519,13 +1636,13 @@ test "real: every shutdown errno has an outcome, and only an undocumented one is
     for (undocumented) |err| try testing.expectEqual(DropOutcome.undocumented, shutdownErrno(err));
 
     var real = errnoCountersOnly();
-    real.shutdownResult(.SUCCESS);
-    real.shutdownResult(.NOTCONN);
+    try testing.expect(!real.shutdownResult(.SUCCESS));
+    try testing.expect(!real.shutdownResult(.NOTCONN));
     try testing.expectEqual(@as(u64, 0), real.drop_errno_undocumented_count);
     try testing.expectEqual(linux.E.SUCCESS, real.drop_errno_undocumented_last);
     var count: u64 = 0;
     for (undocumented) |err| {
-        real.shutdownResult(err);
+        try testing.expect(real.shutdownResult(err));
         count += 1;
         try testing.expectEqual(count, real.drop_errno_undocumented_count);
         try testing.expectEqual(err, real.drop_errno_undocumented_last);
