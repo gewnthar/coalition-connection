@@ -44,7 +44,7 @@ pub const AllocatorCall = enum(u8) {
 };
 
 /// A call on the connection table the harness builds: `table_size` entries, `free_id`
-/// released again, `writing_id` moved to writing, and the others in use and reading.
+/// released again, `writing_id` moved to writing, and the others in use and idle.
 pub const TableCall = enum(u8) {
     // release, get and setState(.writing) on the free entry, named under its current
     // generation (the id the next acquire would hand out), so the generation check passes.
@@ -89,7 +89,7 @@ pub const TableCall = enum(u8) {
     get_reading,
     set_state_to_writing,
     // Controls on the writing entry, whose socket is 0, the lowest valid descriptor:
-    // release, get, and a move back to reading.
+    // release, get, and a move back to idle, as after a response on a connection kept open.
     release_writing,
     get_writing,
     set_state_to_reading,

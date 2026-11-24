@@ -26,7 +26,8 @@
 //!   live_events_backlog_max
 //!   live_events_backlog_bytes_max
 //!
-//! Status: the connection table (roadmap core 4) is in `connections.zig`, the HTTP/1.1
+//! Status: the connection table (roadmap core 4) is in `connections.zig`, each
+//! connection's state machine in `connection_state.zig`, the HTTP/1.1
 //! request parser (roadmap core 5) in `http_request.zig`, and the response writer and the
 //! router (roadmap core 6) in `http_response.zig` and `router.zig`; the rest is a stub.
 //! See docs/roadmap.md (core milestone, live-update slices).
@@ -35,6 +36,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("../constants.zig");
 
+pub const connection_state = @import("connection_state.zig");
 pub const connections = @import("connections.zig");
 pub const http_request = @import("http_request.zig");
 pub const http_response = @import("http_response.zig");
@@ -58,6 +60,7 @@ test "live: stub compiles and its limits are set" {
 }
 
 test {
+    _ = connection_state;
     _ = connections;
     _ = http_request;
     _ = http_response;

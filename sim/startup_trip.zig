@@ -590,7 +590,7 @@ fn runTableCase(startup: *cc.StartupAllocator, call: trip.TableCall, case: trip.
     table.assertInvariants();
     assert(table.count() == trip.table_size - 1);
     assert(table.entries[trip.free_id].state == .free);
-    assert(table.entries[trip.reading_id].state == .reading);
+    assert(table.entries[trip.reading_id].state == .idle);
     assert(table.entries[trip.writing_id].state == .writing);
     if (call == .release_free_stale_socket or call == .get_free_stale_socket) {
         // A valid-looking socket in a free entry, as a stale field would leave.
@@ -657,7 +657,7 @@ fn callTable(table: *connections.Table, call: trip.TableCall) connections.Socket
             break :state -1;
         },
         .set_state_to_reading => state: {
-            table.setState(id, .reading);
+            table.setState(id, .idle);
             break :state -1;
         },
         .send_completed_stale, .send_completed_free, .send_completed_uncounted => completed: {
@@ -706,7 +706,7 @@ fn tableControlHeld(
         },
         .set_state_to_reading => state: {
             var moved = before[index];
-            moved.state = .reading;
+            moved.state = .idle;
             break :state moved;
         },
         else => unreachable, // tableCallAllowed: the comptime block admits only these.

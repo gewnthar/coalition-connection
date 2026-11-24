@@ -1843,7 +1843,7 @@ test "real: an accept over a loopback listener takes a table entry for the conne
         error.SendsInFlight => unreachable,
     });
     try testing.expectEqual(@as(u32, 2), fixture.table.count());
-    try testing.expectEqual(connections.State.reading, fixture.table.get(peer).state);
+    try testing.expectEqual(connections.State.idle, fixture.table.get(peer).state);
     try testing.expectEqual(@as(u64, 0), fixture.real.refused);
 
     // The accepted socket is closed on exec, so a child process never inherits it.
@@ -3160,7 +3160,7 @@ const AcceptSoak = struct {
         assert(self.held_count < accept_soak_table_size);
         assert(first_number < self.clients_connected);
         const entry = self.table.lookup(peer) orelse return error.TestPeerNotLive;
-        try testing.expectEqual(connections.State.reading, entry.state);
+        try testing.expectEqual(connections.State.idle, entry.state);
         try testing.expectEqual(@as(connections.SendCount, 0), entry.sends_in_flight);
         for (self.held[0..self.held_count]) |other| {
             try testing.expect(other.peer != peer);

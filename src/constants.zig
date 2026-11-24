@@ -77,6 +77,11 @@ pub const http_connections_max: u32 = 4_096;
 /// means raising this number in review.
 pub const http_connection_entry_size_max: u32 = 26;
 
+/// Requests one connection serves before the server closes it after the response.
+/// Reason: nginx's default upstream keepalive_requests is 1,000, and a limit bounds every
+/// connection's life, so no kept-alive connection holds its entry for ever.
+pub const http_requests_per_connection_max: u32 = 1_000;
+
 /// Largest HTTP request head plus body. Reason: forms are small; anything larger is
 /// rejected before parsing.
 pub const http_request_size_max: u32 = 16 * 1024;
@@ -100,7 +105,7 @@ pub const http_response_headers_max: u32 = 32;
 /// writer's own fields take at most 113 bytes, and a page's fields (type, caching, a
 /// cookie and security headers such as a Content-Security-Policy) run to about 1 KiB, so
 /// 4 KiB leaves headroom at 0.4% of a buffer. A head longer than this is refused with a
-/// named error, never truncated. Provisional.
+/// named error, never truncated.
 pub const http_response_head_room: u32 = 4 * 1024;
 
 /// Response buffers, each `http_response_size_max` bytes, shared by all connections.
@@ -472,6 +477,7 @@ comptime {
     assert(http_response_buffers_max > 0);
     assert(http_response_buffers_max <= http_connections_max);
     assert(http_connection_entry_size_max > 0);
+    assert(http_requests_per_connection_max > 0);
     // The backlog holds at least one event of the largest size.
     assert(live_events_backlog_bytes_max >= websocket_message_size_max);
     assert(memory_table.len <= memory_table_rows_max);

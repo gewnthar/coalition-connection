@@ -39,7 +39,7 @@ const refusals_per_fill: u32 = 8;
 const fill_arrival_eighths: u8 = 6;
 const empty_arrival_eighths: u8 = 2;
 
-/// Out of 8: how often a step also moves a random connection between reading and writing.
+/// Out of 8: how often a step also moves a random connection between idle and writing.
 const state_change_eighths: u8 = 4;
 
 /// A phase drifts toward its goal by half a connection per step on average, so it needs
@@ -161,7 +161,7 @@ fn arrive(w: *Workload) Error!void {
     const generation: connections.Generation = model.acquired[index];
     if (parts.generation != generation) return error.InvariantBroken;
     model.sockets[index] = socket;
-    model.states[index] = .reading;
+    model.states[index] = .idle;
     // A reused entry: the id it was released under last names the old connection, so a
     // completion still carrying it must not find the new one.
     if (model.acquired[index] > 0) {
@@ -175,7 +175,7 @@ fn arrive(w: *Workload) Error!void {
     assert(w.counts.peak <= capacity);
     trace(&w.counts, 2 | (@as(u64, index) << 8) | (@as(u64, @intCast(socket)) << 32));
     const entry = w.table.get(id);
-    if (entry.socket != socket or entry.state != .reading) return error.InvariantBroken;
+    if (entry.socket != socket or entry.state != .idle) return error.InvariantBroken;
 }
 
 /// A random entry in use, found by probing from a random index, or null when none is.
@@ -219,7 +219,7 @@ fn changeState(w: *Workload) Error!void {
     assert(model.sockets[index] >= socket_first);
     assert(model.states[index] != .free);
     const id = model.ids[index];
-    const state: State = if (model.states[index] == .reading) .writing else .reading;
+    const state: State = if (model.states[index] == .idle) .writing else .idle;
     w.table.setState(id, state);
     model.states[index] = state;
     w.counts.state_changes += 1;
