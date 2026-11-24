@@ -87,7 +87,7 @@ jobs:
   # download, through no fault of a change, so only build-and-test is a required check.
   master-ast-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       # The same pinned checkout as above; the token isn't left in .git/config.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -100,7 +100,9 @@ jobs:
           sudo apt-get install -y -q minisign
 
       - name: Install Zig master (signature and SHA-256 checked)
-        timeout-minutes: 5
+        # Four sources at up to five minutes each, for when every mirror and ziglang.org
+        # are slow; a fast source takes seconds.
+        timeout-minutes: 20
         run: |
           set -euo pipefail
           fetch() { curl -fsSL --proto '=https' --retry 3 --max-time 120 "$@"; }
@@ -119,16 +121,37 @@ jobs:
             echo "the index's master tarball isn't $name from ziglang.org: $url" >&2
             exit 1
           fi
-          fetch "$url" -o "$RUNNER_TEMP/zig.tar.xz"
-          fetch "$url.minisig" -o "$RUNNER_TEMP/zig.tar.xz.minisig"
-          echo "$sha  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict -
-          # Zig's signature, and its signed comment's file field must be exactly this name
-          # (the trusted comment's fields are separated by tabs).
-          minisign -V -m "$RUNNER_TEMP/zig.tar.xz" -x "$RUNNER_TEMP/zig.tar.xz.minisig" \
-            -P "$ZIG_PUBLIC_KEY" | tee "$RUNNER_TEMP/minisign.out"
-          grep -qF "$(printf '\tfile:%s\t' "$name")" "$RUNNER_TEMP/minisign.out"
+          # ziglang.org asks CI to download from its community mirrors, because fetching
+          # from it directly slows it down for everyone: try three mirrors in a random order,
+          # then ziglang.org itself. A copy counts only if it matches the index's SHA-256 and
+          # Zig's signature, whose signed file field must be exactly this name (the trusted
+          # comment's fields are separated by tabs), so no source can hand over another file.
+          # A mirror may not have the newest master build yet; it then answers 404 at once.
+          fetch https://ziglang.org/download/community-mirrors.txt -o "$RUNNER_TEMP/mirrors.txt"
+          mapfile -t mirrors < <(grep '^https://' "$RUNNER_TEMP/mirrors.txt" | shuf -n 3)
+          tarball="$RUNNER_TEMP/zig.tar.xz"
+          query="source=coalition-connection-ci"
+          verified=false
+          for base in "${mirrors[@]}" https://ziglang.org/builds; do
+            if curl -fsSL --proto '=https' --max-time 300 "$base/$name?$query" -o "$tarball" &&
+              fetch "$base/$name.minisig?$query" -o "$tarball.minisig" &&
+              echo "$sha  $tarball" | sha256sum --check --strict --status - &&
+              minisign -V -m "$tarball" -x "$tarball.minisig" -P "$ZIG_PUBLIC_KEY" \
+                > "$RUNNER_TEMP/minisign.out" &&
+              grep -qF "$(printf '\tfile:%s\t' "$name")" "$RUNNER_TEMP/minisign.out"; then
+              cat "$RUNNER_TEMP/minisign.out"
+              echo "Zig master $version, verified, from $base"
+              verified=true
+              break
+            fi
+            echo "no verified copy from $base; trying the next source" >&2
+          done
+          if [ "$verified" != true ]; then
+            echo "no source had a verified Zig master $version" >&2
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          tar -xJf "$tarball" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Check the Zig master version
