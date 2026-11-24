@@ -9,8 +9,10 @@
 //! makes: each send is counted on its entry while in flight, a release tried just after a
 //! send is refused with SendsInFlight and changes nothing, and once everything has arrived
 //! every entry counts no sends and releases. Then a second workload drives
-//! the connection table past its limit and empties it again (sim/connections.zig), and a
-//! third fills it through simulated accepts (sim/accepts.zig). As
+//! the connection table past its limit and empties it again (sim/connections.zig), a
+//! third fills it through simulated accepts (sim/accepts.zig), and a fourth sticks sends
+//! and drops their connections on a write deadline, as the server loop will
+//! (sim/drops.zig). As
 //! components land, each one joins this loop as a real workload (logins, ESI polling, live
 //! updates). A failing seed replays exactly.
 
@@ -20,6 +22,7 @@ const cc = @import("coalition_connection");
 const build_options = @import("build_options");
 const connection_workload = @import("connections.zig");
 const accept_workload = @import("accepts.zig");
+const drop_workload = @import("drops.zig");
 
 const io = cc.io;
 const constants = cc.constants;
@@ -283,4 +286,14 @@ pub fn main() SimError!void {
     std.debug.print("sim: accepts peer_down={d} backpressure={d} too_soon={d}\n", .{ accepts.peer_down, accepts.backpressure, accepts.too_soon });
     std.debug.print("sim: accepts departures={d}\n", .{accepts.departures});
     std.debug.print("sim: accepts trace={x:0>16} ok\n", .{accepts.trace});
+
+    const drops = drop_workload.run(seed) catch |err| {
+        std.debug.print("sim: seed={d} failed in the drop workload\n", .{seed});
+        return err;
+    };
+    std.debug.print("sim: drops sends={d} stuck_first={d} stuck_behind={d} after_drop={d} refused_share={d}\n", .{ drops.sends, drops.stuck_first, drops.stuck_behind, drops.after_drop, drops.refused_share });
+    std.debug.print("sim: drops pending_ended={d} pending_kept={d} redrops={d}\n", .{ drops.pending_ended, drops.pending_kept, drops.redrops });
+    std.debug.print("sim: drops deadline={d} closes={d} worked={d} failed={d} exhausted={d}\n", .{ drops.deadline_drops, drops.closes, drops.drops_worked, drops.drops_failed, drops.exhausted });
+    std.debug.print("sim: drops reconnects={d} accepts={d} peer_down={d}\n", .{ drops.reconnects, drops.accepts, drops.peer_down });
+    std.debug.print("sim: drops trace={x:0>16} ok\n", .{drops.trace});
 }
