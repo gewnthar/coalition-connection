@@ -1,7 +1,7 @@
 //! The server program, installed by `zig build` as `zig-out/bin/coalition-connection`.
 //!
 //! Job: start the process in the order every later component follows: close inherited
-//! descriptors, read the config, make sure the open-file limit covers every connection it
+//! descriptors, refuse to run as the kernel's overflow user, read the config, make sure the open-file limit covers every connection it
 //! allows, size memory through the startup allocator, end startup, then run. For now there
 //! is nothing to run yet, so once the config checks out it prints its name and version and
 //! exits 0; components join here as they land.
@@ -11,9 +11,15 @@
 //! so an argument starting with `-` is refused rather than read as a path.
 //!
 //! Outputs: one line on stdout, `coalition-connection <version>`, and exit status 0. A bad
-//! command line logs the usage on stderr and exits 2. A config the server refuses, an
-//! open-file limit that can't cover every connection, or a version line it can't write,
-//! logs why on stderr and exits 1, with nothing on stdout.
+//! command line logs the usage on stderr and exits 2. Running as the overflow user, a
+//! config the server refuses, an open-file limit that can't cover every connection, or a
+//! version line it can't write, logs why on stderr and exits 1, with nothing on stdout.
+//!
+//! Overflow user: in a user namespace, a file whose owner isn't mapped shows as owned by
+//! the overflow user (/proc/sys/kernel/overflowuid, 65534 by default), so a server running
+//! as that user would take a config owned by any unmapped user as its own. Before the
+//! config is read, startup refuses to run as that user (src/overflow_user.zig), and refuses
+//! as well when it can't read which user that is.
 //!
 //! Open files: every connection holds a socket, so the soft open-file limit (RLIMIT_NOFILE)
 //! must cover the config's `connections_max` plus `descriptors_besides_connections`
@@ -123,9 +129,10 @@ pub const FileLimitError = error{
     FileLimitChanged,
 };
 
-/// Everything that stops a start after the command line: a config the server refuses, an
-/// open-file limit that can't cover every connection, or a version line it can't write.
-pub const RunError = FileLimitError || cc.config.LoadError || MainError;
+/// Everything that stops a start after the command line: running as the overflow user, a
+/// config the server refuses, an open-file limit that can't cover every connection, or a
+/// version line it can't write.
+pub const RunError = FileLimitError || cc.overflow_user.CheckError || cc.config.LoadError || MainError;
 
 /// What startup does about the open-file limit, decided by `fileLimitAction`.
 pub const FileLimitAction = union(enum) {
@@ -146,7 +153,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     assert(config_path.len > 0);
     assert(config_path.len <= config_path_max);
     // run logs each error where it happens, with what it was doing.
-    run(config_path) catch return exit_failure;
+    run(config_path, cc.overflow_user.overflow_uid_path) catch return exit_failure;
     return exit_success;
 }
 
@@ -170,12 +177,17 @@ fn configPath(arguments: std.process.Args) UsageError![:0]const u8 {
 }
 
 /// Reads and checks the config at `config_path`, then runs startup in order. For now that
-/// ends with the version line.
-fn run(config_path: [:0]const u8) RunError!void {
+/// ends with the version line. `overflow_uid_path` names the overflow user's file: the
+/// kernel's in the server, a test's own in tests.
+fn run(config_path: [:0]const u8, overflow_uid_path: [:0]const u8) RunError!void {
     assert(config_path.len > 0);
+    assert(overflow_uid_path.len > 0);
     // First, so nothing the server opens lands among the inherited descriptors. It and
     // ensureFileLimit log their own errors.
     try closeInheritedFiles();
+    // Before the config, whose owner check trusts the server's own user ID. It logs its
+    // own errors.
+    try refuseOverflowUser(overflow_uid_path, linux.geteuid());
     var startup: cc.StartupAllocator = .init(std.heap.page_allocator, cc.constants.memory_budget_bytes);
     assert(startup.allocationAllowed());
     // load frees its file buffer and parse scratch before it returns, so startup keeps only
@@ -220,6 +232,23 @@ fn closeInheritedFiles() FileLimitError!void {
         std.log.err("inherited descriptors: close_range failed, errno {d}: {t}", .{ @backingInt(close_errno), err });
         return err;
     }
+}
+
+/// Refuses to start when `server_uid` is the overflow user named by the file at `path`, or
+/// when that file can't be read or parsed, logging which. `path` is the kernel's file in the
+/// server; tests pass their own.
+fn refuseOverflowUser(path: [:0]const u8, server_uid: linux.uid_t) cc.overflow_user.CheckError!void {
+    assert(path.len > 0);
+    assert(server_uid != std.math.maxInt(linux.uid_t));
+    cc.overflow_user.check(path, server_uid) catch |err| {
+        switch (err) {
+            error.OverflowUser => std.log.err("server user {d} is the overflow user ({s}): {t}: " ++
+                "run the server as its own user", .{ server_uid, path, err }),
+            error.OverflowUidUnavailable, error.OverflowUidMalformed => std.log.err("overflow user: {s}: {t}: " ++
+                "the server can't tell whether it runs as that user", .{ path, err }),
+        }
+        return err;
+    };
 }
 
 /// The open-file limit a config allowing `connections_max` connections needs.
@@ -637,7 +666,13 @@ fn childStartRaisesLimitAndClosesInherited() u8 {
     const inherited: linux.fd_t = @intCast(memory_rc);
     assert(inherited > linux.STDERR_FILENO);
     childSetFileLimit(child_soft_limit, hard);
-    run("/proc/self/fd/0") catch return child_wrong_result;
+    const overflow_uid = cc.overflow_user.read(cc.overflow_user.overflow_uid_path) catch return child_setup_failed;
+    if (linux.geteuid() == overflow_uid) {
+        // Run as the overflow user, the start must stop before it reads the config.
+        run("/proc/self/fd/0", cc.overflow_user.overflow_uid_path) catch |err| return if (err == error.OverflowUser) child_ok else child_wrong_result;
+        return child_wrong_result;
+    }
+    run("/proc/self/fd/0", cc.overflow_user.overflow_uid_path) catch return child_wrong_result;
     const after = childFileLimit();
     if (after.cur != need or after.max != hard) return child_limit_wrong;
     const flags = linux.fcntl(inherited, linux.F.GETFD, 0);
@@ -662,6 +697,129 @@ test "main: a short soft open-file limit is raised to exactly the need, silently
 test "main: a start raises the soft limit to the config's need and closes inherited files" {
     const result = try runInChild(childStartRaisesLimitAndClosesInherited);
     try testing.expectEqual(child_ok, result.status);
+    const overflow_uid = try cc.overflow_user.read(cc.overflow_user.overflow_uid_path);
+    if (linux.geteuid() == overflow_uid) {
+        // Run as the overflow user, the start logs its refusal and nothing else.
+        const logged = result.stderr[0..result.stderr_len];
+        try testing.expect(std.mem.endsWith(u8, logged, ": OverflowUser: run the server as its own user\n"));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, logged, "\n"));
+        return;
+    }
     // A clean start logs nothing; the version line went to /dev/null.
     try testing.expectEqual(@as(u32, 0), result.stderr_len);
+}
+
+/// Child: writes `bytes` into a memory file and runs refuseOverflowUser on it for the
+/// child's own user, which must fail with `expected`.
+fn childOverflowFile(bytes: []const u8, expected: cc.overflow_user.CheckError) u8 {
+    assert(bytes.len > 0);
+    var path_bytes: [overflow_path_size]u8 = @splat(0);
+    const path = childMemoryFile(bytes, &path_bytes) orelse return child_setup_failed;
+    refuseOverflowUser(path, linux.geteuid()) catch |err| return if (err == expected) child_ok else child_wrong_result;
+    return child_wrong_result;
+}
+
+/// Room for a /proc/self/fd path and its NUL.
+const overflow_path_size: u32 = 32;
+
+/// Writes `bytes` into a new memory file and returns its /proc/self/fd path, written into
+/// `path_bytes`, or null when the child can't set it up. The file stays open.
+fn childMemoryFile(bytes: []const u8, path_bytes: *[overflow_path_size]u8) ?[:0]const u8 {
+    assert(bytes.len > 0);
+    const memory_rc = linux.memfd_create("overflowuid", linux.MFD.CLOEXEC);
+    if (linux.errno(memory_rc) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(memory_rc);
+    const written = linux.write(fd, bytes.ptr, bytes.len);
+    if (linux.errno(written) != .SUCCESS or written != bytes.len) return null;
+    const path = std.fmt.bufPrintSentinel(path_bytes, "/proc/self/fd/{d}", .{fd}, 0) catch return null;
+    assert(path.len > "/proc/self/fd/".len);
+    return path;
+}
+
+/// Child: a whole start through run, with an overflow user file naming the child's own
+/// user and a config path that doesn't exist. The start must stop at the overflow user,
+/// before it reads the config, which would fail with ConfigUnavailable.
+fn childStartRefusesOverflowUserBeforeConfig() u8 {
+    var line: [cc.constants.overflow_uid_file_size_max]u8 = undefined;
+    const bytes = std.fmt.bufPrint(&line, "{d}\n", .{linux.geteuid()}) catch return child_setup_failed;
+    var path_bytes: [overflow_path_size]u8 = @splat(0);
+    const path = childMemoryFile(bytes, &path_bytes) orelse return child_setup_failed;
+    // Startup closes every descriptor above standard error first, so the file goes on
+    // standard input, the one way it stays open into the check.
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return child_setup_failed;
+    if (linux.errno(linux.dup2(@intCast(opened), linux.STDIN_FILENO)) != .SUCCESS) return child_setup_failed;
+    run(config_missing_path, "/proc/self/fd/0") catch |err| return if (err == error.OverflowUser) child_ok else child_wrong_result;
+    return child_wrong_result;
+}
+
+const config_missing_path = "/nonexistent/coalition-connection.zon";
+
+/// Child: the overflow user named in the file is the child's own user.
+fn childRefusesOverflowUser() u8 {
+    var line: [cc.constants.overflow_uid_file_size_max]u8 = undefined;
+    const bytes = std.fmt.bufPrint(&line, "{d}\n", .{linux.geteuid()}) catch return child_setup_failed;
+    return childOverflowFile(bytes, error.OverflowUser);
+}
+
+/// Child: the overflow user file holds no number.
+fn childRefusesMalformedOverflowFile() u8 {
+    return childOverflowFile("nobody\n", error.OverflowUidMalformed);
+}
+
+/// Child: the overflow user file doesn't exist.
+fn childRefusesMissingOverflowFile() u8 {
+    const path = "/nonexistent/overflowuid";
+    refuseOverflowUser(path, linux.geteuid()) catch |err| {
+        return if (err == error.OverflowUidUnavailable) child_ok else child_wrong_result;
+    };
+    return child_wrong_result;
+}
+
+/// Child: a whole start through run with an overflow user file that doesn't exist and a
+/// config path that doesn't either. The start must stop at the overflow user file, never
+/// guessing a default, before it reads the config.
+fn childStartRefusesMissingOverflowFile() u8 {
+    run(config_missing_path, "/nonexistent/overflowuid") catch |err| {
+        return if (err == error.OverflowUidUnavailable) child_ok else child_wrong_result;
+    };
+    return child_wrong_result;
+}
+
+test "main: running as the overflow user refuses to start with OverflowUser and logs it" {
+    const result = try runInChild(childRefusesOverflowUser);
+    try testing.expectEqual(child_ok, result.status);
+    const logged = result.stderr[0..result.stderr_len];
+    try testing.expect(std.mem.find(u8, logged, " is the overflow user (/proc/self/fd/") != null);
+    try testing.expect(std.mem.find(u8, logged, "): OverflowUser: run the server as its own user\n") != null);
+}
+
+test "main: an overflow user file that can't be read or parsed refuses to start and logs it" {
+    const missing = try runInChild(childRefusesMissingOverflowFile);
+    try testing.expectEqual(child_ok, missing.status);
+    try testing.expect(std.mem.endsWith(u8, missing.stderr[0..missing.stderr_len], "overflow user: " ++
+        "/nonexistent/overflowuid: OverflowUidUnavailable: the server can't tell whether it runs as that user\n"));
+    const malformed = try runInChild(childRefusesMalformedOverflowFile);
+    try testing.expectEqual(child_ok, malformed.status);
+    const logged = malformed.stderr[0..malformed.stderr_len];
+    try testing.expect(std.mem.find(u8, logged, ": OverflowUidMalformed: the server can't tell") != null);
+}
+
+test "main: a start as the overflow user stops before it reads the config" {
+    const result = try runInChild(childStartRefusesOverflowUserBeforeConfig);
+    try testing.expectEqual(child_ok, result.status);
+    const logged = result.stderr[0..result.stderr_len];
+    try testing.expect(std.mem.endsWith(u8, logged, ": OverflowUser: run the server as its own user\n"));
+    // One line: the config was never read, so nothing names it.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, logged, "\n"));
+    try testing.expect(std.mem.find(u8, logged, "config") == null);
+}
+
+test "main: a start whose overflow user file can't be read stops before the config" {
+    const result = try runInChild(childStartRefusesMissingOverflowFile);
+    try testing.expectEqual(child_ok, result.status);
+    const logged = result.stderr[0..result.stderr_len];
+    try testing.expect(std.mem.endsWith(u8, logged, "/nonexistent/overflowuid: OverflowUidUnavailable: " ++
+        "the server can't tell whether it runs as that user\n"));
+    try testing.expect(std.mem.find(u8, logged, "coalition-connection.zon") == null);
 }

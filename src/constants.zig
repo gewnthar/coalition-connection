@@ -188,6 +188,17 @@ pub const config_fields_max: u32 = 16;
 /// signals and stops a file that keeps growing.
 pub const config_read_attempts_max: u32 = 8;
 
+/// Longest contents of /proc/sys/kernel/overflowuid that startup accepts, in bytes. Reason:
+/// the file holds one user ID in decimal and a newline: 10 digits, the width of a 32-bit ID
+/// (the largest accepted is 4294967294; 4294967295 means no user), plus the newline. The
+/// kernel itself keeps the value at most 65535.
+pub const overflow_uid_file_size_max: u32 = 11;
+
+/// read calls for /proc/sys/kernel/overflowuid. Reason: the kernel hands over the whole
+/// value in one call; the bound leaves room for a few signals, each costing a call, and
+/// stops a source that never ends. Running out refuses the start.
+pub const overflow_uid_read_attempts_max: u32 = 4;
+
 // ---- Importer and services -----------------------------------------------------------
 
 /// Largest single record in an Alliance Auth export. Reason: the importer streams the
