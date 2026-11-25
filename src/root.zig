@@ -9,6 +9,7 @@ pub const BoundedQueue = @import("bounded_queue.zig").BoundedQueue;
 pub const StartupAllocator = @import("startup_allocator.zig").StartupAllocator;
 pub const io = @import("io/root.zig");
 pub const config = @import("config.zig");
+pub const overflow_user = @import("overflow_user.zig");
 
 // Components, in build order.
 pub const sso = @import("sso/root.zig");
@@ -28,6 +29,7 @@ test {
     _ = @import("startup_allocator.zig");
     _ = io;
     _ = config;
+    _ = overflow_user;
     _ = sso;
     _ = esi;
     _ = access;
