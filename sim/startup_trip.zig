@@ -850,8 +850,10 @@ const slots_max: u32 = cc.constants.io_operations_in_flight_max;
 /// Sends the real type holds in flight before it refuses the next with SlotsKeptForAccepts; the
 /// rest of the ring is kept for accepts.
 const send_slots_max: u32 = cc.constants.io_non_accepts_in_flight_max;
-/// Empty polls `drain` allows, 1 ms apart. Reason: a socketpair send completes during the
-/// submitting system call; a second is ample even on a loaded CI machine.
+/// Empty polls `drain` and `drainReading` allow, 1 ms apart, over the whole drain. Reason:
+/// a socketpair send completes during the submitting system call, or, when the far end's
+/// buffer is full, as soon as `drainReading` reads it; a second is ample even on a loaded
+/// CI machine.
 const poll_attempts_max: u32 = 1_000;
 /// The id of the first fill send, on the real type and the simulator alike; the fills
 /// number their operations up from it. The duplicate-id cases resubmit it while that send
@@ -1395,7 +1397,10 @@ fn slotsFullHeld(real: *Real, before: *const RealBefore, result: RealResult, rem
     if (real.submitted != before.submitted or real.completed != before.completed) return false;
     if (real.ring.sq.sqe_tail != before.sqe_tail or real.last != before.last) return false;
     var completions: [send_slots_max]cc.io.Completion = undefined;
-    if (drain(real, &completions) != send_slots_max) return false;
+    // A full share of one-byte sends is more than the socketpair's buffer queues, so the far
+    // end is read while the sends drain, and must end up holding exactly one byte for each.
+    const read = drainReading(real, &completions, remote) orelse return false;
+    if (read.completed != send_slots_max or read.bytes != send_slots_max) return false;
     var seen: [send_slots_max]bool = @splat(false);
     for (completions) |completion| {
         if (completion.id == 0 or completion.id > send_slots_max) return false;
@@ -1408,20 +1413,70 @@ fn slotsFullHeld(real: *Real, before: *const RealBefore, result: RealResult, rem
         };
         if (sent != 1) return false;
     }
-    return farEndHolds(remote, send_slots_max);
+    return true;
 }
 
-/// Whether the far end holds exactly `count` fill bytes. One read of a buffer with room for
-/// one more, so a send that wrote extra bytes reads longer; on a stream socketpair every
-/// completed send's bytes are already there.
-fn farEndHolds(remote: linux.fd_t, count: u32) bool {
+/// What `drainReading` took: completions, and bytes read from the far end.
+const Drained = struct { completed: u32, bytes: u32 };
+
+/// As `drain`, but reads the far end between polls, so sends waiting for room in its
+/// buffer go out, and reads it empty once every completion has come. Every byte read must
+/// be the fill byte. Returns null when a read fails or reads anything else.
+fn drainReading(real: *Real, completions: []cc.io.Completion, remote: linux.fd_t) ?Drained {
     assert(!armed);
-    assert(count > 0 and count <= slots_max);
-    var received: [slots_max + 1]u8 = undefined;
-    const rc = linux.recvfrom(remote, &received, received.len, linux.MSG.DONTWAIT, null, null);
-    if (linux.errno(rc) != .SUCCESS) return false;
-    if (rc != count) return false;
-    return std.mem.allEqual(u8, received[0..count], fill_byte);
+    assert(completions.len > 0 and completions.len <= slots_max);
+    var drained: Drained = .{ .completed = 0, .bytes = 0 };
+    var empty: u32 = 0;
+    var polls: u32 = 0;
+    // Each poll either hands back at least one completion or counts as empty, so the loop
+    // runs at most `completions.len + poll_attempts_max` times.
+    while (drained.completed < completions.len and empty < poll_attempts_max) : (polls += 1) {
+        assert(polls < slots_max + poll_attempts_max);
+        drained.bytes += readFill(remote) orelse return null;
+        const got = real.poll(completions[drained.completed..]);
+        drained.completed += got;
+        if (got > 0) continue;
+        empty += 1;
+        const pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&pause, null);
+    }
+    // A completed send's bytes are already in the far end's buffer, at most one byte per
+    // slot, so a bounded number of reads empties it; a read that finds nothing proves it.
+    const reads_max: u32 = slots_max / far_end_read_bytes + 2;
+    var reads: u32 = 0;
+    var emptied = false;
+    while (reads < reads_max) : (reads += 1) {
+        const got = readFill(remote) orelse return null;
+        if (got == 0) {
+            emptied = true;
+            break;
+        }
+        drained.bytes += got;
+    }
+    if (!emptied) return null;
+    assert(reads < reads_max);
+    assert(drained.completed <= completions.len);
+    return drained;
+}
+
+/// Bytes one read of the far end takes at most.
+const far_end_read_bytes: u32 = 4096;
+
+/// Reads what the far end holds now, without waiting: the bytes read, 0 when it holds
+/// none, or null on a read error, end of stream or a byte other than the fill byte.
+fn readFill(remote: linux.fd_t) ?u32 {
+    assert(!armed);
+    assert(remote >= 0);
+    var scratch: [far_end_read_bytes]u8 = undefined;
+    const rc = linux.recvfrom(remote, &scratch, scratch.len, linux.MSG.DONTWAIT, null, null);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        .AGAIN => return 0,
+        else => return null,
+    }
+    if (rc == 0) return null; // Our end stays open until the case ends.
+    if (!std.mem.allEqual(u8, scratch[0..rc], fill_byte)) return null;
+    return @intCast(rc);
 }
 
 /// CLOCK_MONOTONIC read directly, in nanoseconds, for checking the real type's reading.

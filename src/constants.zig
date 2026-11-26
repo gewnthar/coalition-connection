@@ -231,16 +231,23 @@ pub const doctrine_skills_max: u32 = 512;
 /// Operations submitted to the I/O boundary and not yet completed. Reason: bounds the
 /// in-flight table, as an io_uring queue depth does, so a submission past it fails with
 /// `error.QueueFull` instead of growing anything. It is also the real ring's submission
-/// queue depth, so it must be a power of two of at most 32,768. Provisional: roadmap core 3
-/// sizes it against the connection table, since each connection may keep a read in flight.
-pub const io_operations_in_flight_max: u32 = 256;
+/// queue depth, so it must be a power of two of at most 32,768. Sized against the connection
+/// table: a connection is half-duplex, with one receive or one send in flight at a time, so
+/// `http_connections_max` operations cover every connection, and the cancels
+/// (`io_cancels_in_flight_max`) and accepts (`accepts_in_flight_max`) kept in flight come on
+/// top, checked at compile time (`ringCovers`). 4,096 + 64 + 1 needs the next power of two,
+/// 8,192; the rest is room for statements.
+pub const io_operations_in_flight_max: u32 = 8192;
 
 /// Bytes the real I/O type's io_uring ring and in-flight table may take: the ring mapping
 /// (header, completion entries, submission index) and the submission entries, each in whole
-/// pages, plus the type itself with its slots. Reason: about 34 KiB at 256 operations with
-/// 4 KiB pages; 256 KiB still holds the worst case with 64 KiB pages. `io.real` checks its
-/// worst-case estimate against this at compile time, and the kernel's mapping at startup.
-pub const io_ring_size_max: u64 = 256 * 1024;
+/// pages, plus the type itself with its slots. Reason: about 1.0 MiB at 8,192 operations,
+/// whether pages are 4 KiB or 64 KiB, so 1.5 MiB holds the worst case with room to spare.
+/// `io.real` checks its worst-case estimate against this at compile time, and the kernel's
+/// mapping at startup. Kernels before 5.12 count the ring against the locked-memory limit
+/// (RLIMIT_MEMLOCK, often 64 KiB by default there), so on those the limit must be raised
+/// or the ring's setup fails with `error.RingResources`.
+pub const io_ring_size_max: u64 = 1536 * 1024;
 
 /// Random bytes one call to the I/O boundary may draw. Reason: the largest draw is a 32-byte
 /// key; token nonces are 24 bytes.
@@ -275,6 +282,17 @@ pub const io_accept_backpressure_wait_ns: u64 = 100 * 1_000_000;
 /// them. Provisional: the server loop confirms it.
 pub const io_drop_attempts_max: u32 = 4;
 
+/// Cancels the server keeps in flight at once (roadmap core 3b). Reason: a cancel frees
+/// only a connection whose drops ran out (`io_drop_attempts_max`), which takes an errno
+/// shutdown(2) doesn't document, so cancels are rare; a share of 64 costs 64 slots rather
+/// than one per connection, and a burst of such connections still clears in a few ticks.
+/// A cancel past it waits for the next tick, which loses nothing: the connection's stuck
+/// operations keep their slots until the cancel goes in. The ring is sized to hold this many
+/// beside a receive or a send for every connection (`ringCovers`); the slots are held back
+/// from the other kinds once core 3b adds the cancel itself. Provisional: the server loop
+/// confirms it.
+pub const io_cancels_in_flight_max: u32 = 64;
+
 /// Connections the kernel queues on the local listener before the server accepts them.
 /// Reason: nginx is the only client and opens a few connections per worker, so a queue of
 /// 512 rides out a burst between two accepts; Linux caps it at `net.core.somaxconn`
@@ -306,7 +324,8 @@ pub const listener_socket_mode: u32 = 0o660;
 pub const accepts_in_flight_max: u32 = 1;
 
 /// Operations in flight that may be anything but accepts (sends and statements today,
-/// receives and cancels from core 3b): the I/O operations less the slots kept for accepts.
+/// receives from core 3b, when cancels also take `io_cancels_in_flight_max` of these as a
+/// share of their own): the I/O operations less the slots kept for accepts.
 /// Reason: a client that stops reading leaves its send pending until the connection is
 /// dropped, and enough such clients, or receives, cancels and statements piling up, could
 /// otherwise hold every slot, so that no accept could be submitted for anyone. With
@@ -450,6 +469,16 @@ pub fn memoryTableFits(table: []const MemoryRow, budget: u64) bool {
     return total <= budget;
 }
 
+/// Whether a ring of `operations` slots holds a receive or a send for each of `connections`
+/// connections (each is half-duplex, so one at a time), plus `cancels` cancels and
+/// `accepts` accepts in flight. Counts in u64, so no sum of u32 limits can wrap.
+pub fn ringCovers(operations: u32, connections: u32, cancels: u32, accepts: u32) bool {
+    assert(operations > 0);
+    assert(connections > 0);
+    const needed: u64 = @as(u64, connections) + cancels + accepts;
+    return operations >= needed;
+}
+
 // ---- Simulation and fuzzing ----------------------------------------------------------
 
 /// Simulated time per tick, in nanoseconds. Reason: 10 ms is finer than any timeout.
@@ -502,6 +531,7 @@ comptime {
     assert(accepts_in_flight_max > 0 and accepts_in_flight_max <= io_operations_in_flight_max);
     // Keeping slots for accepts leaves at least one for every other operation.
     assert(io_non_accepts_in_flight_max > 0);
+    assert(io_cancels_in_flight_max > 0);
     // fs.nr_open defaults to 1,048,576, and no hard open-file limit can pass it unless an
     // administrator raises that sysctl, so the largest config must fit below it.
     assert(descriptors_needed_max <= 1024 * 1024);
@@ -513,6 +543,14 @@ comptime {
     assert(io_drop_attempts_max >= 2);
     // A simulated run must leave room to drain every delayed completion.
     assert(sim_completion_delay_ticks_max < sim_ticks_max);
+}
+
+// The ring holds an operation for every connection, the cancels and the accepts at once,
+// so no connection waits for a slot another kind of work holds.
+comptime {
+    if (!ringCovers(io_operations_in_flight_max, http_connections_max, io_cancels_in_flight_max, accepts_in_flight_max)) {
+        @compileError("io_operations_in_flight_max: the ring can't hold an operation per connection plus the cancels and accepts");
+    }
 }
 
 // The memory budget: the buffers in the memory table, added up, must fit.
@@ -560,6 +598,26 @@ test "constants: memoryTableBytes reports overflow instead of wrapping" {
         .{ .name = "one more byte", .count = 1, .size = 1 },
     };
     try std.testing.expectError(error.Overflow, memoryTableBytes(&sum));
+}
+
+test "constants: ringCovers takes exactly enough slots and refuses one short" {
+    const connections: u32 = http_connections_max;
+    const cancels: u32 = io_cancels_in_flight_max;
+    const accepts: u32 = accepts_in_flight_max;
+    const needed: u32 = connections + cancels + accepts;
+    try std.testing.expect(ringCovers(io_operations_in_flight_max, connections, cancels, accepts));
+    // Exactly enough fits; one slot short fails, whichever of the three it is taken from.
+    try std.testing.expect(ringCovers(needed, connections, cancels, accepts));
+    try std.testing.expect(!ringCovers(needed - 1, connections, cancels, accepts));
+    try std.testing.expect(!ringCovers(needed, connections + 1, cancels, accepts));
+    try std.testing.expect(!ringCovers(needed, connections, cancels + 1, accepts));
+    try std.testing.expect(!ringCovers(needed, connections, cancels, accepts + 1));
+    // Half today's ring, the next power of two down, is too small for today's table.
+    try std.testing.expect(!ringCovers(io_operations_in_flight_max / 2, connections, cancels, accepts));
+    // The largest limits add up without wrapping.
+    const top = std.math.maxInt(u32);
+    try std.testing.expect(!ringCovers(top, top, 1, 0));
+    try std.testing.expect(ringCovers(top, top - 2, 1, 1));
 }
 
 test "constants: memoryTableFits refuses one byte over the budget" {

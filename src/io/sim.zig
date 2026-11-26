@@ -1876,7 +1876,25 @@ const DropSoakCounts = struct {
 };
 
 const drop_soak_ticks: u32 = 640;
+/// Sends `dropSoak` submits each tick until the share is full. Reason: at least
+/// `sim_fault_percent_max` of them stick (more, since a send behind a stuck one on the same
+/// connection sticks too), so the share fills within the first half of the run, by about
+/// tick 130 of 640 in practice, and the rest of the run meets a full share; the comptime
+/// check below fails if a larger ring outgrows it.
+const drop_soak_sends_per_tick: u32 = 64;
+/// Sends per tick once the share is full: enough to meet the full share every tick without
+/// paying a full ring's worth of refused submissions.
+const drop_soak_sends_when_full: u32 = 2;
 const drop_soak_accept_id: io.OperationId = 1 << 32;
+
+comptime {
+    // The sends that stick at the lowest rate, over half the run, pass the share, so the run
+    // ends with the share full and sends refused.
+    assert((@as(u64, drop_soak_ticks / 2) * drop_soak_sends_per_tick * constants.sim_fault_percent_max) / 100 > shared_slots_max);
+    // Send ids never reach the accepts' ids.
+    assert(@as(u64, drop_soak_ticks) * drop_soak_sends_per_tick <= drop_soak_accept_id);
+    assert(drop_soak_sends_when_full > 0 and drop_soak_sends_when_full < drop_soak_sends_per_tick);
+}
 
 /// The model `dropSoak` checks the table against: each peer's sends in flight, by the
 /// entry each send id went to.
@@ -1884,7 +1902,7 @@ const DropSoak = struct {
     sim: Sim,
     table: *connections.Table,
     sends: [test_peers]u32 = @splat(0),
-    send_entry: [drop_soak_ticks * 2]u8 = undefined,
+    send_entry: [drop_soak_ticks * drop_soak_sends_per_tick]u8 = undefined,
     accept_in_flight: bool = false,
     accepts_submitted: u64 = 0,
     counts: DropSoakCounts = .{},
@@ -1980,8 +1998,13 @@ fn dropSoak(seed: u64) !DropSoakCounts {
     soak.sim.attachTable(&fixture.table);
     var ticks: u32 = 0;
     while (ticks < drop_soak_ticks) : (ticks += 1) {
-        try soak.send(ticks * 2, prng.random().uintLessThan(u32, test_peers));
-        try soak.send(ticks * 2 + 1, prng.random().uintLessThan(u32, test_peers));
+        const full = soak.sim.share.others_in_flight == shared_slots_max;
+        const sends = if (full) drop_soak_sends_when_full else drop_soak_sends_per_tick;
+        var sent: u32 = 0;
+        while (sent < sends) : (sent += 1) {
+            try soak.send(ticks * drop_soak_sends_per_tick + sent, prng.random().uintLessThan(u32, test_peers));
+        }
+        assert(sent == sends);
         try soak.keepAccepting();
         try soak.tick();
     }
