@@ -12,11 +12,12 @@
 //! startup, then writes one response into a buffer cut from the middle of a larger array,
 //! with the body, a header name or a header value placed inside the buffer, across one of
 //! its edges, right next to it, or elsewhere; an in-place case ends startup, then writes
-//! one in-place response whose body offset or length sits inside, at or one past a bound.
-//! A case that `trips` must stop the process on an assertion (before the child allocator
-//! is touched, for the allocator), or, for a submitted execute, on the real type's
-//! placeholder panic; a control case makes a call its target allows and must finish
-//! normally.
+//! one in-place response whose body offset or length sits inside, at or one past a bound;
+//! a state-machine case ends startup, then asks the connection state machine for one
+//! pair's transition. A case that `trips` must stop the process on an assertion (before the
+//! child allocator is touched, for the allocator), or, for a submitted execute, on the real
+//! type's placeholder panic, or, for a pair the state machine doesn't list, on its own
+//! panic; a control case makes a call its target allows and must finish normally.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -69,30 +70,43 @@ pub const TableCall = enum(u8) {
     // lookup on the largest index a PeerId can carry, far past the table: the index field's
     // whole range must still meet the id check, not an out-of-bounds read.
     lookup_index_max,
-    // The same three calls through a stale id for the reading entry: its index is in use,
+    // The same three calls through a stale id for the idle entry: its index is in use,
     // but the id carries another generation, as an id kept past its connection's release
     // would. The generation check alone must stop these.
     release_stale,
     get_stale,
     set_state_stale,
-    // get through the reading entry's live id with only the generation's top bit flipped:
+    // get through the idle entry's live id with only the generation's top bit flipped:
     // a check that compared fewer than all 48 bits would let it through.
     get_stale_top_bit,
-    // sendCompleted, which a completion calls: through the reading entry's stale id and
+    // sendCompleted, which a completion calls: through the idle entry's stale id and
     // through the free entry, each with a send counted on the entry by hand so only the
-    // id checks can stop it; and through the reading entry's live id with no send counted.
+    // id checks can stop it; and through the idle entry's live id with no send counted.
     send_completed_stale,
     send_completed_free,
     send_completed_uncounted,
-    // Controls on the reading entry: release, get, and a move to writing.
-    release_reading,
-    get_reading,
+    // setState on an entry in use to a state no event of the state machine moves it to,
+    // with the head scan empty, so only the check against `connection_state.moves` can stop
+    // it: the writing entry to reading_head (a response half sent, read as a new head); the
+    // idle entry moved to reading_head first, then back to idle (a half-read head dropped
+    // without a response); the idle entry moved to closing first, then to writing (a
+    // closing connection brought back).
+    set_state_writing_to_head,
+    set_state_head_to_idle,
+    set_state_closing_to_writing,
+    // Controls with the same setup: reading_head to reading_body, and closing to closing,
+    // so a trip above is the move check's, not the setup's.
+    set_state_head_to_body,
+    set_state_closing_to_closing,
+    // Controls on the idle entry: release, get, and a move to writing.
+    release_idle,
+    get_idle,
     set_state_to_writing,
     // Controls on the writing entry, whose socket is 0, the lowest valid descriptor:
     // release, get, and a move back to idle, as after a response on a connection kept open.
     release_writing,
     get_writing,
-    set_state_to_reading,
+    set_state_to_idle,
 };
 
 /// A call on the real I/O type (`cc.io.real.Real`), set up on a table of
@@ -275,15 +289,49 @@ pub const InPlaceCall = enum(u8) {
     value_after_buffer,
 };
 
-/// How a tripping case must stop: on a failed assertion, or on the real type's panic for a
-/// submitted execute. A control case doesn't stop, and carries `.assertion` unused.
-pub const Panic = enum(u8) { assertion, execute_placeholder };
+/// A call to the connection state machine's `transition`
+/// (`cc.live.connection_state.transition`) on one pair of state and event. A pair the
+/// machine doesn't list must stop the process on `transition`'s own panic, which names the
+/// pair, not on an assertion: each trip pair is one `step` answers null for, and two of
+/// them would also fail `transition`'s free-entry assertion if the panic were gone, so
+/// only the panic's message tells the two apart.
+pub const StateCall = enum(u8) {
+    /// A receive's bytes on a free entry: free is left only by an accept. Without the
+    /// panic, the free-entry assertion after it fires instead.
+    free_received,
+    /// An accept on a closing entry: only a free entry is accepted into. Without the
+    /// panic, the same assertion fires instead.
+    closing_accepted,
+    /// A receive's bytes while writing: half-duplex, so no receive is in flight. Neither of
+    /// `transition`'s assertions concerns this pair, so without the panic the call returns.
+    writing_received,
+    /// A refused request while reading a body: only a head can be refused. The null comes
+    /// from the received event's own arm, not the state's; without the panic the call
+    /// returns.
+    reading_body_invalid,
+    // Controls.
+    /// A head's first bytes on an idle connection: reading_head, a receive, and the read
+    /// deadline.
+    idle_head_short,
+    /// Nothing left in flight while closing: free, release, and the deadline cleared, the
+    /// one listed pair that ends on free.
+    closing_drained,
+};
+
+/// How a tripping case must stop: on a failed assertion, on the real type's panic for a
+/// submitted execute, or on the state machine's panic for a pair it doesn't list. A control
+/// case doesn't stop, and carries `.assertion` unused.
+pub const Panic = enum(u8) { assertion, execute_placeholder, unlisted_transition };
 
 /// The panic message a failed std.debug.assert gives: it fails through `unreachable`.
 pub const message_assertion = "reached unreachable code";
 /// How the real type's execute panic begins. A prefix, so rewording the explanation after
 /// it doesn't break the case, but replacing the panic with an assertion does.
 pub const message_execute_head = "io.real: execute is a simulator placeholder;";
+/// How the state machine's panic for an unlisted pair begins. The harness matches this,
+/// then the pair's state, ": event ", the event's name and a space, so the rest of the
+/// message can be reworded, but not the part that names the pair.
+pub const message_unlisted_head = "connection state ";
 
 pub const sim_table_size: u32 = 3;
 pub const sim_peer_index: u32 = 0;
@@ -315,17 +363,17 @@ pub const table_size: u32 = 4;
 /// The one free entry; the harness acquires every entry, then releases this one. Every
 /// call is made with this one entry free, so the tests show each check at that fill level.
 pub const free_id: u32 = 1;
-/// An entry in use and reading, and one in use and writing. Each entry's socket is
+/// An entry in use and idle, and one in use and writing. Each entry's socket is
 /// `socket_base + id`, so the writing entry holds socket 0.
-pub const reading_id: u32 = 2;
+pub const idle_id: u32 = 2;
 pub const writing_id: u32 = 0;
 pub const socket_base: i32 = 0;
 
 comptime {
     assert(free_id < table_size);
-    assert(reading_id < table_size);
+    assert(idle_id < table_size);
     assert(writing_id < table_size);
-    assert(free_id != reading_id and free_id != writing_id and reading_id != writing_id);
+    assert(free_id != idle_id and free_id != writing_id and idle_id != writing_id);
     assert(socket_base + @as(i32, writing_id) == 0);
 }
 
@@ -336,6 +384,7 @@ pub const Target = union(enum) {
     sim_io: SimCall,
     http_response: ResponseCall,
     http_response_in_place: InPlaceCall,
+    connection_state: StateCall,
 };
 
 pub const Case = struct {
@@ -405,6 +454,20 @@ fn onInPlace(name: []const u8, call: InPlaceCall, outcome: Outcome) Case {
         .name = name,
         .target = .{ .http_response_in_place = call },
         .trips = outcome == .trips,
+    };
+}
+
+fn onState(name: []const u8, call: StateCall, outcome: Outcome) Case {
+    // A name longer than its group prefix: the prefix alone names no call.
+    assert(name.len > "state_".len);
+    // State-machine case names start with "state_", so the build log groups them.
+    assert(std.mem.startsWith(u8, name, "state_"));
+    return .{
+        .name = name,
+        .target = .{ .connection_state = call },
+        .trips = outcome == .trips,
+        // Only a tripping case has a panic to match.
+        .panic = if (outcome == .trips) .unlisted_transition else .assertion,
     };
 }
 
@@ -484,13 +547,21 @@ pub const cases = cases: {
         onTable("table_send_completed_stale", .send_completed_stale, .trips),
         onTable("table_send_completed_free", .send_completed_free, .trips),
         onTable("table_send_completed_uncounted", .send_completed_uncounted, .trips),
-        // Controls: the same calls on entries in use, reading and writing.
-        onTable("table_release_reading", .release_reading, .finishes),
-        onTable("table_get_reading", .get_reading, .finishes),
+        // A move the state machine doesn't make, on an entry in use with its scan empty:
+        // only setState's check against the machine's moves can stop these.
+        onTable("table_set_state_writing_to_head", .set_state_writing_to_head, .trips),
+        onTable("table_set_state_head_to_idle", .set_state_head_to_idle, .trips),
+        onTable("table_set_state_closing_to_writing", .set_state_closing_to_writing, .trips),
+        // Controls with the same setups: moves the machine makes.
+        onTable("table_set_state_head_to_body", .set_state_head_to_body, .finishes),
+        onTable("table_set_state_closing_to_closing", .set_state_closing_to_closing, .finishes),
+        // Controls: the same calls on entries in use, idle and writing.
+        onTable("table_release_idle", .release_idle, .finishes),
+        onTable("table_get_idle", .get_idle, .finishes),
         onTable("table_set_state_to_writing", .set_state_to_writing, .finishes),
         onTable("table_release_writing", .release_writing, .finishes),
         onTable("table_get_writing", .get_writing, .finishes),
-        onTable("table_set_state_to_reading", .set_state_to_reading, .finishes),
+        onTable("table_set_state_to_idle", .set_state_to_idle, .finishes),
         // The real I/O type: its clock never steps back, it refuses an execute, a send must
         // name an entry in use (checked before the queue), an id in flight is refused before
         // the sends' share and the queue, and it is set up during startup only.
@@ -562,6 +633,17 @@ pub const cases = cases: {
         // Controls: a header value right before the buffer, and right after it.
         onInPlace("response_in_place_value_before_buffer", .value_before_buffer, .finishes),
         onInPlace("response_in_place_value_after_buffer", .value_after_buffer, .finishes),
+        // The state machine: a pair it doesn't list stops the process on its own panic, from a
+        // state's arm (free, closing, writing) and from the received event's arm (a body
+        // refused).
+        onState("state_free_received", .free_received, .trips),
+        onState("state_closing_accepted", .closing_accepted, .trips),
+        onState("state_writing_received", .writing_received, .trips),
+        onState("state_reading_body_invalid", .reading_body_invalid, .trips),
+        // Controls: a listed pair, and the one listed pair that ends on free. Each must return
+        // its exact transition.
+        onState("state_idle_head_short", .idle_head_short, .finishes),
+        onState("state_closing_drained", .closing_drained, .finishes),
     };
 };
 
@@ -633,7 +715,7 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .connection_table => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .real_io, .sim_io, .http_response, .http_response_in_place => {},
+            .startup_allocator, .real_io, .sim_io, .http_response, .http_response_in_place, .connection_state => {},
         };
         assert(found == 1);
     }
@@ -642,7 +724,7 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .real_io => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .connection_table, .sim_io, .http_response, .http_response_in_place => {},
+            .startup_allocator, .connection_table, .sim_io, .http_response, .http_response_in_place, .connection_state => {},
         };
         assert(found == 1);
     }
@@ -651,7 +733,7 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .sim_io => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .connection_table, .real_io, .http_response, .http_response_in_place => {},
+            .startup_allocator, .connection_table, .real_io, .http_response, .http_response_in_place, .connection_state => {},
         };
         assert(found == 1);
     }
@@ -660,7 +742,7 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .http_response => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .connection_table, .real_io, .sim_io, .http_response_in_place => {},
+            .startup_allocator, .connection_table, .real_io, .sim_io, .http_response_in_place, .connection_state => {},
         };
         assert(found == 1);
     }
@@ -669,13 +751,24 @@ comptime {
         var found: u32 = 0;
         for (cases) |case| switch (case.target) {
             .http_response_in_place => |case_call| found += @intFromBool(case_call == call),
-            .startup_allocator, .connection_table, .real_io, .sim_io, .http_response => {},
+            .startup_allocator, .connection_table, .real_io, .sim_io, .http_response, .connection_state => {},
         };
         assert(found == 1);
     }
-    // Only real-I/O cases expect a panic other than an assertion.
+    // Every state-machine call has exactly one case.
+    for (std.enums.values(StateCall)) |call| {
+        var found: u32 = 0;
+        for (cases) |case| switch (case.target) {
+            .connection_state => |case_call| found += @intFromBool(case_call == call),
+            .startup_allocator, .connection_table, .real_io, .sim_io, .http_response, .http_response_in_place => {},
+        };
+        assert(found == 1);
+    }
+    // Only real-I/O and state-machine cases expect a panic other than an assertion, and a
+    // state-machine trip expects only the machine's own.
     for (cases) |case| switch (case.target) {
-        .real_io => {},
+        .real_io => assert(case.panic != .unlisted_transition),
+        .connection_state => assert(case.panic == (if (case.trips) Panic.unlisted_transition else Panic.assertion)),
         .startup_allocator,
         .connection_table,
         .sim_io,

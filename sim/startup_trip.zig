@@ -22,7 +22,8 @@
 //!   1   a panic outside the call: in setup, or in a control's checks after it
 //!   2   a trip case's call returned without tripping: the check is missing
 //!   3   the call panicked, but not the way its case expects: not on an assertion, or for
-//!       a submitted execute, not on the real type's placeholder panic
+//!       a submitted execute, not on the real type's placeholder panic, or for a pair the
+//!       state machine doesn't list, not on its panic naming that pair
 //!   4   setup failed
 //!   5   the call reached the child allocator before tripping: the guard came too late
 //!   6   a control case's call was refused, or left the accounting or the table wrong
@@ -113,6 +114,22 @@
 //! controls put the value right before the buffer and right after it, so an overlap check
 //! one byte too wide trips one. The cases can't see when the fields are checked, before
 //! the head is written or after: the head never writes over a field that passes.
+//!
+//! For the connection state machine, `transition` stops the process on a pair of state and
+//! event it doesn't list, with a panic that names the pair. A trip case passes only on that
+//! panic, with that pair's names in it: two of the pairs (a receive on a free entry, an
+//! accept on a closing one) also break `transition`'s assertion that only an accept takes a
+//! free entry, so without the panic they stop on that assertion instead (exit 3); the other
+//! two (a receive while writing, a refusal while reading a body) break nothing else, so
+//! without the panic they return (exit 2). Two controls ask for listed pairs, one of them
+//! the only pair that ends on free, and must get their exact transition back.
+//!
+//! The table's `setState` asserts that the state machine makes the move it is asked for.
+//! Three trip cases ask for moves it doesn't make on an entry in use with its head scan
+//! empty, so no other check in `setState` applies: writing to reading_head, reading_head to
+//! idle and closing to writing, the last two after the harness moves the idle entry to
+//! reading_head or closing first. Without the move check each returns (exit 2). Two controls
+//! make allowed moves from the same setups.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -163,6 +180,7 @@ comptime {
         .sim_io => |call| assert(c.trips != simCallAllowed(call)),
         .http_response => |call| assert(c.trips != responseCallAllowed(call)),
         .http_response_in_place => |call| assert(c.trips != inPlaceCallAllowed(call)),
+        .connection_state => |call| assert(c.trips != stateCallAllowed(call)),
     };
 }
 
@@ -174,6 +192,12 @@ var panic_expected: trip.Panic = .assertion;
 /// Set just before the one call and cleared just after, so the panic handler can tell a
 /// trip in that call from a panic anywhere else.
 var armed: bool = false;
+/// For a state-machine trip, how its panic message must begin: the machine's prefix, then
+/// the pair's state and event, so a panic over some other pair doesn't pass. Set before the
+/// call is armed; empty for every other case.
+var unlisted_expected: [unlisted_expected_max]u8 = undefined;
+var unlisted_expected_len: u32 = 0;
+const unlisted_expected_max: u32 = 96;
 /// Calls that reached the child allocator, counted by `Tripwire`.
 var child_calls: u32 = 0;
 var child_calls_armed: u32 = 0;
@@ -189,10 +213,12 @@ fn onPanic(message: []const u8, first_trace_address: ?usize) noreturn {
         std.process.exit(exit_early_panic);
     }
     // std.debug.assert fails through `unreachable`, whose safety panic has this message;
-    // the real type's execute panic begins with its own.
+    // the real type's execute panic and the state machine's begin with their own.
     const expected = switch (panic_expected) {
         .assertion => std.mem.eql(u8, message, trip.message_assertion),
         .execute_placeholder => std.mem.startsWith(u8, message, trip.message_execute_head),
+        .unlisted_transition => unlisted_expected_len > 0 and
+            std.mem.startsWith(u8, message, unlisted_expected[0..unlisted_expected_len]),
     };
     if (!expected) {
         std.debug.print("startup_trip: {s} panicked, but not as expected ({t}): {s}\n", .{
@@ -299,6 +325,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         .sim_io => |call| runSimCase(&startup, call, case),
         .http_response => |call| runResponseCase(&startup, call, case),
         .http_response_in_place => |call| runInPlaceCase(&startup, call, case),
+        .connection_state => |call| runStateCase(&startup, call, case),
     }
 }
 
@@ -463,13 +490,18 @@ const Entry = connections.Entry;
 /// agree.
 fn tableCallAllowed(call: trip.TableCall) bool {
     const allowed = switch (call) {
-        .release_reading,
-        .get_reading,
+        .release_idle,
+        .get_idle,
         .set_state_to_writing,
         .release_writing,
         .get_writing,
-        .set_state_to_reading,
+        .set_state_to_idle,
+        .set_state_head_to_body,
+        .set_state_closing_to_closing,
         => true,
+        .set_state_writing_to_head,
+        .set_state_head_to_idle,
+        .set_state_closing_to_writing,
         .release_free,
         .get_free,
         .set_state_free,
@@ -491,12 +523,63 @@ fn tableCallAllowed(call: trip.TableCall) bool {
         => false,
     };
     // Every allowed call names an entry in use under its live generation; every forbidden
-    // one names the free entry, a move to free, an id out of range, or a stale generation.
+    // one names the free entry, an id out of range, a stale generation, an uncounted send,
+    // or a move the state machine doesn't make (a move to free among them), worked out from
+    // the state the entry is in when the call is made.
     const parts: connections.IdParts = @bitCast(tableCallId(call));
     const live = parts.index < trip.table_size and parts.index != trip.free_id and
         parts.generation == live_generation;
-    assert(allowed == (live and call != .set_state_to_free and call != .send_completed_uncounted));
+    const move_ok = if (!live) true else if (tableMoveTo(call)) |to|
+        cc.live.connection_state.moves(tableStateAtCall(call), to)
+    else
+        true;
+    assert(allowed == (live and call != .send_completed_uncounted and move_ok));
     return allowed;
+}
+
+/// The state the entry a live call names is in when the call is made: its setup state, or
+/// the one the harness moves it to first.
+fn tableStateAtCall(call: trip.TableCall) connections.State {
+    const index = tableCallIndex(call);
+    assert(index < trip.table_size and index != trip.free_id);
+    const setup: connections.State = if (index == trip.writing_id) .writing else .idle;
+    const state = tableMoveFirst(call) orelse setup;
+    // The harness moves only the idle entry first, so the writing entry is always writing.
+    assert(index != trip.writing_id or state == .writing);
+    return state;
+}
+
+/// The state the harness moves the idle entry to before the call, through a move the state
+/// machine makes, or null where the call needs the setup as it is.
+fn tableMoveFirst(call: trip.TableCall) ?connections.State {
+    const first: ?connections.State = switch (call) {
+        .set_state_head_to_idle, .set_state_head_to_body => .reading_head,
+        .set_state_closing_to_writing, .set_state_closing_to_closing => .closing,
+        else => null,
+    };
+    // Only the idle entry is moved first, and never to free or back to idle.
+    assert(first == null or tableCallIndex(call) == trip.idle_id);
+    assert(first == null or (first.? != .free and first.? != .idle));
+    return first;
+}
+
+/// The state a setState call asks for, or null for a call that isn't a setState.
+fn tableMoveTo(call: trip.TableCall) ?connections.State {
+    const to: ?connections.State = switch (call) {
+        .set_state_free, .set_state_out_of_range, .set_state_stale, .set_state_to_writing => .writing,
+        .set_state_closing_to_writing => .writing,
+        .set_state_to_free => .free,
+        .set_state_to_idle, .set_state_head_to_idle => .idle,
+        .set_state_writing_to_head => .reading_head,
+        .set_state_head_to_body => .reading_body,
+        .set_state_closing_to_closing => .closing,
+        else => null,
+    };
+    // Every call moved first is a setState, and only one call asks for free, the move
+    // only release may make.
+    assert(to != null or tableMoveFirst(call) == null);
+    assert((to == .free) == (call == .set_state_to_free));
+    return to;
 }
 
 /// The generation of every entry the harness holds in use: none of them is ever released.
@@ -506,14 +589,17 @@ const live_generation: connections.Generation = 0;
 fn tableCallIndex(call: trip.TableCall) u32 {
     const index: u32 = switch (call) {
         .release_free, .get_free, .set_state_free, .send_completed_free => trip.free_id,
-        .send_completed_stale, .send_completed_uncounted => trip.reading_id,
+        .send_completed_stale, .send_completed_uncounted => trip.idle_id,
         .release_free_stale_socket, .get_free_stale_socket => trip.free_id,
         .release_out_of_range, .get_out_of_range, .set_state_out_of_range => trip.table_size,
         .lookup_out_of_range => trip.table_size,
         .lookup_index_max => std.math.maxInt(connections.Index),
-        .release_reading, .get_reading, .set_state_to_writing, .set_state_to_free => trip.reading_id,
-        .release_stale, .get_stale, .set_state_stale, .get_stale_top_bit => trip.reading_id,
-        .release_writing, .get_writing, .set_state_to_reading => trip.writing_id,
+        .release_idle, .get_idle, .set_state_to_writing, .set_state_to_free => trip.idle_id,
+        .release_stale, .get_stale, .set_state_stale, .get_stale_top_bit => trip.idle_id,
+        .release_writing, .get_writing, .set_state_to_idle => trip.writing_id,
+        .set_state_writing_to_head => trip.writing_id,
+        .set_state_head_to_idle, .set_state_head_to_body => trip.idle_id,
+        .set_state_closing_to_writing, .set_state_closing_to_closing => trip.idle_id,
     };
     assert(index <= trip.table_size or
         (call == .lookup_index_max and index == std.math.maxInt(connections.Index)));
@@ -546,7 +632,7 @@ fn tableCallId(call: trip.TableCall) connections.PeerId {
         free_generation
     else
         live_generation;
-    assert(!stale or index == trip.reading_id); // A stale id names an entry in use.
+    assert(!stale or index == trip.idle_id); // A stale id names an entry in use.
     assert(index < trip.table_size or generation == live_generation);
     return @bitCast(connections.IdParts{ .index = @intCast(index), .generation = generation });
 }
@@ -590,8 +676,9 @@ fn runTableCase(startup: *cc.StartupAllocator, call: trip.TableCall, case: trip.
     table.assertInvariants();
     assert(table.count() == trip.table_size - 1);
     assert(table.entries[trip.free_id].state == .free);
-    assert(table.entries[trip.reading_id].state == .idle);
+    assert(table.entries[trip.idle_id].state == .idle);
     assert(table.entries[trip.writing_id].state == .writing);
+    if (tableMoveFirst(call)) |first| table.setState(tableCallId(call), first);
     if (call == .release_free_stale_socket or call == .get_free_stale_socket) {
         // A valid-looking socket in a free entry, as a stale field would leave.
         table.entries[trip.free_id].socket = socketOf(trip.free_id);
@@ -632,7 +719,7 @@ fn callTable(table: *connections.Table, call: trip.TableCall) connections.Socket
         .release_free,
         .release_free_stale_socket,
         .release_out_of_range,
-        .release_reading,
+        .release_idle,
         .release_writing,
         .release_stale,
         // The harness never counts a send, so a refusal can only mean the table is wrong:
@@ -645,19 +732,22 @@ fn callTable(table: *connections.Table, call: trip.TableCall) connections.Socket
         .get_out_of_range,
         .get_stale,
         .get_stale_top_bit,
-        .get_reading,
+        .get_idle,
         .get_writing,
         => table.get(id).socket,
-        .set_state_free, .set_state_out_of_range, .set_state_stale, .set_state_to_writing => state: {
-            table.setState(id, .writing);
-            break :state -1;
-        },
-        .set_state_to_free => state: {
-            table.setState(id, .free);
-            break :state -1;
-        },
-        .set_state_to_reading => state: {
-            table.setState(id, .idle);
+        .set_state_free,
+        .set_state_out_of_range,
+        .set_state_stale,
+        .set_state_to_writing,
+        .set_state_to_free,
+        .set_state_to_idle,
+        .set_state_writing_to_head,
+        .set_state_head_to_idle,
+        .set_state_closing_to_writing,
+        .set_state_head_to_body,
+        .set_state_closing_to_closing,
+        => state: {
+            table.setState(id, tableMoveTo(call).?);
             break :state -1;
         },
         .send_completed_stale, .send_completed_free, .send_completed_uncounted => completed: {
@@ -693,27 +783,26 @@ fn tableControlHeld(
     const entry = table.entries[index];
     const expected: Entry = switch (call) {
         // A release advances the entry's generation, so the id it was called with is stale.
-        .release_reading, .release_writing => .{
+        .release_idle, .release_writing => .{
             .socket = -1,
             .state = .free,
             .generation = before[index].generation +% 1,
         },
-        .get_reading, .get_writing => before[index],
-        .set_state_to_writing => state: {
+        .get_idle, .get_writing => before[index],
+        .set_state_to_writing,
+        .set_state_to_idle,
+        .set_state_head_to_body,
+        .set_state_closing_to_closing,
+        => state: {
             var moved = before[index];
-            moved.state = .writing;
-            break :state moved;
-        },
-        .set_state_to_reading => state: {
-            var moved = before[index];
-            moved.state = .idle;
+            moved.state = tableMoveTo(call).?;
             break :state moved;
         },
         else => unreachable, // tableCallAllowed: the comptime block admits only these.
     };
     if (!std.meta.eql(entry, expected)) return false;
-    const released = call == .release_reading or call == .release_writing;
-    const socket_expected: connections.Socket = if (call == .get_reading or call == .get_writing or released)
+    const released = call == .release_idle or call == .release_writing;
+    const socket_expected: connections.Socket = if (call == .get_idle or call == .get_writing or released)
         socketOf(index)
     else
         -1;
@@ -2069,4 +2158,94 @@ fn drainSim(sim: *Sim, completions: []cc.io.Completion) u32 {
     }
     assert(count <= completions.len);
     return count;
+}
+
+const connection_state = cc.live.connection_state;
+
+/// The state and event a state-machine call names.
+const StatePair = struct {
+    from: connection_state.State,
+    event: connection_state.Event,
+};
+
+fn statePair(call: trip.StateCall) StatePair {
+    const pair: StatePair = switch (call) {
+        .free_received => .{ .from = .free, .event = .{ .received = .head_short } },
+        .closing_accepted => .{ .from = .closing, .event = .accepted },
+        .writing_received => .{ .from = .writing, .event = .{ .received = .{ .complete = .keep_open } } },
+        .reading_body_invalid => .{ .from = .reading_body, .event = .{ .received = .{ .invalid = .bad_request } } },
+        .idle_head_short => .{ .from = .idle, .event = .{ .received = .head_short } },
+        .closing_drained => .{ .from = .closing, .event = .drained },
+    };
+    // The two pairs that break the free-entry rule are the two the cases file says also
+    // trip on `transition`'s assertion without its panic; the others break no such rule.
+    const breaks_free_rule = (pair.from == .free) != (pair.event == .accepted);
+    assert(breaks_free_rule == (call == .free_received or call == .closing_accepted));
+    // A refusal carries an error status, as the loop gives it, so `step`'s own check of the
+    // event passes and only the pair is wrong.
+    assert(pair.event != .received or pair.event.received != .invalid or
+        @backingInt(pair.event.received.invalid) >= 400);
+    return pair;
+}
+
+/// The transition a control's pair must give, or null for a pair the machine doesn't list,
+/// written out from connection_state.zig's header table, not read back from `step`.
+fn stateExpected(call: trip.StateCall) ?connection_state.Transition {
+    const expected: ?connection_state.Transition = switch (call) {
+        .idle_head_short => .{ .to = .reading_head, .action = .receive, .deadline = .read },
+        .closing_drained => .{ .to = .free, .action = .release, .deadline = .clear },
+        .free_received, .closing_accepted, .writing_received, .reading_body_invalid => null,
+    };
+    // Only drained ends on free, and only a transition to free clears the deadline.
+    const pair = statePair(call);
+    assert(expected == null or ((expected.?.to == .free) == (pair.event == .drained)));
+    assert(expected == null or ((expected.?.to == .free) == (expected.?.deadline == .clear)));
+    return expected;
+}
+
+/// Whether the machine lists the call's pair: the controls. The cases file says the same
+/// through each case's outcome, and the comptime block at the top checks the two agree.
+fn stateCallAllowed(call: trip.StateCall) bool {
+    const allowed = stateExpected(call) != null;
+    // A trip's pair is one the machine doesn't list, and a control's one it does, so a trip
+    // can only stop on the machine's panic for an unlisted pair.
+    const pair = statePair(call);
+    assert(allowed == (connection_state.step(pair.from, pair.event) != null));
+    // A control lands where the machine says: its expected transition is the listed one.
+    assert(!allowed or connection_state.step(pair.from, pair.event).?.to == stateExpected(call).?.to);
+    return allowed;
+}
+
+/// Ends startup (the machine allocates nothing and keeps no state), then asks `transition`
+/// for the case's one pair.
+fn runStateCase(startup: *cc.StartupAllocator, call: trip.StateCall, case: trip.Case) noreturn {
+    assert(startup.bytes_live == 0);
+    assert(startup.phase == .startup);
+    startup.finishStartup();
+    const pair = statePair(call);
+    // Matched up to the space after the event's name, so a longer event name can't pass.
+    const head = std.fmt.bufPrint(&unlisted_expected, "{s}{t}: event {t} ", .{
+        trip.message_unlisted_head, pair.from, std.meta.activeTag(pair.event),
+    }) catch setupFailed(case, "found the panic message buffer too short");
+    assert(head.len > trip.message_unlisted_head.len);
+    assert(std.mem.startsWith(u8, head, trip.message_unlisted_head));
+    unlisted_expected_len = @intCast(head.len);
+
+    child_calls_armed = child_calls;
+    armed = true;
+    const result = connection_state.transition(pair.from, pair.event);
+    armed = false;
+
+    if (case.trips) {
+        std.debug.print("startup_trip: {s} returned without tripping: the check is missing\n", .{case.name});
+        std.process.exit(exit_not_tripped);
+    }
+    const expected = stateExpected(call).?;
+    if (!std.meta.eql(result, expected)) {
+        std.debug.print("startup_trip: {s} control failed: to={t} action={t} deadline={t}\n", .{
+            case.name, result.to, std.meta.activeTag(result.action), result.deadline,
+        });
+        std.process.exit(exit_control_failed);
+    }
+    std.process.exit(trip.exit_finished);
 }
