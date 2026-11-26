@@ -708,8 +708,10 @@ comptime {
 }
 
 comptime {
-    // Every case is visited once per enum value below.
-    @setEvalBranchQuota(10_000);
+    // Every case is visited once per enum value below. Each value has exactly one case, so
+    // there are at most cases_max values in all and at most cases_max * cases_max turns of
+    // the inner loops; doubled for the outer loops and std.enums.values.
+    @setEvalBranchQuota(2 * cases_max * cases_max);
     // Every table call has exactly one case.
     for (std.enums.values(TableCall)) |call| {
         var found: u32 = 0;
