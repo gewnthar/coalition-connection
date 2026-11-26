@@ -19,7 +19,9 @@
 //! returns `error.SlotsKeptForAccepts` and changes nothing, even with a slot free. The rest,
 //! `constants.accepts_in_flight_max`, stay for accepts, so clients that stop reading, each
 //! with a send stuck on a full socket buffer, can't take the whole ring and stop the server
-//! accepting anyone else.
+//! accepting anyone else. Accepts are counted in `share` too: one past
+//! `constants.accepts_in_flight_max` is a caller's bug, since each holds a descriptor when it
+//! completes, so `submit` stops the process on it before checking the ring.
 //!
 //! Sends: `IORING_OP_SEND` on the peer's socket from the connection table, with
 //! `MSG_NOSIGNAL`, so a peer that has gone away fails the send with `EPIPE` instead of
@@ -313,7 +315,8 @@ pub const Real = struct {
     /// and for an accept while the wait after a Backpressure runs, `error.AcceptTooSoon`.
     /// The first two change nothing, the last only the wait's refusal count and the clock's
     /// latest reading, and a full ring wins when it and another hold. An id already in
-    /// flight breaks the contract and stops the process, full ring or not.
+    /// flight breaks the contract and stops the process, full ring or not, and so does an
+    /// accept past `constants.accepts_in_flight_max`.
     pub fn submit(self: *Real, submission: io.Submission) io.SubmitError!void {
         comptime assertLinux();
         const submitted_before = self.submitted;
@@ -331,6 +334,9 @@ pub const Real = struct {
         // Looked up before anything changes: a peer not in the table is a caller's bug.
         const socket = self.socketFor(submission.operation);
         self.assertIdNotInFlight(submission.id);
+        // A second accept past `constants.accepts_in_flight_max` is a caller's bug, checked
+        // before the queue, as above.
+        self.share.assertAcceptRoom(submission.operation);
         assert(self.sends_in_flight <= shared_slots_max);
         if (self.free_count == 0) return error.QueueFull;
         // The slots past shared_slots_max are kept for accepts.
@@ -488,6 +494,7 @@ pub const Real = struct {
         assert(occupied == self.inFlight());
         assert(sends == self.sends_in_flight);
         assert(occupied - accepts == self.share.others_in_flight);
+        assert(accepts == self.share.accepts_in_flight);
     }
 
     /// The socket an operation acts on, checked before anything changes: a send's peer from
@@ -1455,9 +1462,11 @@ test "real: with every send slot held by a stuck send, an accept still goes in a
     try fixture.real.submit(.{ .id = 1000, .operation = accept });
     try testing.expectEqual(slots_count, fixture.real.inFlight());
     try testing.expectEqual(@as(u32, 0), fixture.real.free_count);
+    try testing.expectEqual(constants.accepts_in_flight_max, fixture.real.share.accepts_in_flight);
     const slots_before = fixture.real.slots;
-    try testing.expectError(error.QueueFull, fixture.real.submit(.{ .id = 1001, .operation = accept }));
     // A send meets both limits now; the full ring is the one it reports, as on the simulator.
+    // A second accept would pass `constants.accepts_in_flight_max`, a caller's bug that stops
+    // the process before the ring is checked (the startup-trip harness covers it).
     try testing.expectError(error.QueueFull, fixture.send(1001, "w"));
     try testing.expectEqualSlices(Slot, &slots_before, &fixture.real.slots);
     try loopback.connect();
@@ -2106,7 +2115,12 @@ test "real: a second Backpressure starts the wait again" {
     try testing.expectEqual(@as(?io.Instant, second), fixture.real.accept_wait.resume_at);
 }
 
-test "real: a full ring refuses an accept with QueueFull while the wait runs" {
+test "real: with the share full, the slot kept for accepts still waits out a Backpressure" {
+    // A full ring and a running wait can't both meet an accept: a full ring already holds
+    // `constants.accepts_in_flight_max` accepts, so another would be a caller's bug (the
+    // startup-trip harness covers it). The nearest case is every send slot in use and the
+    // kept slot free: the accept is refused by the wait, not by the share.
+    comptime assert(slots_count - shared_slots_max == constants.accepts_in_flight_max);
     var fixture: Fixture = undefined;
     try fixture.setUp();
     defer fixture.tearDown();
@@ -2114,34 +2128,28 @@ test "real: a full ring refuses an accept with QueueFull while the wait runs" {
     try loopback.open();
     defer loopback.close();
 
-    // An accept in the slot kept for accepts, before any wait, and a one-byte send in
-    // every slot a send may take: every slot is in use until the next poll.
-    try fixture.real.submit(.{ .id = 0, .operation = .{ .accept = .{ .listener = loopback.listener } } });
     var id: io.OperationId = 1;
     while (id <= shared_slots_max) : (id += 1) try fixture.send(id, "x");
-    try testing.expectEqual(@as(u32, 0), fixture.real.free_count);
+    try testing.expectEqual(slots_count - shared_slots_max, fixture.real.free_count);
     try testing.expectError(error.Backpressure, fixture.real.acceptResult(accept_short));
-    // The wait just started, so it runs: both refusals hold.
-    try testing.expect(fixture.real.now() < fixture.real.accept_wait.resume_at.?);
-
-    // The full ring is reported, and the wait's count is untouched.
+    const resume_at = fixture.real.accept_wait.resume_at orelse return error.TestExpectedWait;
     const late: io.Submission = .{ .id = id, .operation = .{ .accept = .{ .listener = loopback.listener } } };
-    try testing.expectError(error.QueueFull, fixture.real.submit(late));
-    try testing.expectEqual(@as(u64, 0), fixture.real.accept_wait.refused);
+    try testing.expectError(error.AcceptTooSoon, fixture.real.submit(late));
+    try testing.expectEqual(@as(u64, 1), fixture.real.accept_wait.refused);
+    try testing.expectEqual(@as(u32, 0), fixture.real.share.accepts_in_flight);
 
-    // With the sends back, the ring has room. A fresh Backpressure starts the wait again,
-    // so it surely runs, and the same accept meets AcceptTooSoon: both refusals held above.
+    // Once the wait is over, the accept takes the kept slot and fills the ring; it takes
+    // the connection once the sends are back.
+    try sleepUntil(&fixture.real, resume_at);
+    try fixture.real.submit(late);
+    try testing.expectEqual(@as(u32, 0), fixture.real.free_count);
+    try testing.expectEqual(constants.accepts_in_flight_max, fixture.real.share.accepts_in_flight);
     var completions: [slots_count]io.Completion = undefined;
     try pollUntil(&fixture.real, &completions, shared_slots_max, fixture.remote);
     for (completions[0..shared_slots_max]) |completion| try testing.expectEqual(@as(u32, 1), try completion.result.send);
-    try testing.expectError(error.Backpressure, fixture.real.acceptResult(accept_short));
-    try testing.expectError(error.AcceptTooSoon, fixture.real.submit(late));
-    try testing.expectEqual(@as(u64, 1), fixture.real.accept_wait.refused);
-
-    // The first accept still takes the connection.
     try loopback.connect();
     try pollUntil(&fixture.real, &completions, 1, -1);
-    try testing.expectEqual(@as(io.OperationId, 0), completions[0].id);
+    try testing.expectEqual(late.id, completions[0].id);
     const peer = try completions[0].result.accept;
     // No send is submitted on the new connection, so nothing holds its release back.
     assert(fixture.table.get(peer).sends_in_flight == 0);
@@ -2684,24 +2692,28 @@ test "real: a seeded send soak over socketpairs completes every send once and fr
     }
 }
 
-/// Entries in the accept soak's table. Reason: small, so a batch of connections often finds
-/// it full and each entry is taken and released many times in one run.
+/// Entries in the accept soak's table that accepts take. Reason: small, so a batch of
+/// connections often finds it full and each entry is taken and released many times in one
+/// run. The table has one more, `accept_soak_filler_index`, for the connection whose stuck
+/// sends fill the ring.
 const accept_soak_table_size: u32 = 4;
-/// Rounds per seed. Each round tops up the accepts in flight, connects clients for some of
-/// them, and releases some of the connections held.
+/// The entry the filler takes: the first acquire hands out entry 0, before any accept.
+const accept_soak_filler_index: connections.Index = 0;
+/// Rounds per seed. Each round connects a batch of clients, accepts them one at a time and
+/// releases some of the connections held.
 const accept_soak_rounds_max: u32 = 24;
-/// Every `accept_soak_period`-th round starts a period: it fills the ring with accepts, so
-/// every slot is taken. The period's last round connects a client for every accept still in
-/// flight and releases every connection held, so the next period starts from nothing.
+/// Every `accept_soak_period`-th round starts a period: one accept goes in, then stuck sends
+/// to the filler fill every other slot, so every slot is taken. The period's last round
+/// reads the filler's far end until every send is back, takes one last client and releases
+/// every connection held, so the next period starts from nothing.
 const accept_soak_period: u32 = 8;
-/// Clients connected before their accepts are polled back. Reason: four times the table, so
-/// a batch often finds the table full partway; far below the listener's backlog, so a
-/// connect never waits.
+/// Clients connected before their accepts are polled back, one accept at a time. Reason:
+/// four times the table, so a batch often finds the table full partway; far below the
+/// listener's backlog, so a connect never waits.
 const accept_soak_batch_max: u32 = 16;
-/// Accepts a round between the period's ends may add to those in flight.
-const accept_soak_top_up_max: u32 = 24;
-/// Operation ids a run can use: each round submits at most a full ring.
-const accept_soak_ids_max: u32 = accept_soak_rounds_max * slots_count;
+/// Operation ids a run can use: a period's fill takes a full ring, and each round's batch
+/// at most `accept_soak_batch_max` accepts more.
+const accept_soak_ids_max: u32 = accept_soak_rounds_max * (slots_count + accept_soak_batch_max);
 /// Reads one check of a client or an accepted socket may take, 1 ms apart, before the soak
 /// gives up on the kernel. Reason: a close or a write on a Unix socket reaches the other end
 /// within the system call; a second is ample even on a loaded CI machine.
@@ -2729,7 +2741,10 @@ comptime {
     assert(accept_soak_batch_max > accept_soak_table_size);
     // A batch's connections all fit the backlog, so no connect waits for an accept.
     assert(accept_soak_batch_max <= constants.listener_backlog);
-    assert(accept_soak_top_up_max <= slots_count);
+    // One accept in flight at a time, as the server keeps, and the rest of the ring is the
+    // sends' share, so a fill takes every slot.
+    assert(constants.accepts_in_flight_max == 1);
+    assert(shared_slots_max + constants.accepts_in_flight_max == slots_count);
     // At least two whole periods, so every slot and every entry is taken twice from empty.
     assert(accept_soak_rounds_max % accept_soak_period == 0);
     assert(accept_soak_rounds_max / accept_soak_period >= 2);
@@ -2738,7 +2753,12 @@ comptime {
     // The socket path fits what the listener takes.
     assert(accept_soak_dir_bytes - 1 + accept_soak_socket_name.len <= constants.config_socket_path_max);
     assert(slots_count <= std.math.maxInt(u16)); // A slot index fits `id_slots`.
+    // The filler's entry is part of the table, beside those accepts take.
+    assert(accept_soak_filler_index < accept_soak_table_size + 1);
 }
+
+/// Entries in the accept soak's table: those accepts take, and the filler's.
+const accept_soak_capacity: u32 = accept_soak_table_size + 1;
 
 /// A connection the soak's table holds: its id, the client's end and the accepted end.
 const AcceptSoakHeld = struct {
@@ -2747,9 +2767,11 @@ const AcceptSoakHeld = struct {
     accepted: linux.fd_t,
 };
 
-/// A seeded run of many accepts over the local listener into a small table, with every
-/// connection held for a while and then released. Set up in place, because `Real` keeps a
-/// pointer to the table.
+/// A seeded run of many accepts over the local listener into a small table, one accept in
+/// flight at a time, with every connection held for a while and then released. A filler
+/// connection, a socketpair whose send buffer is full, takes stuck sends in every slot the
+/// accept leaves, so the ring is full and every slot is taken in each period. Set up in
+/// place, because `Real` keeps a pointer to the table.
 const AcceptSoak = struct {
     seed: u64,
     schedule: std.Random.DefaultPrng,
@@ -2767,7 +2789,14 @@ const AcceptSoak = struct {
     lock_bytes: [constants.config_socket_path_max + 8]u8,
     lock_len: u8,
     local: listener.Listener,
-    /// Accepts submitted so far; the next accept's id is this.
+    /// The filler's end in the table, its id, and its far end, which nothing reads until a
+    /// period's last round, so sends to the filler stay stuck until then.
+    filler_local: linux.fd_t,
+    filler_remote: linux.fd_t,
+    filler: io.PeerId,
+    /// Sends to the filler in flight.
+    filler_sends: u32,
+    /// Operations submitted so far, accepts and sends; the next one's id is this.
     submitted: u64,
     completed: u64,
     /// The ids submitted and not yet completed, and the ring slot each id took.
@@ -2777,12 +2806,13 @@ const AcceptSoak = struct {
     clients_connected: u32,
     held: [accept_soak_table_size]AcceptSoakHeld,
     held_count: u32,
-    /// Times each ring slot was taken by an accept, and each table entry by a connection.
+    /// Times each ring slot was taken by an accept or a send, and each table entry by an
+    /// accepted connection.
     slot_uses: [slots_count]u32,
-    entry_uses: [accept_soak_table_size]u32,
+    entry_uses: [accept_soak_capacity]u32,
     /// The id each entry was last released under, if any: it must never resolve again, and
     /// the entry's next id must differ from it.
-    stale: [accept_soak_table_size]?io.PeerId,
+    stale: [accept_soak_capacity]?io.PeerId,
     /// Accepts that completed with TableFull; `Real.refused` must say the same.
     refused: u64,
 
@@ -2800,12 +2830,15 @@ const AcceptSoak = struct {
         errdefer _ = linux.unlink(lock_path);
         self.local = try listener.open(socket_path);
         errdefer self.local.close();
-        self.startup = .init(testing.allocator, accept_soak_table_size * connections.entry_bytes);
+        self.startup = .init(testing.allocator, accept_soak_capacity * connections.entry_bytes);
         self.gpa = self.startup.allocator();
-        self.table = try connections.Table.init(self.gpa, accept_soak_table_size);
+        self.table = try connections.Table.init(self.gpa, accept_soak_capacity);
         errdefer self.table.deinit(self.gpa);
+        try self.setUpFiller();
+        errdefer self.closeFiller();
         self.real = try Real.init(&self.startup, &self.table);
         self.startup.finishStartup();
+        self.filler_sends = 0;
         self.submitted = 0;
         self.completed = 0;
         self.in_flight_ids = .empty;
@@ -2818,7 +2851,42 @@ const AcceptSoak = struct {
         self.stale = @splat(null);
         self.refused = 0;
         assert(self.real.inFlight() == 0);
+        assert(self.table.count() == 1);
+    }
+
+    /// Opens the filler's socketpair and puts its end in the table, at
+    /// `accept_soak_filler_index`; each period's fill round fills its send buffer.
+    fn setUpFiller(self: *AcceptSoak) !void {
         assert(self.table.count() == 0);
+        var fds: [2]linux.fd_t = .{ -1, -1 };
+        const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &fds)));
+        self.filler_local = fds[0];
+        self.filler_remote = fds[1];
+        errdefer self.closeFiller();
+        self.filler = try self.table.acquire(self.filler_local);
+        const parts: connections.IdParts = @bitCast(self.filler);
+        try testing.expectEqual(accept_soak_filler_index, parts.index);
+        assert(self.table.count() == 1);
+    }
+
+    /// Closes both ends of the filler's socketpair; its entry, if still held, is released
+    /// first by the caller.
+    fn closeFiller(self: *AcceptSoak) void {
+        assert(self.filler_local >= 0);
+        assert(self.filler_remote >= 0);
+        _ = linux.close(self.filler_remote);
+        _ = linux.close(self.filler_local);
+        self.filler_remote = -1;
+        self.filler_local = -1;
+    }
+
+    /// Connections the table holds for accepts: all but the filler.
+    fn acceptedCount(self: *const AcceptSoak) u32 {
+        const count = self.table.count();
+        assert(count >= 1); // The filler is held for the whole run.
+        assert(count <= accept_soak_capacity);
+        return count - 1;
     }
 
     /// Makes a fresh 0700 directory, skipping any name already taken.
@@ -2868,7 +2936,11 @@ const AcceptSoak = struct {
             if (connection.client >= 0) _ = linux.close(connection.client);
         }
         self.held_count = 0;
-        const wanted = self.real.inFlight();
+        // Closing the filler's far end fails every send still stuck on it.
+        _ = linux.close(self.filler_remote);
+        self.filler_remote = -1;
+        // A client for the accept in flight, if any; the filler's sends need none.
+        const wanted = self.real.share.accepts_in_flight;
         var connected: u32 = 0;
         while (connected < wanted) : (connected += 1) {
             const client = self.connectNonBlocking() orelse break;
@@ -2884,6 +2956,8 @@ const AcceptSoak = struct {
         }
         assert(polls <= poll_attempts_max);
         self.releaseLive();
+        _ = linux.close(self.filler_local);
+        self.filler_local = -1;
         self.local.close();
         _ = linux.unlink(self.lockPath());
         _ = linux.rmdir(self.dirPath());
@@ -2896,23 +2970,30 @@ const AcceptSoak = struct {
     }
 
     /// Releases every entry in use and closes its socket, during teardown only: a failed
-    /// check may leave entries the soak never recorded.
+    /// check may leave entries the soak never recorded. The filler's socket is closed by
+    /// the caller; an entry whose sends never came back is left, as the ring is.
     fn releaseLive(self: *AcceptSoak) void {
         assert(self.held_count == 0);
+        var left: u32 = 0;
         for (self.table.entries, 0..) |entry, index| {
             if (entry.state == .free) continue;
             const peer: io.PeerId = @bitCast(connections.IdParts{
                 .index = @intCast(index),
                 .generation = entry.generation,
             });
-            // Accepts never send, so nothing holds a release back.
-            assert(entry.sends_in_flight == 0);
             const socket = self.table.release(peer) catch |err| switch (err) {
-                error.SendsInFlight => unreachable, // Asserted above.
+                error.SendsInFlight => {
+                    // Only the filler sends; accepted connections never do.
+                    assert(index == accept_soak_filler_index);
+                    left += 1;
+                    continue;
+                },
             };
-            _ = linux.close(socket);
+            if (index != accept_soak_filler_index) _ = linux.close(socket);
         }
-        assert(self.table.count() == 0);
+        // Only the filler sends.
+        assert(left <= 1);
+        assert(self.table.count() == left);
     }
 
     /// The listener's address and its length, for connect.
@@ -2951,11 +3032,28 @@ const AcceptSoak = struct {
     }
 
     /// Submits one accept on the listener and records the slot it took.
-    fn submitOne(self: *AcceptSoak) !void {
+    fn submitAccept(self: *AcceptSoak) !void {
+        assert(self.real.share.accepts_in_flight == 0);
+        try self.submitOne(.{ .accept = .{ .listener = self.local.socket } });
+        assert(self.real.share.accepts_in_flight == 1);
+    }
+
+    /// Submits one one-byte send to the filler, which sticks, and records the slot it took.
+    fn submitFillerSend(self: *AcceptSoak) !void {
+        const in_flight_before = self.filler_sends;
+        try self.submitOne(.{ .send = .{ .peer = self.filler, .bytes = "x" } });
+        self.filler_sends += 1;
+        assert(self.filler_sends > in_flight_before);
+        assert(self.real.sends_in_flight == self.filler_sends); // Only the filler sends.
+        assert(self.table.get(self.filler).sends_in_flight == self.filler_sends);
+    }
+
+    /// Submits one operation under the next id and records the slot it took.
+    fn submitOne(self: *AcceptSoak, operation: io.Operation) !void {
         assert(self.real.inFlight() < slots_count);
         assert(self.submitted < accept_soak_ids_max);
         const id = self.submitted;
-        try self.real.submit(.{ .id = id, .operation = .{ .accept = .{ .listener = self.local.socket } } });
+        try self.real.submit(.{ .id = id, .operation = operation });
         self.submitted += 1;
         // Exactly one slot in use holds the new id; found by search, so the test doesn't
         // depend on how the free list orders slots.
@@ -2963,7 +3061,7 @@ const AcceptSoak = struct {
         for (self.real.slots, 0..) |slot, index| {
             if (!slot.in_use or slot.id != id) continue;
             try testing.expect(found == null);
-            try testing.expectEqual(io.Kind.accept, slot.kind);
+            try testing.expectEqual(@as(io.Kind, operation), slot.kind);
             found = @intCast(index);
         }
         const index = found orelse return error.TestExpectedSlot;
@@ -2974,21 +3072,24 @@ const AcceptSoak = struct {
         assert(self.in_flight_ids.count() == self.real.inFlight());
     }
 
-    /// A full ring refuses one more accept and changes nothing.
+    /// A full ring refuses one more send and changes nothing. (Another accept would pass
+    /// `constants.accepts_in_flight_max`, a bug that stops the process.)
     fn expectFullRefusal(self: *AcceptSoak) !void {
         assert(self.real.inFlight() == slots_count);
         assert(self.real.free_count == 0);
         const submitted_before = self.real.submitted;
         const sqe_tail_before = self.real.ring.sq.sqe_tail;
         const slots_before = self.real.slots;
+        const filler_before = self.table.get(self.filler).*;
         const refused: io.Submission = .{
             .id = self.submitted,
-            .operation = .{ .accept = .{ .listener = self.local.socket } },
+            .operation = .{ .send = .{ .peer = self.filler, .bytes = "x" } },
         };
         try testing.expectError(error.QueueFull, self.real.submit(refused));
         try testing.expectEqual(submitted_before, self.real.submitted);
         try testing.expectEqual(sqe_tail_before, self.real.ring.sq.sqe_tail);
         try testing.expectEqualSlices(Slot, &slots_before, &self.real.slots);
+        try testing.expectEqual(filler_before, self.table.get(self.filler).*);
         try testing.expectEqual(slots_count, self.real.inFlight());
     }
 
@@ -3034,7 +3135,7 @@ const AcceptSoak = struct {
     /// first client's number.
     fn connectBatch(self: *AcceptSoak, clients: []linux.fd_t) !u32 {
         assert(clients.len > 0 and clients.len <= accept_soak_batch_max);
-        assert(clients.len <= self.real.inFlight());
+        assert(self.real.share.accepts_in_flight == 1); // Something will take each one.
         const first_number = self.clients_connected;
         for (clients) |*client| {
             assert(client.* == -1);
@@ -3050,25 +3151,54 @@ const AcceptSoak = struct {
         return first_number;
     }
 
-    /// Polls until `completions` is full, asking each poll for a random number of the
-    /// completions still due, so a poll often has fewer places than the ring has ready.
-    /// Fails the test if the kernel stops completing.
-    fn pollBatch(self: *AcceptSoak, completions: []io.Completion) !void {
-        assert(completions.len > 0 and completions.len <= accept_soak_batch_max);
-        assert(completions.len <= self.real.inFlight());
-        const want: u32 = @intCast(completions.len);
-        var count: u32 = 0;
+    /// Polls until the one accept in flight completes and returns its completion, each poll
+    /// with a buffer of a random size, so a poll has more places than the ring has ready.
+    /// (With one accept in flight, polls shorter than the ready count are left to the send
+    /// soak.) The filler's sends stay stuck meanwhile, so nothing else may complete. Fails
+    /// the test if the kernel stops completing.
+    fn pollAccept(self: *AcceptSoak) !io.Completion {
+        assert(self.real.share.accepts_in_flight == 1);
+        assert(self.real.inFlight() == self.filler_sends + 1);
+        var completions: [accept_soak_batch_max]io.Completion = undefined;
+        var empty_polls: u32 = 0;
+        while (empty_polls < poll_attempts_max) : (empty_polls += 1) {
+            const size = self.poll_sizes.random().intRangeAtMost(u32, 1, accept_soak_batch_max);
+            const got = self.real.poll(completions[0..size]);
+            if (got > 0) {
+                try testing.expectEqual(@as(u32, 1), got);
+                try testing.expect(completions[0].result == .accept);
+                return completions[0];
+            }
+            const pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+            _ = linux.nanosleep(&pause, null);
+        }
+        // Nothing came back: the accept still holds its slot.
+        assert(self.real.share.accepts_in_flight == 1);
+        return error.TestAcceptNeverCompleted;
+    }
+
+    /// Reads the filler's far end until every send stuck on it has come back with its one
+    /// byte. The accept in flight has no client, so it keeps waiting. Fails the test if
+    /// the sends stop coming back.
+    fn drainFiller(self: *AcceptSoak) !void {
+        assert(self.filler_sends > 0);
+        assert(self.real.share.accepts_in_flight == 1);
+        var completions: [slots_count]io.Completion = undefined;
         var empty_polls: u32 = 0;
         var polls: u32 = 0;
-        // Each non-empty poll takes at least one completion, so at most `want` of them, each
+        // Each non-empty poll takes at least one send, so at most a ring of them, each
         // after at most poll_attempts_max empty ones.
-        const polls_max: u32 = want * (poll_attempts_max + 1);
-        while (count < want and empty_polls < poll_attempts_max) : (polls += 1) {
+        const polls_max: u32 = slots_count * (poll_attempts_max + 1);
+        while (self.filler_sends > 0 and empty_polls < poll_attempts_max) : (polls += 1) {
             assert(polls < polls_max);
-            const size = self.poll_sizes.random().intRangeAtMost(u32, 1, want - count);
-            const got = self.real.poll(completions[count..][0..size]);
-            try testing.expect(got <= size);
-            count += got;
+            _ = try readSome(self.filler_remote);
+            const got = self.real.poll(completions[0..self.filler_sends]);
+            for (completions[0..got]) |completion| {
+                try testing.expect(completion.result == .send);
+                try testing.expectEqual(@as(u32, 1), try completion.result.send);
+                try self.recordCompletion(completion);
+                self.filler_sends -= 1;
+            }
             if (got > 0) {
                 empty_polls = 0;
                 continue;
@@ -3077,7 +3207,9 @@ const AcceptSoak = struct {
             const pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
             _ = linux.nanosleep(&pause, null);
         }
-        try testing.expectEqual(want, count);
+        try testing.expectEqual(@as(u32, 0), self.filler_sends);
+        try testing.expectEqual(@as(connections.SendCount, 0), self.table.get(self.filler).sends_in_flight);
+        try testing.expectEqual(@as(u32, 1), self.real.inFlight());
     }
 
     /// Checks one completion's id: one in flight, completed once, whose slot is free again.
@@ -3093,30 +3225,29 @@ const AcceptSoak = struct {
         assert(self.completed <= self.submitted);
     }
 
-    /// Connects `count` clients, each writing its number, and polls back the `count` accepts
-    /// they complete. The table takes exactly as many as it has room for; the rest complete
-    /// with TableFull and their connections are closed. Each connection taken is matched to
-    /// its client by the number it wrote, so the entry's socket is shown to be its accepted
-    /// end.
-    fn batch(self: *AcceptSoak, count: u32) !void {
+    /// Connects `count` clients, each writing its number, then accepts them one at a time:
+    /// each completion is followed by the next accept, so one stays in flight, unless
+    /// `last` and it was the batch's last client. The table takes exactly as many as it has
+    /// room for; the rest complete with TableFull and their connections are closed. Each
+    /// connection taken is matched to its client by the number it wrote, so the entry's
+    /// socket is shown to be its accepted end.
+    fn batch(self: *AcceptSoak, count: u32, last: bool) !void {
         assert(count > 0 and count <= accept_soak_batch_max);
-        assert(self.held_count == self.table.count());
+        assert(self.held_count == self.acceptedCount());
         const room = accept_soak_table_size - self.held_count;
         var clients: [accept_soak_batch_max]linux.fd_t = @splat(-1);
         defer for (clients) |client| {
             if (client >= 0) _ = linux.close(client);
         };
         const first_number = try self.connectBatch(clients[0..count]);
-        var completions: [accept_soak_batch_max]io.Completion = undefined;
-        const in_flight_before = self.real.inFlight();
-        try self.pollBatch(completions[0..count]);
-        // Only `count` clients connected, so no other accept had anything to take.
-        try testing.expectEqual(in_flight_before - count, self.real.inFlight());
         var taken: u32 = 0;
         var refused_here: u32 = 0;
         var matched: [accept_soak_batch_max]bool = @splat(false);
-        for (completions[0..count]) |completion| {
+        var index: u32 = 0;
+        while (index < count) : (index += 1) {
+            const completion = try self.pollAccept();
             try self.recordCompletion(completion);
+            if (!last or index + 1 < count) try self.submitAccept();
             if (completion.result.accept) |peer| {
                 // The table had room at this completion, so no TableFull came before it in
                 // the batch: nothing was released in between.
@@ -3125,7 +3256,7 @@ const AcceptSoak = struct {
                 try self.recordTaken(peer, &clients, &matched, first_number);
             } else |err| switch (err) {
                 error.TableFull => {
-                    try testing.expectEqual(accept_soak_table_size, self.table.count());
+                    try testing.expectEqual(accept_soak_table_size, self.acceptedCount());
                     refused_here += 1;
                 },
                 // A local listener's connection can't fail on the network, and the soak
@@ -3137,7 +3268,8 @@ const AcceptSoak = struct {
         try testing.expectEqual(count - taken, refused_here);
         self.refused += refused_here;
         try testing.expectEqual(self.refused, self.real.refused);
-        try testing.expectEqual(self.held_count, self.table.count());
+        try testing.expectEqual(self.held_count, self.acceptedCount());
+        try testing.expectEqual(self.filler_sends + @intFromBool(!last), self.real.inFlight());
         // Every refused connection was closed before its completion was handed back, so its
         // client reads end of stream.
         for (clients[0..count], matched[0..count]) |client, was_taken| {
@@ -3167,7 +3299,8 @@ const AcceptSoak = struct {
             try testing.expect(other.accepted != entry.socket);
         }
         const parts: connections.IdParts = @bitCast(peer);
-        try testing.expect(parts.index < accept_soak_table_size);
+        try testing.expect(parts.index < accept_soak_capacity);
+        try testing.expect(parts.index != accept_soak_filler_index);
         // The entry's last id went stale at its release: the new one differs, and the old
         // one no longer reaches the entry now that it is in use again.
         if (self.stale[parts.index]) |stale| {
@@ -3197,7 +3330,7 @@ const AcceptSoak = struct {
     /// its id goes stale, and once the soak closes that end its client reads end of stream.
     fn releaseAt(self: *AcceptSoak, position: u32) !void {
         assert(position < self.held_count);
-        assert(self.held_count == self.table.count());
+        assert(self.held_count == self.acceptedCount());
         const connection = self.held[position];
         const count_before = self.table.count();
         const socket = try self.table.release(connection.peer);
@@ -3217,7 +3350,7 @@ const AcceptSoak = struct {
 
     /// Releases some held connections, picked by the schedule.
     fn releaseSome(self: *AcceptSoak) !void {
-        assert(self.held_count == self.table.count());
+        assert(self.held_count == self.acceptedCount());
         const random = self.schedule.random();
         const releases = random.uintAtMost(u32, self.held_count);
         var done: u32 = 0;
@@ -3225,7 +3358,7 @@ const AcceptSoak = struct {
             assert(self.held_count > 0);
             try self.releaseAt(random.uintLessThan(u32, self.held_count));
         }
-        assert(self.held_count == self.table.count());
+        assert(self.held_count == self.acceptedCount());
     }
 
     /// Releases every held connection.
@@ -3237,51 +3370,44 @@ const AcceptSoak = struct {
             try self.releaseAt(self.held_count - 1);
         }
         assert(releases == held_before);
-        assert(self.table.count() == 0);
+        assert(self.acceptedCount() == 0);
     }
 
-    /// The first round of a period: fill the ring, see one more accept refused, and run a
-    /// batch larger than the table, so TableFull comes up in every period.
+    /// The first round of a period: one accept goes in, stuck sends to the filler take every
+    /// other slot, a full ring refuses one more send, and a batch larger than the table
+    /// runs, so TableFull comes up in every period.
     fn fillRound(self: *AcceptSoak) !void {
         // The previous period ended with nothing in flight, so every slot is taken anew.
         try testing.expectEqual(@as(u32, 0), self.real.inFlight());
-        try testing.expectEqual(@as(u32, 0), self.table.count());
-        var submissions: u32 = 0;
-        while (submissions < slots_count) : (submissions += 1) try self.submitOne();
-        assert(submissions == slots_count);
+        try testing.expectEqual(@as(u32, 0), self.acceptedCount());
+        _ = try fillSendBuffer(self.filler_local);
+        try self.submitAccept();
+        var sends: u32 = 0;
+        while (sends < shared_slots_max) : (sends += 1) try self.submitFillerSend();
+        assert(sends == shared_slots_max);
+        try expectStuck(&self.real);
         try self.expectFullRefusal();
-        try self.batch(accept_soak_batch_max);
+        try self.batch(accept_soak_batch_max, false);
         try self.releaseSome();
     }
 
-    /// One round. The first of a period fills the ring; the last connects a client for
-    /// every accept still in flight and releases everything; the others top up a little,
-    /// run one batch and release some.
+    /// One round. The first of a period fills the ring; the last brings the filler's sends
+    /// back, takes one last batch with no accept after it, and releases everything; the
+    /// others run one batch and release some.
     fn round(self: *AcceptSoak, number: u32) !void {
         assert(number < accept_soak_rounds_max);
         const phase = number % accept_soak_period;
         if (phase == 0) return self.fillRound();
+        // The fill round left one accept in flight, and each batch since put one back.
+        assert(self.real.share.accepts_in_flight == 1);
         const random = self.schedule.random();
-        const room = slots_count - self.real.inFlight();
-        const top_up = random.uintAtMost(u32, @min(room, accept_soak_top_up_max));
-        var submissions: u32 = 0;
-        while (submissions < top_up) : (submissions += 1) try self.submitOne();
-        assert(submissions == top_up);
+        const size = random.intRangeAtMost(u32, 1, accept_soak_batch_max);
         if (phase == accept_soak_period - 1) {
-            // Each batch takes at least one accept, so at most a full ring of batches.
-            var batches: u32 = 0;
-            while (self.real.inFlight() > 0) : (batches += 1) {
-                assert(batches < slots_count);
-                const size = random.intRangeAtMost(u32, 1, @min(self.real.inFlight(), accept_soak_batch_max));
-                try self.batch(size);
-                try self.releaseSome();
-            }
-            assert(batches <= slots_count);
+            try self.drainFiller();
+            try self.batch(size, true);
             return self.releaseAll();
         }
-        if (self.real.inFlight() == 0) return;
-        const size = random.intRangeAtMost(u32, 1, @min(self.real.inFlight(), accept_soak_batch_max));
-        try self.batch(size);
+        try self.batch(size, false);
         try self.releaseSome();
     }
 
@@ -3307,13 +3433,18 @@ const AcceptSoak = struct {
         try testing.expectEqual(self.submitted, self.real.submitted);
         try testing.expectEqual(self.real.submitted, self.real.completed);
         try testing.expectEqual(self.refused, self.real.refused);
-        try testing.expectEqual(@as(u32, 0), self.table.count());
+        try testing.expectEqual(@as(u32, 0), self.acceptedCount());
+        try testing.expectEqual(@as(u32, 0), self.filler_sends);
+        try testing.expectEqual(@as(u32, 0), self.real.share.accepts_in_flight);
         try testing.expectEqual(@as(u64, 0), self.real.accept_errno_undocumented_count);
         // The soak's own coverage, not the code's: these fail if a change to the constants
         // or the schedule stops it taking every slot and every entry in every period.
         const periods = accept_soak_rounds_max / accept_soak_period;
         for (self.slot_uses) |uses| try testing.expect(uses >= periods);
-        for (self.entry_uses) |uses| try testing.expect(uses >= periods);
+        for (self.entry_uses, 0..) |uses, index| {
+            if (index == accept_soak_filler_index) continue;
+            try testing.expect(uses >= periods);
+        }
         self.table.assertInvariants();
     }
 };

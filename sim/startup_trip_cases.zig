@@ -133,6 +133,14 @@ pub const RealCall = enum(u8) {
     send_duplicate_id_queue_full,
     /// `Real.init` after startup has finished.
     init_running,
+    /// A second accept while the first still waits on its listener, with the ring
+    /// otherwise empty: accepts in flight would pass `accepts_in_flight_max`, so the call
+    /// trips. The share's own count trips it too when the accept is taken, so this case
+    /// pins neither check alone; the queue-full case below pins the early one.
+    accept_second,
+    /// The same with every slot a send may take in use too, so the ring is full: the accept
+    /// limit is checked before the queue, so the call trips instead of returning QueueFull.
+    accept_second_queue_full,
     // Controls.
     /// `now` on a fresh type: a reading at or after the last, which becomes the last.
     now_fresh,
@@ -177,6 +185,14 @@ pub const SimCall = enum(u8) {
     /// harness clears the entry's count first, so the release goes through): the
     /// completion must stop on the table's live-id check, not uncount a dead entry quietly.
     complete_released,
+    /// A second accept while the first is still in flight, with nothing else in flight:
+    /// accepts in flight would pass `accepts_in_flight_max`, so the call trips, through the
+    /// same check as on the real type.
+    accept_second,
+    /// The same with every slot in use (a send in each slot a send may take, the first
+    /// accept in the slot kept back): the accept limit is checked before the queue, as on
+    /// the real type, so the call trips instead of returning QueueFull.
+    accept_second_queue_full,
     // Controls.
     /// A send to the entry in use: counted on the entry, which then refuses to release,
     /// and uncounted when it completes with every byte sent.
@@ -493,7 +509,8 @@ pub const cases = cases: {
         onTable("table_set_state_to_reading", .set_state_to_reading, .finishes),
         // The real I/O type: its clock never steps back, it refuses an execute, a send must
         // name an entry in use (checked before the queue), an id in flight is refused before
-        // the sends' share and the queue, and it is set up during startup only.
+        // the sends' share and the queue, it is set up during startup only, and a second
+        // accept in flight is refused, before the queue.
         onReal("real_now_after_max", .now_after_max, .trips),
         onReal("real_submit_execute", .submit_execute, .trips),
         onReal("real_send_free", .send_free, .trips),
@@ -504,6 +521,8 @@ pub const cases = cases: {
         onReal("real_send_duplicate_id_slots_full", .send_duplicate_id_slots_full, .trips),
         onReal("real_send_duplicate_id_queue_full", .send_duplicate_id_queue_full, .trips),
         onReal("real_init_running", .init_running, .trips),
+        onReal("real_accept_second", .accept_second, .trips),
+        onReal("real_accept_second_queue_full", .accept_second_queue_full, .trips),
         // Controls: the clock read once, a send to the entry in use, and that send on a full
         // ring.
         onReal("real_now_fresh", .now_fresh, .finishes),
@@ -512,8 +531,8 @@ pub const cases = cases: {
         // The simulator: a send must name a live entry, checked through the table before the
         // queue, as on the real type: a stale id, the free entry, or an index past the table;
         // a send needs a table to check it against; an id in flight is refused before the
-        // sends' share and the queue; and a send that outlived its entry stops when it
-        // completes.
+        // sends' share and the queue; a send that outlived its entry stops when it
+        // completes; and a second accept in flight is refused, before the queue.
         onSim("sim_send_stale", .send_stale, .trips),
         onSim("sim_send_free", .send_free, .trips),
         onSim("sim_send_out_of_range", .send_out_of_range, .trips),
@@ -522,6 +541,8 @@ pub const cases = cases: {
         onSim("sim_send_duplicate_id_queue_full", .send_duplicate_id_queue_full, .trips),
         onSim("sim_send_duplicate_id_slots_full", .send_duplicate_id_slots_full, .trips),
         onSim("sim_complete_released", .complete_released, .trips),
+        onSim("sim_accept_second", .accept_second, .trips),
+        onSim("sim_accept_second_queue_full", .accept_second_queue_full, .trips),
         // Controls: a send to the entry in use, and that send with every slot in use.
         onSim("sim_send_peer", .send_peer, .finishes),
         onSim("sim_send_queue_full", .send_queue_full, .finishes),

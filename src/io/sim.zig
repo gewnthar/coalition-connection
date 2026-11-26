@@ -24,7 +24,9 @@
 //! the wait the real type keeps: until `constants.io_accept_backpressure_wait_ns` of
 //! simulated time has passed, `submit` refuses every accept with `error.AcceptTooSoon`,
 //! draws nothing and changes nothing but the wait's refusal count (`io.AcceptWait`, the
-//! type the real one keeps too), so the loop is tested against it.
+//! type the real one keeps too), so the loop is tested against it. As on the real type, at
+//! most `constants.accepts_in_flight_max` accepts may be in flight; another crashes, before
+//! the queue is checked (`io.SlotShare.assertAcceptRoom`).
 //!
 //! Sends: a send goes through the attached table with the same calls the real type makes.
 //! Its peer is looked up at submit, before the queue is checked, so a free, stale or
@@ -265,8 +267,10 @@ pub const Sim = struct {
     /// accept while the wait after a Backpressure runs `error.AcceptTooSoon`, as on the real
     /// type, in that order when more than one holds; each draws nothing and takes no slot,
     /// and only the last changes a count, the wait's refusals. An id already in flight
-    /// breaks the contract and crashes, full table or not. The one exception to the delay:
-    /// a send that sticks (`setDropFaults`) completes only once its connection is dropped.
+    /// breaks the contract and crashes, full table or not, and so does an accept past
+    /// `constants.accepts_in_flight_max`, through the same check as on the real type. The
+    /// one exception to the delay: a send that sticks (`setDropFaults`) completes only once
+    /// its connection is dropped.
     pub fn submit(self: *Sim, submission: io.Submission) io.SubmitError!void {
         comptime assertSimulationAllowed();
         assert(self.in_flight <= slots_count);
@@ -278,6 +282,9 @@ pub const Sim = struct {
         // crashes, full queue or not.
         const sends_before = self.sendsCounted(submission.operation);
         self.assertIdNotInFlight(submission.id);
+        // A second accept past `constants.accepts_in_flight_max` is a caller's bug, checked
+        // before the queue through the same call as on the real type.
+        self.share.assertAcceptRoom(submission.operation);
         assert(self.sends_in_flight <= shared_slots_max);
         if (self.in_flight == slots_count) return error.QueueFull;
         // The operations past shared_slots_max are kept for accepts.
@@ -530,6 +537,7 @@ pub const Sim = struct {
         assert(occupied == self.in_flight);
         assert(sends == self.sends_in_flight);
         assert(occupied - accepts == self.share.others_in_flight);
+        assert(accepts == self.share.accepts_in_flight);
     }
 
     /// Takes a free slot, scanning from a seeded offset.
@@ -995,12 +1003,14 @@ test "sim: past the share kept from accepts, a send and a statement are refused 
     try testing.expectEqualDeep(slots_before, sim.slots);
     try testing.expectEqual(outcomes_before, sim.outcomes.s);
 
-    // The operations kept back take an accept; then the table is full for every kind.
+    // The operations kept back take an accept; then the table is full for every kind. A
+    // second accept would pass `constants.accepts_in_flight_max`, a caller's bug that stops
+    // the process before the queue is checked (the startup-trip harness covers it).
     const accept: io.Submission = .{ .id = id, .operation = .{ .accept = .{ .listener = test_listener } } };
     try sim.submit(accept);
     try testing.expectEqual(slots_count, sim.in_flight);
     try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
-    try testing.expectError(error.QueueFull, sim.submit(.{ .id = id + 1, .operation = accept.operation }));
+    try testing.expectEqual(constants.accepts_in_flight_max, sim.share.accepts_in_flight);
     try testing.expectError(error.QueueFull, sim.submit(.{ .id = id + 1, .operation = statement.operation }));
     try testing.expectError(error.QueueFull, sim.submit(.{ .id = id + 1, .operation = send.operation }));
 
@@ -1011,6 +1021,7 @@ test "sim: past the share kept from accepts, a send and a statement are refused 
     try testing.expectEqual(slots_count, sim.poll(&completions));
     try testing.expectEqual(@as(u32, 0), sim.sends_in_flight);
     try testing.expectEqual(@as(u32, 0), sim.share.others_in_flight);
+    try testing.expectEqual(@as(u32, 0), sim.share.accepts_in_flight);
     try testing.expectEqual(@as(u32, 0), sim.in_flight);
     try fixture.expectNoSendsCounted();
 }
@@ -1236,10 +1247,13 @@ test "sim: accepts take table entries under fresh sockets until the table is ful
     defer fixture.tearDown();
     var sim = Sim.init(21, 0);
     sim.attachTable(&fixture.table);
-    var id: io.OperationId = 0;
-    while (id < 6) : (id += 1) try sim.submit(acceptSubmission(id));
+    // One accept in flight at a time, as `constants.accepts_in_flight_max` allows.
     var completions: [6]io.Completion = undefined;
-    try testing.expectEqual(@as(u32, 6), drainAll(&sim, &completions));
+    var id: io.OperationId = 0;
+    while (id < 6) : (id += 1) {
+        try sim.submit(acceptSubmission(id));
+        try testing.expectEqual(@as(u32, 1), drainAll(&sim, completions[@intCast(id)..][0..1]));
+    }
 
     var sockets_seen: [6]io.Socket = @splat(-1);
     var accepted: u32 = 0;
@@ -1271,9 +1285,11 @@ test "sim: accepts take table entries under fresh sockets until the table is ful
     }
 }
 
-/// Runs `ids.len` accepts at the largest fault rate into a table of `size`, records each
-/// completion's id and outcome (the peer, or 1, 2 or 3 shifted past any peer for
-/// TableFull, PeerDown and Backpressure) in completion order, and returns the simulator.
+/// Runs `ids.len` accepts at the largest fault rate into a table of `size`, one at a time
+/// as `constants.accepts_in_flight_max` allows, waiting out each Backpressure by ticking.
+/// Records each completion's id and outcome (the peer, or 1, 2 or 3 shifted past any peer
+/// for TableFull, PeerDown and Backpressure) in completion order, and returns the
+/// simulator.
 fn acceptRun(seed: u64, size: u32, ids: []io.OperationId, results: []u64) !Sim {
     assert(ids.len == results.len);
     assert(ids.len <= slots_count);
@@ -1282,9 +1298,19 @@ fn acceptRun(seed: u64, size: u32, ids: []io.OperationId, results: []u64) !Sim {
     defer fixture.tearDown();
     var sim = Sim.init(seed, constants.sim_fault_percent_max);
     sim.attachTable(&fixture.table);
-    for (ids, 0..) |_, index| try sim.submit(acceptSubmission(index));
     var completions: [slots_count]io.Completion = undefined;
-    const count = drainAll(&sim, completions[0..ids.len]);
+    var count: u32 = 0;
+    for (ids, 0..) |_, index| {
+        // Each accept drains before the next, so at most one wait runs, of `wait_ticks`.
+        var ticks: u32 = 0;
+        while (sim.accept_wait.resume_at) |resume_at| : (ticks += 1) {
+            if (sim.now() >= resume_at) break;
+            assert(ticks < wait_ticks);
+            sim.tick();
+        }
+        try sim.submit(acceptSubmission(index));
+        count += drainAll(&sim, completions[count..][0..1]);
+    }
     try testing.expectEqual(@as(u32, @intCast(ids.len)), count);
     for (completions[0..count], ids, results) |completion, *id, *result| {
         id.* = completion.id;
@@ -1316,7 +1342,10 @@ test "sim: same seed, same accepts, refusals and faults, in the same order" {
     _ = try acceptRun(6, 16, &ids_c, &results_c);
     try testing.expectEqualSlices(io.OperationId, &ids_a, &ids_b);
     try testing.expectEqualSlices(u64, &results_a, &results_b);
-    try testing.expect(!std.mem.eql(io.OperationId, &ids_a, &ids_c));
+    // One accept at a time completes in submission order, so another seed shows in the
+    // outcomes, not the order.
+    try testing.expectEqualSlices(io.OperationId, &ids_a, &ids_c);
+    try testing.expect(!std.mem.eql(u64, &results_a, &results_c));
     try testing.expectEqual(a.faults, b.faults);
     try testing.expectEqual(a.refused, b.refused);
     // At a 50% fault rate, about 32 of 64 arrive, so 16 entries fill and the rest are
@@ -1390,30 +1419,42 @@ test "sim: a second Backpressure starts the wait again" {
     _ = try fixture.table.release(try completions[0].result.accept);
 }
 
-test "sim: a full queue refuses an accept with QueueFull while the wait runs" {
+test "sim: with the share full, the slot kept for accepts still waits out a Backpressure" {
+    // A full queue and a running wait can't both meet an accept: a full queue already holds
+    // `constants.accepts_in_flight_max` accepts, so another would be a caller's bug. The
+    // nearest case is the share full and the kept slot free: the accept is refused by the
+    // wait, not by the share, and the wait's count says so.
+    comptime assert(slots_count - shared_slots_max == constants.accepts_in_flight_max);
     var fixture: TableFixture = undefined;
     try fixture.setUpPeers(test_peers);
     defer fixture.tearDown();
     var sim = Sim.init(13, 0);
     sim.attachTable(&fixture.table);
     var id: io.OperationId = 0;
-    while (id < slots_count) : (id += 1) try sim.submit(fullSubmission(id));
+    while (id < shared_slots_max) : (id += 1) try sim.submit(testSubmission(id));
+    try testing.expectError(error.SlotsKeptForAccepts, sim.submit(testSubmission(id)));
     try testing.expectError(error.Backpressure, sim.arrive(error.Backpressure));
-    // An id no fill submission holds.
-    const accept: io.Submission = .{ .id = slots_count, .operation = .{ .accept = .{ .listener = test_listener } } };
-    // Both refusals hold; the full queue is reported, and the wait's count is untouched.
-    try testing.expectError(error.QueueFull, sim.submit(accept));
-    try testing.expectEqual(@as(u64, 0), sim.accept_wait.refused);
-    // With room again, the wait still runs: the same accept meets AcceptTooSoon. With 256
-    // delays drawn from 0 to 16 ticks, this seed has some due at once, so no tick passes.
-    var completions: [slots_count]io.Completion = undefined;
-    try testing.expectEqual(@as(u32, 1), sim.poll(completions[0..1]));
-    try testing.expect(sim.accept_wait.resume_at != null);
-    try testing.expect(sim.now() < sim.accept_wait.resume_at.?);
+    const accept: io.Submission = .{ .id = id, .operation = .{ .accept = .{ .listener = test_listener } } };
     try testing.expectError(error.AcceptTooSoon, sim.submit(accept));
     try testing.expectEqual(@as(u64, 1), sim.accept_wait.refused);
-    _ = drainAll(&sim, &completions);
+    try testing.expectEqual(@as(u32, 0), sim.share.accepts_in_flight);
+    // Once the wait is over, the accept takes the kept slot and fills the queue.
+    var ticks: u32 = 0;
+    while (ticks < wait_ticks) : (ticks += 1) sim.tick();
+    try sim.submit(accept);
+    try testing.expectEqual(slots_count, sim.in_flight);
+    try testing.expectEqual(constants.accepts_in_flight_max, sim.share.accepts_in_flight);
+    var completions: [slots_count]io.Completion = undefined;
+    try testing.expectEqual(slots_count, drainAll(&sim, &completions));
     try fixture.expectNoSendsCounted();
+    // Every entry holds a test peer, so the arrival finds the table full.
+    var accepts: u32 = 0;
+    for (completions) |completion| {
+        if (completion.result != .accept) continue;
+        try testing.expectError(error.TableFull, completion.result.accept);
+        accepts += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), accepts);
 }
 
 test "sim: a release with a send in flight is refused until the send completes" {
