@@ -10,9 +10,9 @@
 //! send is refused with SendsInFlight and changes nothing, and once everything has arrived
 //! every entry counts no sends and releases. Then a second workload drives
 //! the connection table past its limit and empties it again (sim/connections.zig), a
-//! third fills it through simulated accepts (sim/accepts.zig), and a fourth sticks sends
-//! and drops their connections on a write deadline, as the server loop will
-//! (sim/drops.zig). As
+//! third fills a smaller table through simulated accepts, one at a time
+//! (sim/accepts.zig), and a fourth sticks sends and drops their connections on a write
+//! deadline, as the server loop will (sim/drops.zig). As
 //! components land, each one joins this loop as a real workload (logins, ESI polling, live
 //! updates). A failing seed replays exactly.
 

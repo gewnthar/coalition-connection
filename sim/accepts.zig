@@ -1,11 +1,12 @@
 //! Accept workload for the simulation run (roadmap core 3a).
 //!
-//! Accepts go through the simulated I/O boundary into a full-size connection table
-//! (http_connections_max entries). Each round keeps `accepts_in_flight` accepts waiting
-//! until the table is full and `refusals_per_fill` arrivals were refused, then lets
-//! connections leave until the table is empty. A model beside the table predicts every
-//! answer: an arrival takes a free entry under a socket never seen before, a refusal comes
-//! only when every entry is in use, and each accept completes exactly once. After an
+//! Accepts go through the simulated I/O boundary into a connection table of `capacity`
+//! entries. Each round keeps one accept waiting, as the server does
+//! (`constants.accepts_in_flight_max`), until the table is full and `refusals_per_fill`
+//! arrivals were refused, then lets connections leave until the table is empty. A model
+//! beside the table predicts every answer: an arrival takes a free entry under a socket
+//! never seen before, a refusal comes only when every entry is in use, and each accept
+//! completes exactly once. After an
 //! accept completes with Backpressure, the model expects every accept submitted within
 //! `constants.io_accept_backpressure_wait_ns` to be refused with AcceptTooSoon, and the
 //! first one after it to be taken; the workload waits by ticking, as the server loop will.
@@ -25,13 +26,17 @@ const Table = connections.Table;
 
 pub const Error = error{InvariantBroken};
 
-const capacity: u32 = constants.http_connections_max;
+/// Entries in the workload's table. Reason: with one accept in flight, each arrival waits
+/// about 9 ticks, so a fill takes about 10 ticks an entry; 512 entries fill in about 5,000
+/// ticks, which leaves room for both rounds in one simulated run. Tests in
+/// src/live/connections.zig and sim/connections.zig fill a full-size table directly.
+const capacity: u32 = 512;
 const fault_percent: u8 = 10;
 const rounds: u32 = 2;
 const refusals_per_fill: u32 = 8;
 
-/// Accepts kept waiting while filling, as a listener with a backlog would be.
-const accepts_in_flight: u32 = 128;
+/// Accepts kept waiting while filling: as many as the server keeps.
+const accepts_in_flight: u32 = constants.accepts_in_flight_max;
 /// Connections that leave per tick while emptying.
 const departures_per_tick: u32 = 64;
 
@@ -41,24 +46,26 @@ const listener: io.Socket = 3;
 /// Ticks in the wait after a Backpressure; the simulator's clock moves in whole ticks.
 const wait_ticks: u32 = @intCast(constants.io_accept_backpressure_wait_ns / constants.tick_ns);
 
-/// An accept waits 8 ticks on average, so about 15 complete per tick: without waits a fill
-/// takes about 300 ticks, and an empty about 70. Top-ups also pause for about 50 waits per
-/// fill (measured: 733 to 820 ticks a fill on seeds 1 to 8 with 10-tick waits). Ten times
-/// that estimate is a margin no valid seed comes near, and it grows with the wait, so a
-/// longer wait can't make a valid seed run out of ticks. A phase that runs out of ticks is
-/// a failure, not a hang.
-const phase_ticks_max: u32 = 10 * (300 + 50 * wait_ticks);
+/// One accept is in flight at a time and waits 8 ticks on average, plus the tick it is
+/// submitted on, so a fill of `capacity` entries, with a tenth of accepts failing, takes
+/// about 10 ticks an entry: 5,120 ticks. Top-ups also pause for about 30 waits per fill
+/// (a Backpressure per 20 accepts or so). Measured: 4,658 to 5,217 ticks a fill on seeds 1
+/// to 8 with 10-tick waits. Three times the estimate is a margin no valid seed comes near,
+/// and it grows with the wait, so a longer wait can't make a valid seed run out of ticks.
+/// A phase that runs out of ticks is a failure, not a hang.
+const phase_ticks_max: u32 = 3 * (10 * capacity + 30 * wait_ticks);
 
 /// Ids in flight, tracked by id modulo the window. An id stays in flight for at most
 /// `sim_completion_delay_ticks_max + 1` ticks, and at most `accepts_in_flight` ids are
 /// handed out per tick, so two ids in flight never share an entry.
-const outstanding_window: u32 = 4096;
+const outstanding_window: u32 = 64;
 
 const completions_batch: u32 = 64;
 
 comptime {
     assert(fault_percent <= constants.sim_fault_percent_max);
     assert(accepts_in_flight <= constants.io_operations_in_flight_max);
+    assert(capacity > 0 and capacity <= constants.http_connections_max);
     assert((constants.sim_completion_delay_ticks_max + 1) * accepts_in_flight < outstanding_window);
     // Every phase of every round fits in one simulated run.
     assert(@as(u64, rounds) * 2 * phase_ticks_max < constants.sim_ticks_max);
@@ -335,7 +342,7 @@ fn runOnce(seed: u64, w: *Workload) Error!Counts {
 /// Runs the workload twice with the same seed and checks that both runs did the same
 /// thing, completion for completion.
 pub fn run(seed: u64) Error!Counts {
-    // The workload holds a Sim and a model of about 40 KiB, so it lives in static memory
+    // The workload holds a Sim and a model of several KiB, so it lives in static memory
     // rather than on the stack. Each run starts it afresh.
     const static = struct {
         var workload: Workload = undefined;

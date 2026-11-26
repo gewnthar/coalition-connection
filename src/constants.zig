@@ -300,7 +300,9 @@ pub const listener_socket_mode: u32 = 0o660;
 /// Accepts the server keeps in flight at once. Reason: each accept's completion already
 /// holds a new socket the kernel opened, before the table is asked for an entry, so every
 /// accept in flight needs a descriptor of its own; one at a time is enough for nginx, the
-/// only client. Provisional: the server loop keeps to it.
+/// only client. The real I/O type and the simulator stop the process on an accept submitted
+/// past it, so a loop that keeps more fails in simulation first. Provisional: the server
+/// loop confirms it under load.
 pub const accepts_in_flight_max: u32 = 1;
 
 /// Operations in flight that may be anything but accepts (sends and statements today,
