@@ -143,7 +143,7 @@ fn topUp(w: *Workload) Error!void {
         const submission: io.Submission = .{ .id = w.next_id, .operation = .{ .accept = .{ .listener = listener } } };
         w.sim.submit(submission) catch |err| switch (err) {
             // Fewer than the ring's depth are ever in flight here, and all are accepts.
-            error.QueueFull, error.SlotsKeptForAccepts => return error.InvariantBroken,
+            error.QueueFull, error.SlotsKeptForAccepts, error.CancelsFull => return error.InvariantBroken,
             error.AcceptTooSoon => {
                 if (!too_soon) return error.InvariantBroken; // Refused with the wait over.
                 w.counts.too_soon += 1;
@@ -237,7 +237,7 @@ fn depart(w: *Workload) Error!void {
     const peer = w.peers[index];
     // The workload never sends, so the table must not refuse the release.
     const socket = w.table.release(peer) catch |err| switch (err) {
-        error.SendsInFlight => return error.InvariantBroken,
+        error.OperationsInFlight => return error.InvariantBroken,
     };
     if (socket != w.sockets[index]) return error.InvariantBroken;
     w.sockets[index] = -1;

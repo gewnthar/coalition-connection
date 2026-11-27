@@ -278,19 +278,20 @@ pub const io_accept_backpressure_wait_ns: u64 = 100 * 1_000_000;
 /// loop drops a stuck connection again at each of its write deadlines, so four attempts ride
 /// out a failure that clears within a few deadlines, while a socket that keeps failing costs
 /// at most four system calls, not one per deadline for as long as it stays open. Past the
-/// bound its stuck sends still hold their slots until the cancel (roadmap core 3b) frees
-/// them. Provisional: the server loop confirms it.
+/// bound the caller cancels the connection's operations instead (a cancel in the I/O
+/// contract), which frees their slots. Provisional: the server loop confirms it.
 pub const io_drop_attempts_max: u32 = 4;
 
 /// Cancels the server keeps in flight at once (roadmap core 3b). Reason: a cancel frees
 /// only a connection whose drops ran out (`io_drop_attempts_max`), which takes an errno
 /// shutdown(2) doesn't document, so cancels are rare; a share of 64 costs 64 slots rather
 /// than one per connection, and a burst of such connections still clears in a few ticks.
-/// A cancel past it waits for the next tick, which loses nothing: the connection's stuck
-/// operations keep their slots until the cancel goes in. The ring is sized to hold this many
-/// beside a receive or a send for every connection (`ringCovers`); the slots are held back
-/// from the other kinds once core 3b adds the cancel itself. Provisional: the server loop
-/// confirms it.
+/// A cancel past it is refused with `error.CancelsFull` and goes again on the next tick,
+/// which loses nothing: the connection's stuck operations keep their slots until the cancel
+/// goes in. The ring is sized to hold this many beside a receive or a send for every
+/// connection (`ringCovers`), and these slots are held back from every other kind
+/// (`io_shared_in_flight_max`), so stuck sends and receives can't keep a cancel out.
+/// Provisional: the server loop confirms it.
 pub const io_cancels_in_flight_max: u32 = 64;
 
 /// Connections the kernel queues on the local listener before the server accepts them.
@@ -323,16 +324,18 @@ pub const listener_socket_mode: u32 = 0o660;
 /// loop confirms it under load.
 pub const accepts_in_flight_max: u32 = 1;
 
-/// Operations in flight that may be anything but accepts (sends and statements today,
-/// receives from core 3b, when cancels also take `io_cancels_in_flight_max` of these as a
-/// share of their own): the I/O operations less the slots kept for accepts.
+/// Operations in flight that may be anything but accepts and cancels (sends, receives and
+/// statements): the I/O operations less the slots kept for accepts and for cancels.
 /// Reason: a client that stops reading leaves its send pending until the connection is
-/// dropped, and enough such clients, or receives, cancels and statements piling up, could
-/// otherwise hold every slot, so that no accept could be submitted for anyone. With
-/// `accepts_in_flight_max` slots kept back from every other kind, the server still accepts
-/// while all of them are stuck. The real I/O type refuses any operation but an accept past
-/// this with `error.SlotsKeptForAccepts`, and so does the simulator.
-pub const io_non_accepts_in_flight_max: u32 = io_operations_in_flight_max - accepts_in_flight_max;
+/// dropped, and enough such clients, or receives and statements piling up, could
+/// otherwise hold every slot, so that no accept could be submitted for anyone, and no
+/// cancel could free a connection whose drops ran out. With `accepts_in_flight_max` slots
+/// kept back for accepts and `io_cancels_in_flight_max` for cancels, the server still
+/// accepts and cancels while all of them are stuck. The real I/O type refuses any
+/// operation of these kinds past this with `error.SlotsKeptForAccepts`, and so does the
+/// simulator.
+pub const io_shared_in_flight_max: u32 = io_operations_in_flight_max - accepts_in_flight_max -
+    io_cancels_in_flight_max;
 
 /// File descriptors the server holds open besides its connections' sockets, at most, at
 /// any one moment:
@@ -529,9 +532,11 @@ comptime {
     assert(io_random_bytes_max >= 32);
     assert(io_random_attempts_max >= 2);
     assert(accepts_in_flight_max > 0 and accepts_in_flight_max <= io_operations_in_flight_max);
-    // Keeping slots for accepts leaves at least one for every other operation.
-    assert(io_non_accepts_in_flight_max > 0);
+    // Keeping slots for accepts and cancels leaves at least one for every other operation.
+    assert(io_shared_in_flight_max > 0);
     assert(io_cancels_in_flight_max > 0);
+    // The share still holds a receive or a send for every connection.
+    assert(io_shared_in_flight_max >= http_connections_max);
     // fs.nr_open defaults to 1,048,576, and no hard open-file limit can pass it unless an
     // administrator raises that sysctl, so the largest config must fit below it.
     assert(descriptors_needed_max <= 1024 * 1024);

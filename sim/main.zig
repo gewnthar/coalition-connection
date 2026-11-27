@@ -7,12 +7,14 @@
 //! completes exactly once, with the kind it was submitted as. The sends go to `peers`
 //! connections held in a connection table, through the same table calls the real type
 //! makes: each send is counted on its entry while in flight, a release tried just after a
-//! send is refused with SendsInFlight and changes nothing, and once everything has arrived
+//! send is refused with OperationsInFlight and changes nothing, and once everything has arrived
 //! every entry counts no sends and releases. Then a second workload drives
 //! the connection table past its limit and empties it again (sim/connections.zig), a
 //! third fills a smaller table through simulated accepts, one at a time
-//! (sim/accepts.zig), and a fourth sticks sends and drops their connections on a write
-//! deadline, as the server loop will (sim/drops.zig). As
+//! (sim/accepts.zig), a fourth sticks sends and drops their connections on a write
+//! deadline, as the server loop will (sim/drops.zig), and a fifth drives byte-at-a-time
+//! clients through the connection state machine with receives, deadlines, drops and
+//! cancels (sim/receives.zig). As
 //! components land, each one joins this loop as a real workload (logins, ESI polling, live
 //! updates). A failing seed replays exactly.
 
@@ -23,6 +25,7 @@ const build_options = @import("build_options");
 const connection_workload = @import("connections.zig");
 const accept_workload = @import("accepts.zig");
 const drop_workload = @import("drops.zig");
+const receive_workload = @import("receives.zig");
 
 const io = cc.io;
 const constants = cc.constants;
@@ -86,13 +89,13 @@ fn submitPair(run: *Run) SimError!void {
                 continue;
             },
             // Only an accept waits after Backpressure, and this workload submits none.
-            error.AcceptTooSoon => return error.InvariantBroken,
+            error.AcceptTooSoon, error.CancelsFull => return error.InvariantBroken,
         };
         entry.* = true;
         switch (submission.operation) {
             .send => try sendCounted(run, peer),
             .execute => run.executes += 1,
-            .accept => unreachable, // The pair above holds a send and a statement.
+            .accept, .receive, .cancel => unreachable, // The pair above holds a send and a statement.
         }
     }
     try checkSendsCounted(run);
@@ -112,7 +115,7 @@ fn sendCounted(run: *Run, peer: io.PeerId) SimError!void {
     if (run.table.release(peer)) |_| {
         return error.InvariantBroken; // Released with a send in flight.
     } else |err| switch (err) {
-        error.SendsInFlight => {},
+        error.OperationsInFlight => {},
     }
     if (!std.meta.eql(before, run.table.get(peer).*)) return error.InvariantBroken;
     if (run.table.count() != peers) return error.InvariantBroken;
@@ -150,6 +153,7 @@ fn checkCompletion(run: *Run, completion: io.Completion) SimError!void {
             run.sends[index] -= 1;
             const bytes = sent catch |err| switch (err) {
                 error.PeerDown, error.Backpressure => return, // Counted in sim.faults.
+                error.Canceled => return error.InvariantBroken, // Nothing here cancels.
             };
             // A short send is allowed; a real component would send the rest.
             if (bytes == 0 or bytes > message.len) return error.InvariantBroken;
@@ -161,8 +165,9 @@ fn checkCompletion(run: *Run, completion: io.Completion) SimError!void {
                 error.Unavailable, error.Timeout => {}, // Counted in sim.faults.
             };
         },
-        // This workload submits no accepts; the kind check above already refused one.
-        .accept => return error.InvariantBroken,
+        // This workload submits no accepts, receives or cancels; the kind check above
+        // already refused one.
+        .accept, .receive, .cancel => return error.InvariantBroken,
     }
 }
 
@@ -215,7 +220,7 @@ fn checkEnd(run: *const Run) SimError!void {
     var index: u32 = 0;
     while (index < peers) : (index += 1) {
         _ = run.table.release(@intCast(index)) catch |err| switch (err) {
-            error.SendsInFlight => return error.InvariantBroken,
+            error.OperationsInFlight => return error.InvariantBroken,
         };
     }
     if (run.table.count() != 0) return error.InvariantBroken;
@@ -296,4 +301,21 @@ pub fn main() SimError!void {
     std.debug.print("sim: drops deadline={d} closes={d} worked={d} failed={d} exhausted={d}\n", .{ drops.deadline_drops, drops.closes, drops.drops_worked, drops.drops_failed, drops.exhausted });
     std.debug.print("sim: drops reconnects={d} accepts={d} peer_down={d}\n", .{ drops.reconnects, drops.accepts, drops.peer_down });
     std.debug.print("sim: drops trace={x:0>16} ok\n", .{drops.trace});
+
+    try runReceives(seed);
+}
+
+/// Runs the receive workload (sim/receives.zig) and prints what it did.
+fn runReceives(seed: u64) SimError!void {
+    const receives = receive_workload.run(seed) catch |err| {
+        std.debug.print("sim: seed={d} failed in the receive workload\n", .{seed});
+        return err;
+    };
+    std.debug.print("sim: receives accepts={d} reused={d} receives={d} bytes={d}\n", .{ receives.accepts, receives.reused, receives.receives, receives.bytes });
+    std.debug.print("sim: receives requests={d} complete_clients={d} ended={d} sends={d}\n", .{ receives.requests, receives.complete_clients, receives.receive_ended, receives.sends });
+    std.debug.print("sim: receives refused={d} retries={d} read_deadlines={d} write_deadlines={d}\n", .{ receives.refused, receives.retries, receives.read_deadlines, receives.write_deadlines });
+    std.debug.print("sim: receives drops={d} exhausted={d} cancels={d} canceled={d} releases={d}\n", .{ receives.drops, receives.exhausted, receives.cancels, receives.canceled, receives.releases });
+    std.debug.print("sim: receives trace={x:0>16} ok\n", .{receives.trace});
+    assert(receives.releases == receives.accepts);
+    assert(receives.requests >= receives.complete_clients);
 }

@@ -13,13 +13,14 @@
 //! completion finds its operation without a search. A submission with no free slot returns
 //! `error.QueueFull` and changes nothing.
 //!
-//! Slots kept for accepts: every operation but an accept (only sends on this type today;
-//! receives and cancels from core 3b) shares at most `constants.io_non_accepts_in_flight_max`
-//! slots, counted in `share` (`io.SlotShare`, shared with the simulator), and one past that
-//! returns `error.SlotsKeptForAccepts` and changes nothing, even with a slot free. The rest,
+//! Slots kept for accepts and cancels: sends and receives share at most
+//! `constants.io_shared_in_flight_max` slots, counted in `share` (`io.SlotShare`, shared
+//! with the simulator), and one past that returns `error.SlotsKeptForAccepts` and changes
+//! nothing, even with a slot free. Cancels have `constants.io_cancels_in_flight_max` slots
+//! of their own, and one past those returns `error.CancelsFull`. The rest,
 //! `constants.accepts_in_flight_max`, stay for accepts, so clients that stop reading, each
 //! with a send stuck on a full socket buffer, can't take the whole ring and stop the server
-//! accepting anyone else. Accepts are counted in `share` too: one past
+//! accepting anyone else, or cancelling a connection whose drops ran out. Accepts are counted in `share` too: one past
 //! `constants.accepts_in_flight_max` is a caller's bug, since each holds a descriptor when it
 //! completes, so `submit` stops the process on it before checking the ring.
 //!
@@ -52,7 +53,29 @@
 //! failed drop on the connection's entry (`Table.dropFailed`). Each drop first asks the
 //! entry (`Table.dropAdmit`), so once `constants.io_drop_attempts_max` have failed, drop
 //! returns `error.DropsExhausted` without calling shutdown again, and the caller cancels the
-//! connection's operations instead (core 3b). The simulator makes the same two calls.
+//! connection's operations instead. The simulator makes the same two calls.
+//!
+//! Receives: `IORING_OP_RECV` on the peer's socket into the caller's buffer, counted on the
+//! peer's entry (`Table.receiveSubmitted`, at most one per connection) until its completion
+//! (`Table.receiveCompleted`), as sends are. It completes with the bytes read, or 0 when the
+//! peer closed its side, or when the connection was dropped: a shutdown ends a pending
+//! receive as end of stream. Each errno recv(2) documents maps as for sends
+//! (`receiveErrno`); an undocumented one is `PeerDown`, counted in
+//! `receive_errno_undocumented_count` with the latest in `receive_errno_undocumented_last`.
+//!
+//! Cancels: `IORING_OP_ASYNC_CANCEL` with `IORING_ASYNC_CANCEL_FD` and
+//! `IORING_ASYNC_CANCEL_ALL` on the peer's socket (Linux 5.19 or later), so every send and
+//! receive in flight on that socket completes with `ECANCELED`, which this type hands back
+//! as `error.Canceled`, after checking the entry was canceled (`Table.assertCanceled`). One
+//! the kernel was already running in a worker thread is interrupted instead (`EINTR`, which
+//! would be Backpressure); on a canceled entry that is handed back as `error.Canceled` too,
+//! since the caller is closing it either way. The cancel itself is counted on the entry
+//! (`Table.cancelSubmitted`) and completes with the number of operations it reached, which
+//! the kernel counts per worker on its slow path, so treat it as a hint. A kernel that refuses the flags returns `EINVAL`, which
+//! stops the process with the reason; an errno the cancel isn't documented to return is
+//! counted in `cancel_errno_undocumented_count`, with the latest in
+//! `cancel_errno_undocumented_last`, and completes as 0 reached, so the caller's next
+//! deadline tries again.
 //!
 //! Accepts: `IORING_OP_ACCEPT` on the caller's listening socket, with `SOCK_CLOEXEC` on the
 //! new socket. The completion takes an entry in the connection table for the new socket and
@@ -95,7 +118,8 @@
 //! Inputs: the connection table, submissions, listening sockets, buffers to fill.
 //! Outputs: completions, time readings and random bytes.
 //! Limits: `constants.io_operations_in_flight_max` operations in flight; sends of at most
-//! `constants.http_response_size_max` bytes; 1 to `constants.io_random_bytes_max` random
+//! `constants.http_response_size_max` bytes; receives into at most
+//! `constants.http_request_size_max` bytes; 1 to `constants.io_random_bytes_max` random
 //! bytes per call, with at most `constants.io_random_attempts_max` getrandom calls.
 //!
 //! Linux only: each method refuses to compile for another operating system.
@@ -119,17 +143,19 @@ const clock_seconds_max: u64 = (std.math.maxInt(u64) - (ns_per_s - 1)) / ns_per_
 /// Operations in flight, and the ring's submission queue depth.
 const slots_count: u32 = constants.io_operations_in_flight_max;
 
-/// Slots every operation but an accept may hold at once; the rest are kept for accepts.
-const shared_slots_max: u32 = constants.io_non_accepts_in_flight_max;
+/// Slots sends and receives may hold at once; the rest are kept for accepts and cancels.
+const shared_slots_max: u32 = constants.io_shared_in_flight_max;
 
 /// One operation in flight: what its completion needs to be checked and handed back.
 const Slot = struct {
     id: io.OperationId,
-    /// A send or an accept: `submit` refuses every other kind.
+    /// A send, a receive, an accept or a cancel: `submit` refuses a statement.
     kind: io.Kind,
-    /// Bytes a send was given; the kernel never reports more. 0 for an accept.
+    /// Bytes a send was given, or a receive's buffer holds; the kernel never reports more.
+    /// 0 for an accept or a cancel.
     length: u32,
-    /// The connection a send was counted on, uncounted at its completion. 0 for an accept.
+    /// The connection a send, receive or cancel was counted on, uncounted at its
+    /// completion. 0 for an accept.
     peer: io.PeerId,
     in_use: bool,
 };
@@ -224,6 +250,19 @@ pub const Real = struct {
     /// The latest of those errnos, or `.SUCCESS` if there has been none. Print it with
     /// `@backingInt`, as for sends.
     drop_errno_undocumented_last: linux.E,
+    /// Receives that failed with an errno recv(2) doesn't document; each completed as
+    /// `PeerDown`. For metrics: any count above zero means `receiveErrno` is missing a case.
+    receive_errno_undocumented_count: u64,
+    /// The latest of those errnos, or `.SUCCESS` if there has been none. Print it with
+    /// `@backingInt`, as for sends.
+    receive_errno_undocumented_last: linux.E,
+    /// Cancels that failed with an errno the cancel isn't documented to return; each
+    /// completed as 0 reached. For metrics: any count above zero means `cancelErrno` is
+    /// missing a case, and those connections' operations may still be pending.
+    cancel_errno_undocumented_count: u64,
+    /// The latest of those errnos, or `.SUCCESS` if there has been none. Print it with
+    /// `@backingInt`, as for sends.
+    cancel_errno_undocumented_last: linux.E,
 
     /// Sets up the ring. `startup` proves the call happens during startup; nothing is
     /// mapped or allocated afterwards.
@@ -255,6 +294,10 @@ pub const Real = struct {
             .accept_wait = .{},
             .drop_errno_undocumented_count = 0,
             .drop_errno_undocumented_last = .SUCCESS,
+            .receive_errno_undocumented_count = 0,
+            .receive_errno_undocumented_last = .SUCCESS,
+            .cancel_errno_undocumented_count = 0,
+            .cancel_errno_undocumented_last = .SUCCESS,
         };
         // Push the indices in reverse, so the first submission takes slot 0.
         var position: u32 = 0;
@@ -273,8 +316,8 @@ pub const Real = struct {
     /// Closes the ring. Call it during shutdown only, once every operation has completed:
     /// the kernel tears a ring down in the background, so a send still in flight could
     /// read its bytes after this returns. An accept completes only when a connection
-    /// arrives, and the contract has no cancel until core 3b, so until then a caller
-    /// stops submitting accepts and waits for the last one before shutting down.
+    /// arrives, and a cancel names a connection, never the listener, so a caller stops
+    /// submitting accepts and waits for the last one before shutting down.
     pub fn deinit(self: *Real) void {
         comptime assertLinux();
         assert(self.ring.fd >= 0);
@@ -310,13 +353,15 @@ pub const Real = struct {
     /// `submit` or `poll`, still naming the socket number read now. A send is therefore
     /// counted on its connection's entry until its completion, and the table refuses to
     /// release that entry meanwhile, so the number can't be closed and reused under it.
-    /// With every slot in use, returns `error.QueueFull`; for anything but an accept when
+    /// With every slot in use, returns `error.QueueFull`; for a send or a receive when
     /// those hold every slot they may (`shared_slots_max`), `error.SlotsKeptForAccepts`;
-    /// and for an accept while the wait after a Backpressure runs, `error.AcceptTooSoon`.
-    /// The first two change nothing, the last only the wait's refusal count and the clock's
-    /// latest reading, and a full ring wins when it and another hold. An id already in
-    /// flight breaks the contract and stops the process, full ring or not, and so does an
-    /// accept past `constants.accepts_in_flight_max`.
+    /// for a cancel when cancels hold all of theirs, `error.CancelsFull`; and for an accept
+    /// while the wait after a Backpressure runs, `error.AcceptTooSoon`. The first three
+    /// change nothing, the last only the wait's refusal count and the clock's latest
+    /// reading, and a full ring wins when it and another hold. An id already in flight
+    /// breaks the contract and stops the process, full ring or not, and so do an accept past
+    /// `constants.accepts_in_flight_max` and an operation its peer's entry has no room for
+    /// (`Table.assertRoomFor`).
     pub fn submit(self: *Real, submission: io.Submission) io.SubmitError!void {
         comptime assertLinux();
         const submitted_before = self.submitted;
@@ -327,11 +372,13 @@ pub const Real = struct {
     }
 
     /// Everything `submit` does except handing the ring to the kernel: takes a slot, fills a
-    /// submission entry and counts a send on its peer. The entry waits on the ring until
-    /// the next `enter`, as after a refused one; tests call this directly to hold it there.
+    /// submission entry and counts the operation on its peer. The entry waits on the ring
+    /// until the next `enter`, as after a refused one; tests call this directly to hold it
+    /// there.
     fn queue(self: *Real, submission: io.Submission) io.SubmitError!void {
         const in_flight_before = self.inFlight();
-        // Looked up before anything changes: a peer not in the table is a caller's bug.
+        // Looked up before anything changes: a peer not in the table, or one whose entry
+        // has no room for the operation, is a caller's bug.
         const socket = self.socketFor(submission.operation);
         self.assertIdNotInFlight(submission.id);
         // A second accept past `constants.accepts_in_flight_max` is a caller's bug, checked
@@ -339,14 +386,14 @@ pub const Real = struct {
         self.share.assertAcceptRoom(submission.operation);
         assert(self.sends_in_flight <= shared_slots_max);
         if (self.free_count == 0) return error.QueueFull;
-        // The slots past shared_slots_max are kept for accepts.
+        // The slots past shared_slots_max are kept for accepts and cancels.
         try self.share.admit(submission.operation, self.free_count);
         // Checked last, so a refusal above leaves the wait and the clock as they were. The
         // clock is read only while a wait runs.
         if (submission.operation == .accept and self.accept_wait.resume_at != null) {
             try self.accept_wait.admit(self.now());
         }
-        const sends_before = self.sendsCounted(submission.operation);
+        const counted_before = self.countedOnPeer(submission.operation);
 
         // Each queued entry belongs to an operation in flight, and fewer than slots_count
         // are in flight, so the submission queue has room.
@@ -360,22 +407,18 @@ pub const Real = struct {
         self.submitted += 1;
         self.share.taken(submission.operation);
         // Counted before the kernel can see it, so no completion arrives uncounted.
-        if (submission.operation == .send) {
-            self.table.sendSubmitted(submission.operation.send.peer);
-            self.sends_in_flight += 1;
-        }
-        const sends_added: connections.SendCount = if (submission.operation == .send) 1 else 0;
-        assert(self.sendsCounted(submission.operation) == sends_before + sends_added);
+        self.table.operationSubmitted(submission.operation);
+        if (submission.operation == .send) self.sends_in_flight += 1;
+        const added: u32 = @intFromBool(io.operationPeer(submission.operation) != null);
+        assert(self.countedOnPeer(submission.operation) == counted_before + added);
         assert(self.inFlight() == in_flight_before + 1);
     }
 
-    /// Sends counted on a send's peer; 0 for an accept, which names no peer.
-    fn sendsCounted(self: *const Real, operation: io.Operation) connections.SendCount {
+    /// What the peer's entry counts of an operation's kind: its sends, whether a receive is
+    /// in flight, or whether a cancel is; 0 for an accept, which names no peer.
+    fn countedOnPeer(self: *const Real, operation: io.Operation) u32 {
         assert(operation != .execute); // `socketFor` stopped the process already.
-        const count: connections.SendCount = switch (operation) {
-            .send => |send| self.table.get(send.peer).sends_in_flight,
-            .accept, .execute => 0,
-        };
+        const count = self.table.operationCount(operation);
         assert(count <= slots_count);
         return count;
     }
@@ -480,6 +523,7 @@ pub const Real = struct {
         var occupied: u32 = 0;
         var sends: u32 = 0;
         var accepts: u32 = 0;
+        var cancels: u32 = 0;
         var index: u32 = 0;
         while (index < slots_count) : (index += 1) {
             const slot = &self.slots[index];
@@ -487,30 +531,30 @@ pub const Real = struct {
             occupied += 1;
             if (slot.kind == .send) sends += 1;
             if (slot.kind == .accept) accepts += 1;
+            if (slot.kind == .cancel) cancels += 1;
             assert(slot.id != id); // An id already in flight.
         }
-        // The slots in use, the free stack, the send count and the share kept from accepts
-        // are kept separately; they must agree.
+        // The slots in use, the free stack, the send count and the shares kept for accepts
+        // and cancels are kept separately; they must agree.
         assert(occupied == self.inFlight());
         assert(sends == self.sends_in_flight);
-        assert(occupied - accepts == self.share.others_in_flight);
+        assert(occupied - accepts - cancels == self.share.others_in_flight);
         assert(accepts == self.share.accepts_in_flight);
+        assert(cancels == self.share.cancels_in_flight);
     }
 
-    /// The socket an operation acts on, checked before anything changes: a send's peer from
-    /// the table (`get` asserts it is in use), an accept's listener as given. `execute`
-    /// stops the process: it is a simulator placeholder.
+    /// The socket an operation acts on, checked before anything changes: a send's,
+    /// receive's or cancel's peer from the table (`get` asserts it is in use, and
+    /// `assertRoomFor` that its entry takes the operation), an accept's listener as given.
+    /// `execute` stops the process: it is a simulator placeholder.
     fn socketFor(self: *const Real, operation: io.Operation) io.Socket {
-        const socket: io.Socket = switch (operation) {
-            .send => |send| send: {
-                assert(send.bytes.len > 0);
-                assert(send.bytes.len <= constants.http_response_size_max);
-                break :send self.table.get(send.peer).socket;
-            },
-            .accept => |accept| accept.listener,
-            .execute => std.debug.panic("io.real: execute is a simulator placeholder; " ++
-                "the real type has no database traffic until Postgres is framed over sockets", .{}),
-        };
+        if (operation == .execute) std.debug.panic("io.real: execute is a simulator placeholder; " ++
+            "the real type has no database traffic until Postgres is framed over sockets", .{});
+        assertOperationBytes(operation);
+        const socket: io.Socket = if (io.operationPeer(operation)) |peer| peer: {
+            self.table.assertRoomFor(peer, operation);
+            break :peer self.table.get(peer).socket;
+        } else operation.accept.listener;
         assert(socket >= 0);
         assert(self.free_count <= slots_count);
         return socket;
@@ -518,8 +562,8 @@ pub const Real = struct {
 
     /// Frees the slot a completion names and builds its `io.Completion`.
     fn complete(self: *Real, cqe: linux.io_uring_cqe) io.Completion {
-        // user_data is always a slot index this type wrote, and a send or an accept posts
-        // one completion.
+        // user_data is always a slot index this type wrote, and each kind posts one
+        // completion.
         assert(cqe.user_data < slots_count);
         assert(cqe.flags & linux.IORING_CQE_F_MORE == 0);
         const index: u32 = @intCast(cqe.user_data);
@@ -532,22 +576,41 @@ pub const Real = struct {
         self.share.released(slot.kind);
         assert(self.free_count <= slots_count);
         assert(slot.kind != .execute); // `prepare` never writes one.
+        if (slot.kind != .accept) self.uncount(slot);
         const result: io.Result = switch (slot.kind) {
             .send => send: {
-                // The table refused to release the peer while this send was counted, so
-                // the id is still live and names the socket the send was submitted on.
-                const sends_before = self.table.get(slot.peer).sends_in_flight;
-                self.table.sendCompleted(slot.peer);
-                assert(self.table.get(slot.peer).sends_in_flight == sends_before - 1);
-                assert(self.sends_in_flight > 0); // Counted at submit, like the peer's.
-                self.sends_in_flight -= 1;
-                break :send .{ .send = self.sendResult(cqe.res, slot.length) };
+                var sent = self.sendResult(cqe.res, slot.length);
+                if (sent == error.Backpressure and self.table.get(slot.peer).canceled) sent = error.Canceled;
+                // Only a cancel of the send's connection ends it so.
+                if (sent == error.Canceled) self.table.assertCanceled(slot.peer);
+                break :send .{ .send = sent };
             },
+            .receive => receive: {
+                var received = self.receiveResult(cqe.res, slot.length);
+                if (received == error.Backpressure and self.table.get(slot.peer).canceled) received = error.Canceled;
+                if (received == error.Canceled) self.table.assertCanceled(slot.peer);
+                break :receive .{ .receive = received };
+            },
+            .cancel => .{ .cancel = self.cancelResult(cqe.res) },
             .accept => .{ .accept = self.acceptResult(cqe.res) },
             .execute => unreachable, // Asserted above.
-
         };
         return .{ .id = slot.id, .result = result };
+    }
+
+    /// Uncounts a finished send, receive or cancel on its peer's entry. The table refused
+    /// to release the peer while the operation was counted, so the id is still live and
+    /// names the socket it was submitted on.
+    fn uncount(self: *Real, slot: Slot) void {
+        const operation = slotOperation(slot);
+        const counted_before = self.table.operationCount(operation);
+        assert(counted_before > 0); // Counted at submit.
+        self.table.operationCompleted(operation);
+        assert(self.table.operationCount(operation) == counted_before - 1);
+        if (slot.kind == .send) {
+            assert(self.sends_in_flight > 0); // Counted at submit, like the peer's.
+            self.sends_in_flight -= 1;
+        }
     }
 
     /// A send's result from its completion: the bytes sent, or the error its errno means.
@@ -570,14 +633,67 @@ pub const Real = struct {
         switch (sendErrno(err)) {
             .peer_down => return error.PeerDown,
             .backpressure => return error.Backpressure,
+            .canceled => return error.Canceled,
             // A bad descriptor (a socket closed while its send was in flight), address, flag
-            // or length, a Fast Open or a cancel this type never asks for: each means a bug in
-            // this file or its caller, so the process stops with the reason.
+            // or length, or a Fast Open this type never asks for: each means a bug in this
+            // file or its caller, so the process stops with the reason.
             .bug => std.debug.panic("io_uring send: errno {d}", .{@backingInt(err)}),
             .peer_down_undocumented => {
                 self.send_errno_undocumented_count += 1;
                 self.send_errno_undocumented_last = err;
                 return error.PeerDown;
+            },
+        }
+    }
+
+    /// A receive's result from its completion: the bytes read (0 for end of stream), or the
+    /// error its errno means. An undocumented errno completes as `PeerDown` and is counted.
+    fn receiveResult(self: *Real, res: i32, length: u32) io.ReceiveError!u32 {
+        assert(length > 0);
+        assert(length <= constants.http_request_size_max);
+        if (res >= 0) {
+            const received: u32 = @intCast(res);
+            assert(received <= length); // The kernel never reads more than the buffer holds.
+            return received;
+        }
+        assert(res > -4096);
+        const err: linux.E = @fromBackingInt(@intCast(-res));
+        // The count and the latest errno change together, so neither is set without the other.
+        assert((self.receive_errno_undocumented_count == 0) == (self.receive_errno_undocumented_last == .SUCCESS));
+        switch (receiveErrno(err)) {
+            .peer_down => return error.PeerDown,
+            .backpressure => return error.Backpressure,
+            .canceled => return error.Canceled,
+            .bug => std.debug.panic("io_uring receive: errno {d}", .{@backingInt(err)}),
+            .peer_down_undocumented => {
+                self.receive_errno_undocumented_count += 1;
+                self.receive_errno_undocumented_last = err;
+                return error.PeerDown;
+            },
+        }
+    }
+
+    /// A cancel's result from its completion: the operations it reached. An errno the cancel
+    /// isn't documented to return is counted and completes as 0 reached.
+    fn cancelResult(self: *Real, res: i32) u32 {
+        assert(res > -4096);
+        if (res >= 0) {
+            const reached: u32 = @intCast(res);
+            // Only operations in flight can be reached, and the cancel holds a slot itself.
+            assert(reached < slots_count);
+            return reached;
+        }
+        const err: linux.E = @fromBackingInt(@intCast(-res));
+        // The count and the latest errno change together, so neither is set without the other.
+        assert((self.cancel_errno_undocumented_count == 0) == (self.cancel_errno_undocumented_last == .SUCCESS));
+        switch (cancelErrno(err)) {
+            .none_found => return 0,
+            .bug => std.debug.panic("io_uring cancel: errno {d} (cancelling by descriptor " ++
+                "needs Linux 5.19 or later)", .{@backingInt(err)}),
+            .undocumented => {
+                self.cancel_errno_undocumented_count += 1;
+                self.cancel_errno_undocumented_last = err;
+                return 0;
             },
         }
     }
@@ -642,32 +758,66 @@ pub const Real = struct {
     }
 };
 
-/// Fills a submission entry for a send or an accept, and returns the slot that tracks it.
+/// Fills a submission entry for a send, a receive, an accept or a cancel, and returns the
+/// slot that tracks it.
 fn prepare(sqe: *linux.io_uring_sqe, submission: io.Submission, socket: io.Socket) Slot {
     assert(socket >= 0);
-    const slot: Slot = switch (submission.operation) {
-        .send => |send| send: {
+    var slot: Slot = .{ .id = submission.id, .kind = submission.operation, .length = 0, .peer = 0, .in_use = true };
+    switch (submission.operation) {
+        .send => |send| {
             sqe.prep_send(socket, send.bytes, linux.MSG.NOSIGNAL);
-            break :send .{
-                .id = submission.id,
-                .kind = .send,
-                .length = @intCast(send.bytes.len),
-                .peer = send.peer,
-                .in_use = true,
-            };
+            slot.length = @intCast(send.bytes.len);
+            slot.peer = send.peer;
         },
-        .accept => accept: {
-            // No peer address is asked for: the app listens only where nginx reaches it.
-            sqe.prep_accept(socket, null, null, linux.SOCK.CLOEXEC);
-            break :accept .{ .id = submission.id, .kind = .accept, .length = 0, .peer = 0, .in_use = true };
+        .receive => |receive| {
+            sqe.prep_recv(socket, receive.buffer, 0);
+            slot.length = @intCast(receive.buffer.len);
+            slot.peer = receive.peer;
         },
+        .cancel => |cancel| {
+            // Every request on the socket, not only the first one found.
+            sqe.prep_cancel_fd(socket, linux.IORING_ASYNC_CANCEL_ALL);
+            slot.peer = cancel.peer;
+        },
+        // No peer address is asked for: the app listens only where nginx reaches it.
+        .accept => sqe.prep_accept(socket, null, null, linux.SOCK.CLOEXEC),
         // `socketFor` stopped the process already.
         .execute => unreachable,
-    };
-    assert(slot.kind == @as(io.Kind, submission.operation));
+    }
     assert(slot.kind != .execute);
     assert(sqe.fd == socket);
     return slot;
+}
+
+/// The operation a slot's completion uncounts on its peer, rebuilt from what the slot
+/// kept: only the kind and the peer matter to the table, so the bytes are left empty.
+fn slotOperation(slot: Slot) io.Operation {
+    assert(slot.in_use);
+    assert(slot.kind == .send or slot.kind == .receive or slot.kind == .cancel);
+    const operation: io.Operation = switch (slot.kind) {
+        .send => .{ .send = .{ .peer = slot.peer, .bytes = "" } },
+        .receive => .{ .receive = .{ .peer = slot.peer, .buffer = &.{} } },
+        .cancel => .{ .cancel = .{ .peer = slot.peer } },
+        .accept, .execute => unreachable, // Asserted above.
+    };
+    assert(io.operationPeer(operation).? == slot.peer);
+    return operation;
+}
+
+/// Preconditions on the bytes a send or a receive names: a caller that breaks one has a
+/// bug, so these assert.
+fn assertOperationBytes(operation: io.Operation) void {
+    switch (operation) {
+        .send => |send| {
+            assert(send.bytes.len > 0);
+            assert(send.bytes.len <= constants.http_response_size_max);
+        },
+        .receive => |receive| {
+            assert(receive.buffer.len > 0);
+            assert(receive.buffer.len <= constants.http_request_size_max);
+        },
+        .accept, .cancel, .execute => {},
+    }
 }
 
 /// What a failed accept's errno means. `backpressure_undocumented` is an errno accept(2)
@@ -794,10 +944,11 @@ fn copyReady(ring: *linux.IoUring, cqes: []linux.io_uring_cqe) u32 {
     return count;
 }
 
-/// What a failed send's errno means. `peer_down_undocumented` is an errno send(2) isn't
-/// documented to return; `Real.sendResult` treats it as `PeerDown` and counts it. `bug`
-/// can only mean a bug in this file or its caller; `Real.sendResult` stops the process.
-const SendOutcome = enum { peer_down, backpressure, peer_down_undocumented, bug };
+/// What a failed send's or receive's errno means. `canceled`: a cancel of its connection
+/// reached it. `peer_down_undocumented` is an errno send(2) or recv(2) isn't documented to
+/// return; `Real.sendResult` and `Real.receiveResult` treat it as `PeerDown` and count it.
+/// `bug` can only mean a bug in this file or its caller; they stop the process.
+const SendOutcome = enum { peer_down, backpressure, canceled, peer_down_undocumented, bug };
 
 /// Maps a failed send's errno to its outcome. Pure, so tests can check every arm,
 /// including the ones that stop the process.
@@ -815,15 +966,65 @@ fn sendErrno(err: linux.E) SendOutcome {
         .ACCES, .PERM, .IO, .PROTO => .peer_down,
         // The kernel is short of buffers or the call was interrupted: try again later.
         .AGAIN, .NOBUFS, .NOMEM, .INTR => .backpressure,
+        // A cancel of the connection reached the send; `Real.complete` checks it was asked.
+        .CANCELED => .canceled,
         // Only a bug causes these; `Real.sendResult` says which and stops. EALREADY is a
         // second Fast Open in progress, and no send here sets MSG_FASTOPEN.
         .BADF, .NOTSOCK, .FAULT, .INVAL, .OPNOTSUPP, .MSGSIZE, .DESTADDRREQ, .ISCONN => .bug,
-        .CANCELED, .ALREADY => .bug,
+        .ALREADY => .bug,
         // An errno send(2) isn't documented to return, named in std or not. It says this
         // file's model of the kernel is incomplete, not that this process is broken, and a
         // client might be able to provoke it, so stopping would take the server down for
         // everyone. Only this connection fails, and the caller counts it.
         else => .peer_down_undocumented,
+    };
+}
+
+/// Maps a failed receive's errno to its outcome, as `sendErrno` does for sends. Pure, so
+/// tests can check every arm, including the ones that stop the process.
+fn receiveErrno(err: linux.E) SendOutcome {
+    // Preconditions for any caller, tests included: a failure, in the kernel's errno
+    // range of 1 to 4095.
+    assert(err != .SUCCESS);
+    assert(@backingInt(err) < 4096);
+    return switch (err) {
+        // The connection is gone or unusable, as for sends: the caller closes it.
+        .CONNRESET, .CONNREFUSED, .CONNABORTED, .NOTCONN, .TIMEDOUT, .PIPE => .peer_down,
+        .HOSTUNREACH, .NETUNREACH, .NETDOWN, .HOSTDOWN, .NETRESET => .peer_down,
+        .ACCES, .PERM, .IO, .PROTO => .peer_down,
+        // The kernel is short of buffers or the call was interrupted: try again later.
+        .AGAIN, .NOBUFS, .NOMEM, .INTR => .backpressure,
+        // A cancel of the connection reached the receive; `Real.complete` checks it was asked.
+        .CANCELED => .canceled,
+        // A descriptor that isn't an open socket, a bad buffer, or a flag this type never
+        // sets: each means a bug here or in the caller.
+        .BADF, .NOTSOCK, .FAULT, .INVAL, .OPNOTSUPP => .bug,
+        // Counted, not fatal, as for sends: only this connection fails.
+        else => .peer_down_undocumented,
+    };
+}
+
+/// What a failed cancel's errno means for `Real.cancelResult`. `none_found`: nothing on the
+/// socket was in flight. `bug`: a bad descriptor, or flags the kernel doesn't know (before
+/// Linux 5.19). `undocumented`: an errno a cancel isn't documented to return.
+const CancelOutcome = enum { none_found, bug, undocumented };
+
+/// Maps a cancel's errno to its outcome. Pure, so tests can check every arm, including the
+/// one that stops the process.
+fn cancelErrno(err: linux.E) CancelOutcome {
+    // Preconditions for any caller, tests included: a failure, in the kernel's errno range
+    // of 1 to 4095.
+    assert(err != .SUCCESS);
+    assert(@backingInt(err) < 4096);
+    return switch (err) {
+        // ENOENT: no request matched. With IORING_ASYNC_CANCEL_ALL the kernel reports that
+        // as 0 reached, but an older path may still return it.
+        .NOENT => .none_found,
+        // The descriptor is held open by the entry, and the flags are this file's, so
+        // these mean a bug or a kernel too old for cancelling by descriptor.
+        .BADF, .INVAL => .bug,
+        // Counted, not fatal: the caller's next deadline cancels again.
+        else => .undocumented,
     };
 }
 
@@ -999,9 +1200,9 @@ const Fixture = struct {
         self.remote = fds[1];
         errdefer _ = linux.close(fds[0]);
         errdefer _ = linux.close(fds[1]);
-        self.startup = .init(testing.allocator, 4 * connections.entry_bytes);
+        self.startup = .init(testing.allocator, fixture_table_size * connections.entry_bytes);
         self.gpa = self.startup.allocator();
-        self.table = try connections.Table.init(self.gpa, 4);
+        self.table = try connections.Table.init(self.gpa, fixture_table_size);
         errdefer self.table.deinit(self.gpa);
         self.peer = try self.table.acquire(self.local);
         self.real = try Real.init(&self.startup, &self.table);
@@ -1015,9 +1216,9 @@ const Fixture = struct {
         assert(self.table.count() == 1);
         self.real.deinit();
         // deinit asserted nothing is in flight, so no send is counted on the peer.
-        assert(self.table.get(self.peer).sends_in_flight == 0);
+        assert(!self.table.get(self.peer).busy());
         const released = self.table.release(self.peer) catch |err| switch (err) {
-            error.SendsInFlight => unreachable,
+            error.OperationsInFlight => unreachable,
         };
         assert(released == self.local);
         self.startup.beginShutdown();
@@ -1032,7 +1233,42 @@ const Fixture = struct {
         assert(bytes.len <= constants.http_response_size_max);
         return self.real.submit(.{ .id = id, .operation = .{ .send = .{ .peer = self.peer, .bytes = bytes } } });
     }
+
+    /// Fills the slots kept for cancels: takes `cancel_entries` more entries, each on the far
+    /// end, which nothing on the ring uses, so each cancel reaches nothing, and submits a
+    /// cancel of each, ids from `first`. Returns the entries for `releaseCancelled`.
+    fn fillCancels(self: *Fixture, first: io.OperationId) ![cancel_entries]io.PeerId {
+        assert(self.remote >= 0);
+        assert(self.real.share.cancels_in_flight == 0);
+        var peers: [cancel_entries]io.PeerId = undefined;
+        for (&peers, 0..) |*peer, index| {
+            peer.* = try self.table.acquire(self.remote);
+            try self.real.submit(.{ .id = first + index, .operation = .{ .cancel = .{ .peer = peer.* } } });
+        }
+        try testing.expectEqual(cancel_entries, self.real.share.cancels_in_flight);
+        return peers;
+    }
+
+    /// Takes the cancels `fillCancels` submitted, each reaching nothing, and releases their
+    /// entries. Nothing else may complete meanwhile.
+    fn releaseCancelled(self: *Fixture, peers: [cancel_entries]io.PeerId, first: io.OperationId) !void {
+        var completions: [cancel_entries]io.Completion = undefined;
+        try pollUntil(&self.real, &completions, cancel_entries, -1);
+        for (completions) |completion| {
+            try testing.expect(completion.id >= first and completion.id < first + cancel_entries);
+            try testing.expectEqual(@as(u32, 0), completion.result.cancel);
+        }
+        for (peers) |peer| try testing.expectEqual(self.remote, try self.table.release(peer));
+        try testing.expectEqual(@as(u32, 0), self.real.share.cancels_in_flight);
+        try testing.expectEqual(@as(u32, 1), self.table.count());
+    }
 };
+
+/// Entries `Fixture.fillCancels` takes: one for each cancel the ring keeps slots for.
+const cancel_entries: u32 = constants.io_cancels_in_flight_max;
+
+/// The fixture's table: the peer, three spare entries, and the cancels' entries.
+const fixture_table_size: u32 = 4 + cancel_entries;
 
 /// Empty polls `pollUntil` allows, 1 ms apart. Reason: a socketpair send normally completes
 /// during the submitting system call; a second is ample even on a loaded CI machine.
@@ -1158,7 +1394,7 @@ test "real: a peer with a send in flight is refused release until its completion
     // released, so its socket can't be closed and its number reused under the send.
     try testing.expectEqual(@as(connections.SendCount, 1), fixture.table.get(fixture.peer).sends_in_flight);
     const entry_before = fixture.table.get(fixture.peer).*;
-    try testing.expectError(error.SendsInFlight, fixture.table.release(fixture.peer));
+    try testing.expectError(error.OperationsInFlight, fixture.table.release(fixture.peer));
     try testing.expectEqual(entry_before, fixture.table.get(fixture.peer).*);
     try testing.expectEqual(@as(u32, 1), fixture.table.count());
 
@@ -1180,7 +1416,7 @@ test "real: a send left on the ring before enter holds its peer until its comple
     try testing.expectEqual(@as(u32, 1), fixture.real.ring.sq_ready());
     const entry_before = fixture.table.get(fixture.peer).*;
     try testing.expectEqual(@as(connections.SendCount, 1), entry_before.sends_in_flight);
-    try testing.expectError(error.SendsInFlight, fixture.table.release(fixture.peer));
+    try testing.expectError(error.OperationsInFlight, fixture.table.release(fixture.peer));
     try testing.expectEqual(entry_before, fixture.table.get(fixture.peer).*);
 
     // The next poll hands it to the kernel; it goes out on the socket it was queued with.
@@ -1360,7 +1596,7 @@ test "real: drop fails a send stuck on a client that stopped reading, and the en
     try fixture.send(21, &stuck);
     try expectStuck(&fixture.real);
     // The stuck send holds the entry, and nothing would ever release it.
-    try testing.expectError(error.SendsInFlight, fixture.table.release(fixture.peer));
+    try testing.expectError(error.OperationsInFlight, fixture.table.release(fixture.peer));
 
     try fixture.real.drop(fixture.peer);
     try testing.expectEqual(@as(u64, 1), fixture.real.dropped);
@@ -1414,7 +1650,7 @@ test "real: dropping one connection leaves another connection's stuck send pendi
     // The other connection's send still waits, still counted on its entry.
     try expectStuck(&fixture.real);
     try testing.expectEqual(@as(connections.SendCount, 1), fixture.table.get(other).sends_in_flight);
-    try testing.expectError(error.SendsInFlight, fixture.table.release(other));
+    try testing.expectError(error.OperationsInFlight, fixture.table.release(other));
 
     // Reading its far end lets it finish with its byte; then it is released.
     const filled = try readSome(fds[1]);
@@ -1462,9 +1698,12 @@ test "real: with every send slot held by a stuck send, an accept still goes in a
     try testing.expectError(error.SlotsKeptForAccepts, fixture.send(id, "w"));
     try testing.expectEqual(shared_slots_max, fixture.real.inFlight());
 
-    // The slot kept for accepts takes the accept; then the ring is full for everything.
+    // The slot kept for accepts takes the accept, and the slots kept for cancels a cancel
+    // each; then the ring is full for everything.
     const accept: io.Operation = .{ .accept = .{ .listener = loopback.listener } };
     try fixture.real.submit(.{ .id = ids_past_share, .operation = accept });
+    const cancels_first = ids_past_share + 2;
+    const cancelled = try fixture.fillCancels(cancels_first);
     try testing.expectEqual(slots_count, fixture.real.inFlight());
     try testing.expectEqual(@as(u32, 0), fixture.real.free_count);
     try testing.expectEqual(constants.accepts_in_flight_max, fixture.real.share.accepts_in_flight);
@@ -1478,6 +1717,9 @@ test "real: with every send slot held by a stuck send, an accept still goes in a
     // `constants.accepts_in_flight_max`, a caller's bug that stops the process before the ring
     // is checked (the startup-trip harness covers it).
     try testing.expectError(error.QueueFull, fixture.send(ids_past_share + 1, "w"));
+    // So does a cancel, its own share full too, and the refusal marks no entry cancelled.
+    const cancel: io.Operation = .{ .cancel = .{ .peer = fixture.peer } };
+    try testing.expectError(error.QueueFull, fixture.real.submit(.{ .id = ids_past_share + 1, .operation = cancel }));
     try testing.expectEqualSlices(Slot, &slots_before, &fixture.real.slots);
     try testing.expectEqual(submitted_before, fixture.real.submitted);
     try testing.expectEqual(sqe_tail_before, fixture.real.ring.sq.sqe_tail);
@@ -1485,6 +1727,7 @@ test "real: with every send slot held by a stuck send, an accept still goes in a
     try testing.expectEqual(share_before, fixture.real.share);
     try testing.expectEqual(@as(u32, 0), fixture.real.free_count);
     try testing.expectEqual(slots_count, fixture.real.inFlight());
+    try fixture.releaseCancelled(cancelled, cancels_first);
     try loopback.connect();
     var completions: [slots_count]io.Completion = undefined;
     try pollUntil(&fixture.real, &completions, 1, -1);
@@ -1508,7 +1751,7 @@ test "real: with every send slot held by a stuck send, an accept still goes in a
     fixture.peer = try fixture.table.acquire(fixture.local);
 }
 
-test "real: an accept counts against no share, so a send takes the last free slot, and the accept's freed slot stays kept" {
+test "real: an accept counts against no share, so a send takes the share's last place, and the accept's freed slot stays kept" {
     var fixture: Fixture = undefined;
     try fixture.setUp();
     defer fixture.tearDown();
@@ -1522,13 +1765,13 @@ test "real: an accept counts against no share, so a send takes the last free slo
     var id: io.OperationId = 0;
     while (id < shared_slots_max - 1) : (id += 1) try fixture.send(id, "w");
     try expectStuck(&fixture.real);
-    try testing.expectEqual(@as(u32, 1), fixture.real.free_count);
+    try testing.expectEqual(1 + cancel_entries, fixture.real.free_count);
     try testing.expectEqual(shared_slots_max - 1, fixture.real.share.others_in_flight);
-    // The last free slot is not the kept one: the share counts operations, not free slots.
+    // The share's last place is not the accept's: it counts operations, not free slots.
     try fixture.send(id, "w");
     id += 1;
     try expectStuck(&fixture.real);
-    try testing.expectEqual(slots_count, fixture.real.inFlight());
+    try testing.expectEqual(slots_count - cancel_entries, fixture.real.inFlight());
     try testing.expectEqual(shared_slots_max, fixture.real.share.others_in_flight);
 
     // The accept completes; its slot is free again but kept, so a send is refused and
@@ -1549,7 +1792,7 @@ test "real: an accept counts against no share, so a send takes the last free slo
     try other.open();
     defer other.close();
     try fixture.real.submit(.{ .id = ids_past_share + 1, .operation = .{ .accept = .{ .listener = other.listener } } });
-    try testing.expectEqual(slots_count, fixture.real.inFlight());
+    try testing.expectEqual(slots_count - cancel_entries, fixture.real.inFlight());
 
     // Dropping the stuck connection hands every send slot back; the second accept stays.
     try fixture.real.drop(fixture.peer);
@@ -1641,11 +1884,23 @@ test "real: an undocumented shutdown errno counts against the bound, and past it
     try testing.expectEqual(@as(u64, bound), fixture.real.dropped);
     try expectStuck(&fixture.real);
 
-    // Ended here by hand, as the cancel will (core 3b); the entry's count goes with it.
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.shutdown(fixture.local, linux.SHUT.RDWR)));
-    var completions: [1]io.Completion = undefined;
-    try pollUntil(&fixture.real, &completions, 1, -1);
-    try testing.expectError(error.PeerDown, completions[0].result.send);
+    // The cancel frees it: the stuck send completes with Canceled, the cancel says it
+    // reached one, and the entry, its counts back to zero, is released.
+    try testing.expectError(error.OperationsInFlight, fixture.table.release(fixture.peer));
+    try fixture.real.submit(.{ .id = 42, .operation = .{ .cancel = .{ .peer = fixture.peer } } });
+    var completions: [2]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 2, -1);
+    var canceled_send = false;
+    var reached: ?u32 = null;
+    for (completions) |completion| switch (completion.id) {
+        41 => canceled_send = completion.result.send == error.Canceled,
+        42 => reached = completion.result.cancel,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(canceled_send);
+    try testing.expectEqual(@as(?u32, 1), reached);
+    try testing.expectEqual(@as(u32, 0), fixture.real.inFlight());
+    try testing.expect(!fixture.table.get(fixture.peer).busy());
     try testing.expectEqual(fixture.local, try fixture.table.release(fixture.peer));
     fixture.peer = try fixture.table.acquire(fixture.local);
     try testing.expectEqual(@as(connections.DropCount, 0), fixture.table.get(fixture.peer).drops_failed);
@@ -1685,6 +1940,10 @@ fn errnoCountersOnly() Real {
     real.accept_errno_undocumented_last = .SUCCESS;
     real.drop_errno_undocumented_count = 0;
     real.drop_errno_undocumented_last = .SUCCESS;
+    real.receive_errno_undocumented_count = 0;
+    real.receive_errno_undocumented_last = .SUCCESS;
+    real.cancel_errno_undocumented_count = 0;
+    real.cancel_errno_undocumented_last = .SUCCESS;
     return real;
 }
 
@@ -1700,8 +1959,8 @@ const send_errnos_peer_down = [_]linux.E{
 };
 const send_errnos_backpressure = [_]linux.E{ .AGAIN, .NOBUFS, .NOMEM, .INTR };
 const send_errnos_bug = [_]linux.E{
-    .BADF,    .NOTSOCK,     .FAULT,  .INVAL,    .OPNOTSUPP,
-    .MSGSIZE, .DESTADDRREQ, .ISCONN, .CANCELED, .ALREADY,
+    .BADF,    .NOTSOCK,     .FAULT,  .INVAL,   .OPNOTSUPP,
+    .MSGSIZE, .DESTADDRREQ, .ISCONN, .ALREADY,
 };
 
 /// Errnos send(2) doesn't document: some std names, the top of the kernel's range, and a
@@ -1757,6 +2016,195 @@ test "real: a completion's result maps bytes and no progress" {
     try testing.expectEqual(@as(u32, 2), try real.sendResult(2, 5)); // A short send.
     try testing.expectError(error.Backpressure, real.sendResult(0, 5));
     try testing.expectEqual(@as(u64, 0), real.send_errno_undocumented_count);
+}
+test "real: ECANCELED on a send is Canceled, counted nowhere" {
+    var real = errnoCountersOnly();
+    try testing.expectEqual(SendOutcome.canceled, sendErrno(.CANCELED));
+    try testing.expectError(error.Canceled, real.sendResult(sendFailed(.CANCELED), 5));
+    try testing.expectEqual(@as(u64, 0), real.send_errno_undocumented_count);
+}
+
+const receive_errnos_peer_down = [_]linux.E{
+    .CONNRESET,   .CONNREFUSED, .CONNABORTED, .NOTCONN,  .TIMEDOUT, .PIPE,
+    .HOSTUNREACH, .NETUNREACH,  .NETDOWN,     .HOSTDOWN, .NETRESET, .ACCES,
+    .PERM,        .IO,          .PROTO,
+};
+const receive_errnos_backpressure = [_]linux.E{ .AGAIN, .NOBUFS, .NOMEM, .INTR };
+const receive_errnos_bug = [_]linux.E{ .BADF, .NOTSOCK, .FAULT, .INVAL, .OPNOTSUPP };
+/// Errnos recv(2) doesn't document: some only send(2) has, others std names, the top of the
+/// kernel's range, and a value std has no name for.
+const receive_errnos_undocumented = [_]linux.E{
+    .MSGSIZE, .ISCONN, .SHUTDOWN, .NOENT, .NOSPC, @fromBackingInt(4095), @fromBackingInt(1000),
+};
+
+test "real: every documented receive errno has an outcome, counted nowhere" {
+    var real = errnoCountersOnly();
+    for (receive_errnos_peer_down) |err| {
+        try testing.expectEqual(SendOutcome.peer_down, receiveErrno(err));
+        try testing.expectError(error.PeerDown, real.receiveResult(sendFailed(err), 5));
+    }
+    for (receive_errnos_backpressure) |err| {
+        try testing.expectEqual(SendOutcome.backpressure, receiveErrno(err));
+        try testing.expectError(error.Backpressure, real.receiveResult(sendFailed(err), 5));
+    }
+    try testing.expectEqual(SendOutcome.canceled, receiveErrno(.CANCELED));
+    try testing.expectError(error.Canceled, real.receiveResult(sendFailed(.CANCELED), 5));
+    // `receiveResult` stops the process on these, so only the mapping is checked here.
+    for (receive_errnos_bug) |err| try testing.expectEqual(SendOutcome.bug, receiveErrno(err));
+    try testing.expectEqual(@as(u64, 0), real.receive_errno_undocumented_count);
+    try testing.expectEqual(linux.E.SUCCESS, real.receive_errno_undocumented_last);
+}
+
+test "real: an undocumented receive errno is PeerDown and is counted; bytes and end of stream are not" {
+    var real = errnoCountersOnly();
+    for (receive_errnos_undocumented, 1..) |err, count| {
+        try testing.expectEqual(SendOutcome.peer_down_undocumented, receiveErrno(err));
+        try testing.expectError(error.PeerDown, real.receiveResult(sendFailed(err), 5));
+        try testing.expectEqual(@as(u64, count), real.receive_errno_undocumented_count);
+        try testing.expectEqual(err, real.receive_errno_undocumented_last);
+    }
+    const counted = real.receive_errno_undocumented_count;
+    try testing.expectEqual(@as(u32, 5), try real.receiveResult(5, 5));
+    try testing.expectEqual(@as(u32, 2), try real.receiveResult(2, 5)); // A short read.
+    try testing.expectEqual(@as(u32, 0), try real.receiveResult(0, 5)); // End of stream.
+    try testing.expectError(error.PeerDown, real.receiveResult(sendFailed(.CONNRESET), 5));
+    try testing.expectEqual(counted, real.receive_errno_undocumented_count);
+    // Sends keep their own count.
+    try testing.expectEqual(@as(u64, 0), real.send_errno_undocumented_count);
+}
+
+const cancel_errnos_undocumented = [_]linux.E{ .ALREADY, .AGAIN, .NOMEM, .PERM, @fromBackingInt(4095) };
+
+test "real: a cancel's result is what it reached; ENOENT is none, an undocumented errno counts as none" {
+    var real = errnoCountersOnly();
+    try testing.expectEqual(@as(u32, 0), real.cancelResult(0));
+    try testing.expectEqual(@as(u32, 3), real.cancelResult(3));
+    try testing.expectEqual(CancelOutcome.none_found, cancelErrno(.NOENT));
+    try testing.expectEqual(@as(u32, 0), real.cancelResult(sendFailed(.NOENT)));
+    try testing.expectEqual(@as(u64, 0), real.cancel_errno_undocumented_count);
+    // `cancelResult` stops the process on these, so only the mapping is checked here.
+    try testing.expectEqual(CancelOutcome.bug, cancelErrno(.BADF));
+    try testing.expectEqual(CancelOutcome.bug, cancelErrno(.INVAL));
+    for (cancel_errnos_undocumented, 1..) |err, count| {
+        try testing.expectEqual(CancelOutcome.undocumented, cancelErrno(err));
+        try testing.expectEqual(@as(u32, 0), real.cancelResult(sendFailed(err)));
+        try testing.expectEqual(@as(u64, count), real.cancel_errno_undocumented_count);
+        try testing.expectEqual(err, real.cancel_errno_undocumented_last);
+    }
+}
+
+/// Writes all of `bytes` to `socket`, which must take them at once.
+fn writeAll(socket: linux.fd_t, bytes: []const u8) !void {
+    const rc = linux.sendto(socket, bytes.ptr, bytes.len, linux.MSG.NOSIGNAL, null, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try testing.expectEqual(bytes.len, rc);
+}
+
+test "real: a receive reads what the far end wrote, short of its buffer, then end of stream" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    try writeAll(fixture.remote, "GET / HTTP/1.1\r\n");
+    var buffer: [64]u8 = @splat(0);
+    const receive: io.Operation = .{ .receive = .{ .peer = fixture.peer, .buffer = &buffer } };
+    try fixture.real.submit(.{ .id = 51, .operation = receive });
+    try testing.expect(fixture.table.get(fixture.peer).receiving);
+    // The receive holds the entry until it completes.
+    try testing.expectError(error.OperationsInFlight, fixture.table.release(fixture.peer));
+    var completions: [1]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(io.OperationId, 51), completions[0].id);
+    const received = try completions[0].result.receive;
+    try testing.expectEqualStrings("GET / HTTP/1.1\r\n", buffer[0..received]);
+    // Nothing past what was read was written.
+    try testing.expect(std.mem.allEqual(u8, buffer[received..], 0));
+    try testing.expect(!fixture.table.get(fixture.peer).receiving);
+
+    // The far end closes: the next receive reads end of stream.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.close(fixture.remote)));
+    fixture.remote = -1;
+    try fixture.real.submit(.{ .id = 52, .operation = receive });
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(u32, 0), try completions[0].result.receive);
+    try testing.expectEqual(@as(u64, 0), fixture.real.receive_errno_undocumented_count);
+}
+
+test "real: a drop ends a pending receive as end of stream, and its entry can be released" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    var buffer: [16]u8 = undefined;
+    const receive: io.Operation = .{ .receive = .{ .peer = fixture.peer, .buffer = &buffer } };
+    try fixture.real.submit(.{ .id = 61, .operation = receive });
+    // Nothing was written, so the receive waits.
+    var completions: [1]io.Completion = undefined;
+    try testing.expectEqual(@as(u32, 0), fixture.real.poll(&completions));
+    try fixture.real.drop(fixture.peer);
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(io.OperationId, 61), completions[0].id);
+    // The contract allows end of stream or PeerDown; Linux gives end of stream.
+    const ended = completions[0].result.receive catch |err| switch (err) {
+        error.PeerDown => 0,
+        error.Backpressure, error.Canceled => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(u32, 0), ended);
+    try testing.expectEqual(fixture.local, try fixture.table.release(fixture.peer));
+    fixture.peer = try fixture.table.acquire(fixture.local);
+}
+
+test "real: a cancel ends a pending receive with Canceled, reaching one, and a second reaches none" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    var buffer: [16]u8 = undefined;
+    const receive: io.Operation = .{ .receive = .{ .peer = fixture.peer, .buffer = &buffer } };
+    try fixture.real.submit(.{ .id = 71, .operation = receive });
+    try fixture.real.submit(.{ .id = 72, .operation = .{ .cancel = .{ .peer = fixture.peer } } });
+    try testing.expect(fixture.table.get(fixture.peer).canceled);
+    try testing.expectEqual(@as(u32, 1), fixture.real.share.cancels_in_flight);
+    var completions: [2]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 2, -1);
+    var canceled_receive = false;
+    var reached: ?u32 = null;
+    for (completions) |completion| switch (completion.id) {
+        71 => canceled_receive = completion.result.receive == error.Canceled,
+        72 => reached = completion.result.cancel,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(canceled_receive);
+    try testing.expectEqual(@as(?u32, 1), reached);
+    try testing.expectEqual(@as(u32, 0), fixture.real.share.cancels_in_flight);
+    // A second cancel, with nothing left in flight, reaches nothing.
+    try fixture.real.submit(.{ .id = 73, .operation = .{ .cancel = .{ .peer = fixture.peer } } });
+    try pollUntil(&fixture.real, completions[0..1], 1, -1);
+    try testing.expectEqual(@as(u32, 0), completions[0].result.cancel);
+    try testing.expectEqual(fixture.local, try fixture.table.release(fixture.peer));
+    fixture.peer = try fixture.table.acquire(fixture.local);
+    try testing.expect(!fixture.table.get(fixture.peer).canceled);
+}
+
+test "real: past the cancels' share a cancel is refused with CancelsFull and changes nothing" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    const first: io.OperationId = 100;
+    const cancelled = try fixture.fillCancels(first);
+    const slots_before = fixture.real.slots;
+    const submitted_before = fixture.real.submitted;
+    const share_before = fixture.real.share;
+    const entry_before = fixture.table.get(fixture.peer).*;
+    const cancel: io.Submission = .{ .id = first + cancel_entries, .operation = .{ .cancel = .{ .peer = fixture.peer } } };
+    try testing.expectError(error.CancelsFull, fixture.real.submit(cancel));
+    try testing.expectEqualSlices(Slot, &slots_before, &fixture.real.slots);
+    try testing.expectEqual(submitted_before, fixture.real.submitted);
+    try testing.expectEqual(share_before, fixture.real.share);
+    // The refused cancel marks nothing: the entry still takes a send.
+    try testing.expectEqual(entry_before, fixture.table.get(fixture.peer).*);
+    try fixture.releaseCancelled(cancelled, first);
+    try fixture.send(first + cancel_entries + 1, "x");
+    var completions: [1]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 1, fixture.remote);
+    try testing.expectEqual(@as(u32, 1), try completions[0].result.send);
 }
 
 test "real: a poll takes no more completions than its buffer holds; the rest wait" {
@@ -1863,9 +2311,9 @@ test "real: an accept over a loopback listener takes a table entry for the conne
     // Released first on any failure below, so the fixture's teardown reports nothing false.
     const socket = fixture.table.get(peer).socket;
     // No send is submitted on the new connection, so nothing holds its release back.
-    assert(fixture.table.get(peer).sends_in_flight == 0);
+    assert(!fixture.table.get(peer).busy());
     defer _ = linux.close(fixture.table.release(peer) catch |err| switch (err) {
-        error.SendsInFlight => unreachable,
+        error.OperationsInFlight => unreachable,
     });
     try testing.expectEqual(@as(u32, 2), fixture.table.count());
     try testing.expectEqual(connections.State.idle, fixture.table.get(peer).state);
@@ -1914,9 +2362,9 @@ test "real: an accept on the local listener takes the client connecting through 
     try testing.expectEqual(@as(io.OperationId, 11), completions[0].id);
     const peer = try completions[0].result.accept;
     const socket = fixture.table.get(peer).socket;
-    assert(fixture.table.get(peer).sends_in_flight == 0);
+    assert(!fixture.table.get(peer).busy());
     defer _ = linux.close(fixture.table.release(peer) catch |err| switch (err) {
-        error.SendsInFlight => unreachable,
+        error.OperationsInFlight => unreachable,
     });
     try testing.expectEqual(@as(u32, 2), fixture.table.count());
 
@@ -1937,13 +2385,13 @@ test "real: an accept into a full table closes the connection and completes with
     defer loopback.close();
     // Fill the rest of the table with descriptor numbers no test opens; the table never
     // touches them.
-    var fillers: [3]io.PeerId = undefined;
+    var fillers: [fixture_table_size - 1]io.PeerId = undefined;
     for (&fillers, 0..) |*filler, index| filler.* = try fixture.table.acquire(@intCast(1_000_000 + index));
     defer for (fillers) |filler| {
         // The fillers never send, so nothing holds their release back.
-        assert(fixture.table.get(filler).sends_in_flight == 0);
+        assert(!fixture.table.get(filler).busy());
         _ = fixture.table.release(filler) catch |err| switch (err) {
-            error.SendsInFlight => unreachable,
+            error.OperationsInFlight => unreachable,
         };
     };
     try testing.expectEqual(fixture.table.capacity(), fixture.table.count());
@@ -2103,9 +2551,9 @@ test "real: after Backpressure an accept is refused until the wait is over, send
     try pollUntil(&fixture.real, &completions, 1, -1);
     try testing.expectEqual(@as(io.OperationId, 21), completions[0].id);
     const peer = try completions[0].result.accept;
-    assert(fixture.table.get(peer).sends_in_flight == 0);
+    assert(!fixture.table.get(peer).busy());
     _ = linux.close(fixture.table.release(peer) catch |err| switch (err) {
-        error.SendsInFlight => unreachable,
+        error.OperationsInFlight => unreachable,
     });
 }
 
@@ -2136,7 +2584,7 @@ test "real: with the share full, the slot kept for accepts still waits out a Bac
     // `constants.accepts_in_flight_max` accepts, so another would be a caller's bug (the
     // startup-trip harness covers it). The nearest case is every send slot in use and the
     // kept slot free: the accept is refused by the wait, not by the share.
-    comptime assert(slots_count - shared_slots_max == constants.accepts_in_flight_max);
+    comptime assert(slots_count - shared_slots_max == constants.accepts_in_flight_max + constants.io_cancels_in_flight_max);
     var fixture: Fixture = undefined;
     try fixture.setUp();
     defer fixture.tearDown();
@@ -2154,11 +2602,11 @@ test "real: with the share full, the slot kept for accepts still waits out a Bac
     try testing.expectEqual(@as(u64, 1), fixture.real.accept_wait.refused);
     try testing.expectEqual(@as(u32, 0), fixture.real.share.accepts_in_flight);
 
-    // Once the wait is over, the accept takes the kept slot and fills the ring; it takes
-    // the connection once the sends are back.
+    // Once the wait is over, the accept takes the kept slot, leaving only the cancels'
+    // free; it takes the connection once the sends are back.
     try sleepUntil(&fixture.real, resume_at);
     try fixture.real.submit(late);
-    try testing.expectEqual(@as(u32, 0), fixture.real.free_count);
+    try testing.expectEqual(cancel_entries, fixture.real.free_count);
     try testing.expectEqual(constants.accepts_in_flight_max, fixture.real.share.accepts_in_flight);
     var completions: [slots_count]io.Completion = undefined;
     try pollUntil(&fixture.real, &completions, shared_slots_max, fixture.remote);
@@ -2168,9 +2616,9 @@ test "real: with the share full, the slot kept for accepts still waits out a Bac
     try testing.expectEqual(late.id, completions[0].id);
     const peer = try completions[0].result.accept;
     // No send is submitted on the new connection, so nothing holds its release back.
-    assert(fixture.table.get(peer).sends_in_flight == 0);
+    assert(!fixture.table.get(peer).busy());
     _ = linux.close(fixture.table.release(peer) catch |err| switch (err) {
-        error.SendsInFlight => unreachable,
+        error.OperationsInFlight => unreachable,
     });
 }
 
@@ -2415,9 +2863,9 @@ const Soak = struct {
         if (!settled) return false;
         self.real.deinit();
         for (self.peers, self.locals) |peer, local| {
-            assert(self.table.get(peer).sends_in_flight == 0);
+            assert(!self.table.get(peer).busy());
             const released = self.table.release(peer) catch |err| switch (err) {
-                error.SendsInFlight => unreachable, // Nothing is in flight.
+                error.OperationsInFlight => unreachable, // Nothing is in flight.
             };
             assert(released == local);
         }
@@ -2497,6 +2945,8 @@ const Soak = struct {
             // A send on a blocking socketpair waits in the kernel instead of failing with
             // EAGAIN; only a machine out of buffers (ENOBUFS, ENOMEM) could report this.
             error.Backpressure => return error.TestUnexpectedBackpressure,
+            // Nothing in the soak cancels.
+            error.Canceled => return error.TestUnexpectedCanceled,
         }
         assert(self.completed <= self.submitted);
     }
@@ -2586,7 +3036,7 @@ const Soak = struct {
             try testing.expectEqual(in_flight, entry_before.sends_in_flight);
             in_flight_total += in_flight;
             if (in_flight > 0) {
-                try testing.expectError(error.SendsInFlight, self.table.release(peer.*));
+                try testing.expectError(error.OperationsInFlight, self.table.release(peer.*));
                 try testing.expectEqual(entry_before, self.table.get(peer.*).*);
                 self.busy_refusals += 1;
                 continue;
@@ -2993,7 +3443,7 @@ const AcceptSoak = struct {
                 .generation = entry.generation,
             });
             const socket = self.table.release(peer) catch |err| switch (err) {
-                error.SendsInFlight => {
+                error.OperationsInFlight => {
                     // Only the filler sends; accepted connections never do.
                     assert(index == accept_soak_filler_index);
                     left += 1;

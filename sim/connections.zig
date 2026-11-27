@@ -200,7 +200,7 @@ fn depart(w: *Workload) Error!void {
     const id = model.ids[index];
     // The workload never sends, so the table must not refuse the release.
     const socket = w.table.release(id) catch |err| switch (err) {
-        error.SendsInFlight => return error.InvariantBroken,
+        error.OperationsInFlight => return error.InvariantBroken,
     };
     if (socket != model.sockets[index]) return error.InvariantBroken;
     model.sockets[index] = -1;

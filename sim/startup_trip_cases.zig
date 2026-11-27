@@ -349,10 +349,16 @@ pub const message_execute_head = "io.real: execute is a simulator placeholder;";
 /// message can be reworded, but not the part that names the pair.
 pub const message_unlisted_head = "connection state ";
 
-pub const sim_table_size: u32 = 3;
+/// Cancels a full queue keeps in flight, each on an entry of its own (one cancel in flight
+/// per connection), so the real and simulator tables hold that many entries more.
+pub const cancels_fill: u32 = 64;
+
 pub const sim_peer_index: u32 = 0;
 pub const sim_reused_index: u32 = 1;
 pub const sim_free_index: u32 = 2;
+/// The first of the `cancels_fill` entries the simulator's queue-full fill cancels.
+pub const sim_cancel_first: u32 = 3;
+pub const sim_table_size: u32 = sim_cancel_first + cancels_fill;
 
 comptime {
     assert(sim_peer_index < sim_table_size);
@@ -362,9 +368,11 @@ comptime {
     assert(sim_reused_index != sim_free_index);
 }
 
-pub const real_table_size: u32 = 2;
 pub const real_peer_id: u32 = 0;
 pub const real_free_id: u32 = 1;
+/// The first of the `cancels_fill` entries the real type's queue-full fill cancels.
+pub const real_cancel_first: u32 = 2;
+pub const real_table_size: u32 = real_cancel_first + cancels_fill;
 /// The bytes the send control sends.
 pub const real_send_bytes = "startup_trip";
 

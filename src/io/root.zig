@@ -23,21 +23,42 @@
 //! Each accepted operation completes exactly once, carrying the `id` the caller gave it, and
 //! ids in flight must be distinct; the simulator and the real type both check this. A
 //! submission refused with any `SubmitError` never completes.
-//! Every operation but an accept (a send or a statement today) shares at most
-//! `constants.io_non_accepts_in_flight_max` operations; the rest are kept for accepts, so
-//! clients that stop reading, or any other kind piling up, can't keep the server from
-//! accepting. Anything but an accept past that share is refused with
-//! `error.SlotsKeptForAccepts`, even with operations free, and an accept may still take
-//! any free operation; the simulator and the real type both check this through
-//! `SlotShare`. At most `constants.accepts_in_flight_max` accepts may be in flight, since
-//! each completes holding a descriptor; another is a caller's bug and stops the process,
-//! however full the queue is, checked through `SlotShare` on both types too. `poll` takes a
-//! buffer of 1 to
+//! Every operation but an accept or a cancel (a send, a receive or a statement) shares at
+//! most `constants.io_shared_in_flight_max` operations; the rest are kept for accepts and
+//! cancels, so clients that stop reading, or any other kind piling up, can't keep the
+//! server from accepting, or from cancelling a connection whose drops ran out. Any of
+//! those kinds past that share is refused with `error.SlotsKeptForAccepts`, even with
+//! operations free. Cancels have a share of their own, `constants.io_cancels_in_flight_max`,
+//! and one past it is refused with `error.CancelsFull`; an accept may take any free
+//! operation. The simulator and the real type both check this through `SlotShare`. At most
+//! `constants.accepts_in_flight_max` accepts may be in flight, since each completes holding
+//! a descriptor; another is a caller's bug and stops the process, however full the queue
+//! is, checked through `SlotShare` on both types too. `poll` takes a buffer of 1 to
 //! `constants.io_operations_in_flight_max` completions. A send may complete short,
-//! reporting fewer bytes than it was given; the caller sends the rest. A send's peer stays
-//! in the connection table, with its socket open, until the send's completion arrives. The
-//! real type enforces this: it counts each send on its peer's entry, and the table refuses
-//! to release an entry with sends counted (`error.SendsInFlight`).
+//! reporting fewer bytes than it was given; the caller sends the rest. A send's, a
+//! receive's or a cancel's peer stays in the connection table, with its socket open, until
+//! that operation's completion arrives. Both types enforce this: they count each such
+//! operation on its peer's entry, and the table refuses to release an entry with any
+//! counted (`error.OperationsInFlight`).
+//!
+//! Receives (roadmap core 3b): a receive reads what has arrived on a connection into the
+//! caller's buffer, which belongs to the I/O type until the completion arrives (the
+//! simulator checks the caller leaves it alone), and completes with the bytes it read: at
+//! least one and at most the buffer's length, or 0 when the peer has closed its side (end
+//! of stream). It may complete short of the buffer at any point, so a request head can
+//! arrive a byte at a time. At most one receive may be in flight on a connection, since
+//! two would split its bytes between their buffers in no set order; a second is a
+//! caller's bug and stops the process (`Table.receiveSubmitted`).
+//!
+//! Cancels (roadmap core 3b): a cancel names a connection, and every send and receive in
+//! flight on it that hasn't finished yet completes with `error.Canceled`, at a later
+//! `poll`; one that had already finished keeps its own result. The cancel completes too,
+//! with the number of operations it reached, which may be 0. It is how the caller frees a
+//! connection whose drops ran out (`error.DropsExhausted`). Once a cancel is submitted on
+//! a connection, nothing but another cancel or a drop may be submitted on it until it is
+//! released, and at most one cancel may be in flight on it; either is a caller's bug and
+//! stops the process (`Table.cancelSubmitted`). Accepts are never cancelled: a cancel names
+//! a connection, and an accept waits on the listener.
 //!
 //! Accepts (roadmap core 3a): an accept waits on a listening socket until a connection
 //! arrives, then completes with the new connection's `PeerId`: the I/O type itself takes
@@ -63,15 +84,15 @@
 //! errno shutdown(2) doesn't document, on the real type), leaving the sends pending; each
 //! failure is counted on the connection's entry, for its whole life, and once
 //! `constants.io_drop_attempts_max` have failed, that drop and every later one of the
-//! connection returns `error.DropsExhausted` without trying again. The contract has no
-//! cancel yet (core 3b adds it), so until then such a connection's stuck sends keep their
-//! operations and its entry: the caller stops sending to it and leaves it be. Once a drop
-//! has worked, dropping again changes nothing and never fails. The simulator and the real
-//! type both count through the same table calls (`Table.dropAdmit`, `Table.dropFailed`).
+//! connection returns `error.DropsExhausted` without trying again; the caller then cancels
+//! the connection's operations instead. A drop also ends a receive pending on the
+//! connection, as end of stream (0 bytes) or `error.PeerDown`, and a receive submitted to
+//! it afterwards completes the same way. Once a drop has worked, dropping again changes
+//! nothing and never fails. The simulator and the real type both count through the same
+//! table calls (`Table.dropAdmit`, `Table.dropFailed`).
 //!
 //! Placeholders: `execute` stands in for database traffic until roadmap core 11 frames
-//! Postgres over sockets, and the contract has no cancel yet; core 3b adds socket reads and
-//! cancellation. Components should not build on `execute`.
+//! Postgres over sockets. Components should not build on `execute`.
 //!
 //! Random bytes: the operating system's CSPRNG in production, the seeded PRNG in the
 //! simulator, so token nonces never break replay. The simulator refuses to compile into a
@@ -80,7 +101,8 @@
 //! Inputs: submissions from components; buffers to fill.
 //! Outputs: time readings, completions with explicit errors, random bytes.
 //! Limits: at most `constants.io_operations_in_flight_max` operations in flight; messages of
-//! at most `constants.http_response_size_max` bytes; statements of at most
+//! at most `constants.http_response_size_max` bytes; receives into at most
+//! `constants.http_request_size_max` bytes; statements of at most
 //! `constants.postgres_message_size_max` bytes; at most `constants.io_random_bytes_max`
 //! random bytes per call.
 //!
@@ -88,9 +110,9 @@
 //! every new one against it.
 //!
 //! Status: the contract, the simulator, and the real type for Linux (`real.zig`), which
-//! meets the contract with an io_uring ring for sends and accepts. `listener.zig` opens
+//! meets the contract with an io_uring ring for sends, receives, accepts and cancels. `listener.zig` opens
 //! the one socket accepts are taken on: a Unix socket at the config's path, never a network
-//! address. The contract grows (receive, cancel, connect, timers) slice by slice.
+//! address. The contract grows (connect, timers) slice by slice.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -118,16 +140,25 @@ pub const Socket = i32;
 pub const OperationId = u64;
 
 /// `QueueFull`: every operation the I/O type holds is in flight. `SlotsKeptForAccepts`:
-/// anything but an accept, with operations other than accepts already holding their whole
-/// share (`constants.io_non_accepts_in_flight_max`); the operations left are kept for
-/// accepts. Either way, submit again after a completion.
+/// anything but an accept or a cancel, with those kinds already holding their whole share
+/// (`constants.io_shared_in_flight_max`); the operations left are kept for accepts and
+/// cancels. `CancelsFull`: a cancel, with `constants.io_cancels_in_flight_max` cancels in
+/// flight already. Each way, submit again after a completion.
 /// `AcceptTooSoon`: an accept, less than `constants.io_accept_backpressure_wait_ns` after
 /// the latest accept that completed with `error.Backpressure`; submit it again once that
 /// time has passed. A full queue never meets an accept: the share keeps exactly
 /// `constants.accepts_in_flight_max` operations back, so a full queue already holds every
 /// accept allowed, and another accept stops the process before the queue is checked.
-pub const SubmitError = error{ QueueFull, SlotsKeptForAccepts, AcceptTooSoon };
-pub const SendError = error{ PeerDown, Backpressure };
+pub const SubmitError = error{ QueueFull, SlotsKeptForAccepts, CancelsFull, AcceptTooSoon };
+
+/// `Canceled`: a cancel of the send's connection reached it before it finished.
+pub const SendError = error{ PeerDown, Backpressure, Canceled };
+
+/// Why a receive read nothing. `PeerDown`: the connection failed (reset, or dropped).
+/// `Backpressure`: the system was short of memory, or the call was interrupted; receive
+/// again later. `Canceled`: a cancel of the connection reached it before it finished. End
+/// of stream is no error: the receive completes with 0 bytes.
+pub const ReceiveError = error{ PeerDown, Backpressure, Canceled };
 pub const DatabaseError = error{ Unavailable, Timeout };
 
 /// `DropsExhausted`: dropping this connection has failed `constants.io_drop_attempts_max`
@@ -183,11 +214,12 @@ pub const AcceptWait = struct {
     }
 };
 
-/// The operations kept for accepts, counted by every I/O type that meets the contract
-/// through the same calls, as with `AcceptWait`, so a check only one side makes can't let a
-/// bug pass every simulation. Every operation but an accept counts against one share of
-/// `constants.io_non_accepts_in_flight_max`; an accept counts against nothing there and may
-/// take any free operation. The I/O type checks its own full queue first.
+/// The operations kept for accepts and cancels, counted by every I/O type that meets the
+/// contract through the same calls, as with `AcceptWait`, so a check only one side makes
+/// can't let a bug pass every simulation. Every operation but an accept or a cancel counts
+/// against one share of `constants.io_shared_in_flight_max`; a cancel counts against its
+/// own share of `constants.io_cancels_in_flight_max`; an accept counts against no share
+/// and may take any free operation. The I/O type checks its own full queue first.
 ///
 /// Accepts are counted too, against `constants.accepts_in_flight_max`: each one in flight
 /// completes holding a new socket, a descriptor the open-file check at startup counts in
@@ -196,65 +228,99 @@ pub const AcceptWait = struct {
 /// `assertAcceptRoom` stops the process on it, before the I/O type checks anything that
 /// can refuse a submission.
 pub const SlotShare = struct {
-    /// Operations in flight that aren't accepts: never more than `others_max`.
+    /// Operations in flight that are neither accepts nor cancels: never more than
+    /// `others_max`.
     others_in_flight: u32 = 0,
+    /// Cancels in flight: never more than `cancels_max`.
+    cancels_in_flight: u32 = 0,
     /// Accepts in flight: never more than `accepts_max`.
     accepts_in_flight: u32 = 0,
 
-    pub const others_max: u32 = constants.io_non_accepts_in_flight_max;
+    pub const others_max: u32 = constants.io_shared_in_flight_max;
+    pub const cancels_max: u32 = constants.io_cancels_in_flight_max;
     pub const accepts_max: u32 = constants.accepts_in_flight_max;
+
+    comptime {
+        // The three shares are the whole queue, so a full queue has every share full.
+        assert(others_max + cancels_max + accepts_max == constants.io_operations_in_flight_max);
+    }
+
+    /// Operations counted here, of every kind.
+    pub fn total(self: *const SlotShare) u32 {
+        assert(self.others_in_flight <= others_max);
+        assert(self.cancels_in_flight <= cancels_max and self.accepts_in_flight <= accepts_max);
+        return self.others_in_flight + self.cancels_in_flight + self.accepts_in_flight;
+    }
 
     /// Stops the process when `kind` is an accept and `accepts_max` accepts are in flight
     /// already. Changes nothing. The I/O type calls it before its full-queue check, so a
     /// caller's bug stops the process however full the queue is.
     pub fn assertAcceptRoom(self: *const SlotShare, kind: Kind) void {
         assert(self.accepts_in_flight <= accepts_max);
-        // Every accept in flight holds an operation, and so does every other kind counted.
-        assert(self.others_in_flight + self.accepts_in_flight <= constants.io_operations_in_flight_max);
+        // Every operation counted here holds one of the I/O type's.
+        assert(self.total() <= constants.io_operations_in_flight_max);
         // A caller keeps at most `accepts_max` accepts in flight (src/constants.zig).
         if (kind == .accept) assert(self.accepts_in_flight < accepts_max);
     }
 
-    /// Refuses `kind` with `error.SlotsKeptForAccepts` when it isn't an accept and the
-    /// others already hold their whole share. Changes nothing. `free` is the operations the
-    /// I/O type has free, after its own full-queue check, so never 0.
-    pub fn admit(self: *const SlotShare, kind: Kind, free: u32) error{SlotsKeptForAccepts}!void {
+    /// Refuses `kind` when its share is held whole: a cancel with `error.CancelsFull`, any
+    /// kind but an accept or a cancel with `error.SlotsKeptForAccepts`. Changes nothing.
+    /// `free` is the operations the I/O type has free, after its own full-queue check, so
+    /// never 0.
+    pub fn admit(self: *const SlotShare, kind: Kind, free: u32) error{ SlotsKeptForAccepts, CancelsFull }!void {
         // The full queue is checked first, as the contract orders the refusals.
         assert(free > 0);
-        // Every operation counted here holds one that isn't free.
-        assert(self.others_in_flight + free <= constants.io_operations_in_flight_max);
-        if (kind == .accept) return;
-        if (self.others_in_flight == others_max) return error.SlotsKeptForAccepts;
+        // Every operation is counted here or free, on both types.
+        assert(self.total() + free == constants.io_operations_in_flight_max);
+        switch (kind) {
+            .accept => {},
+            .cancel => if (self.cancels_in_flight == cancels_max) return error.CancelsFull,
+            .send, .receive, .execute => if (self.others_in_flight == others_max) {
+                return error.SlotsKeptForAccepts;
+            },
+        }
     }
 
     /// Counts an operation of `kind` that `admit` let in and that now holds a slot.
     pub fn taken(self: *SlotShare, kind: Kind) void {
-        assert(self.others_in_flight <= others_max);
-        assert(self.accepts_in_flight <= accepts_max);
-        if (kind == .accept) {
-            // `assertAcceptRoom` stopped the process otherwise.
-            assert(self.accepts_in_flight < accepts_max);
-            self.accepts_in_flight += 1;
-            return;
+        const total_before = self.total();
+        // `assertAcceptRoom` stopped the process, or `admit` refused it, otherwise.
+        switch (kind) {
+            .accept => {
+                assert(self.accepts_in_flight < accepts_max);
+                self.accepts_in_flight += 1;
+            },
+            .cancel => {
+                assert(self.cancels_in_flight < cancels_max);
+                self.cancels_in_flight += 1;
+            },
+            .send, .receive, .execute => {
+                assert(self.others_in_flight < others_max);
+                self.others_in_flight += 1;
+            },
         }
-        // `admit` refused it otherwise.
-        assert(self.others_in_flight < others_max);
-        self.others_in_flight += 1;
+        assert(self.total() == total_before + 1);
     }
 
     /// Uncounts an operation of `kind` that has completed and given its slot back.
     pub fn released(self: *SlotShare, kind: Kind) void {
-        assert(self.others_in_flight <= others_max);
-        assert(self.accepts_in_flight <= accepts_max);
-        if (kind == .accept) {
-            // Counted by `taken` at submit.
-            assert(self.accepts_in_flight > 0);
-            self.accepts_in_flight -= 1;
-            return;
+        const total_before = self.total();
+        // Each was counted by `taken` at submit.
+        switch (kind) {
+            .accept => {
+                assert(self.accepts_in_flight > 0);
+                self.accepts_in_flight -= 1;
+            },
+            .cancel => {
+                assert(self.cancels_in_flight > 0);
+                self.cancels_in_flight -= 1;
+            },
+            .send, .receive, .execute => {
+                assert(self.others_in_flight > 0);
+                self.others_in_flight -= 1;
+            },
         }
-        // Counted by `taken` at submit.
-        assert(self.others_in_flight > 0);
-        self.others_in_flight -= 1;
+        assert(self.total() == total_before - 1);
     }
 };
 
@@ -262,7 +328,7 @@ pub const SlotShare = struct {
 /// operation that needed them; they never fall back to a weaker source.
 pub const RandomError = error{RandomUnavailable};
 
-pub const Kind = enum(u8) { send, execute, accept };
+pub const Kind = enum(u8) { send, execute, accept, receive, cancel };
 
 /// One outgoing message to a peer.
 pub const Send = struct {
@@ -280,10 +346,24 @@ pub const Accept = struct {
     listener: Socket,
 };
 
+/// Read what has arrived from a peer into `buffer`, which the I/O type owns until the
+/// receive completes.
+pub const Receive = struct {
+    peer: PeerId,
+    buffer: []u8,
+};
+
+/// End every send and receive in flight on a peer's connection.
+pub const Cancel = struct {
+    peer: PeerId,
+};
+
 pub const Operation = union(Kind) {
     send: Send,
     execute: Execute,
     accept: Accept,
+    receive: Receive,
+    cancel: Cancel,
 };
 
 pub const Submission = struct {
@@ -292,17 +372,40 @@ pub const Submission = struct {
 };
 
 /// The outcome of one operation. A send reports the bytes it sent; an accept, the new
-/// connection's entry in the connection table.
+/// connection's entry in the connection table; a receive, the bytes it read (0 for end of
+/// stream); a cancel, the operations it reached.
 pub const Result = union(Kind) {
     send: SendError!u32,
     execute: DatabaseError!void,
     accept: AcceptError!PeerId,
+    receive: ReceiveError!u32,
+    cancel: u32,
 };
 
 pub const Completion = struct {
     id: OperationId,
     result: Result,
 };
+
+/// The low bits of a `PeerId` that hold its entry's index (`connections.IdParts`).
+const peer_index_mask: PeerId = std.math.maxInt(u16);
+
+/// The peer an operation acts on, or null for an accept or a statement, which name none.
+pub fn operationPeer(operation: Operation) ?PeerId {
+    const peer: ?PeerId = switch (operation) {
+        .send => |send| send.peer,
+        .receive => |receive| receive.peer,
+        .cancel => |cancel| cancel.peer,
+        .accept, .execute => null,
+    };
+    // Exactly the kinds a connection's entry counts name a peer.
+    const counted = operation == .send or operation == .receive or operation == .cancel;
+    assert((peer != null) == counted);
+    // A peer's index, its id's low 16 bits (`connections.IdParts`), names an entry of the
+    // largest table.
+    assert(peer == null or (peer.? & peer_index_mask) < constants.http_connections_max);
+    return peer;
+}
 
 /// Fails compilation when `IO` does not meet the contract above.
 pub fn assertContract(comptime IO: type) void {
@@ -765,4 +868,40 @@ test "SlotShare: anything but an accept is refused once the share is held, and a
     share.released(.send);
     try testing.expectEqual(others_max - 1, share.others_in_flight);
     try share.admit(.execute, total - held + 1);
+}
+
+test "SlotShare: cancels have a share of their own, refused past it, and touch no other count" {
+    const cancels_max = SlotShare.cancels_max;
+    var share: SlotShare = .{};
+    var held: u32 = 0;
+    while (held < cancels_max) : (held += 1) {
+        try share.admit(.cancel, constants.io_operations_in_flight_max - held);
+        share.taken(.cancel);
+    }
+    try testing.expectEqual(cancels_max, share.cancels_in_flight);
+    try testing.expectEqual(@as(u32, 0), share.others_in_flight);
+    const free = constants.io_operations_in_flight_max - held;
+    try testing.expectError(error.CancelsFull, share.admit(.cancel, free));
+    // The other kinds are let in beside a full cancels' share.
+    try share.admit(.send, free);
+    try share.admit(.receive, free);
+    try share.admit(.accept, free);
+    // A full share of the others refuses them, but not a cancel while its own has room.
+    share.released(.cancel);
+    const others: SlotShare = .{ .others_in_flight = SlotShare.others_max };
+    const others_free = constants.io_operations_in_flight_max - SlotShare.others_max;
+    try testing.expectError(error.SlotsKeptForAccepts, others.admit(.receive, others_free));
+    try testing.expectError(error.SlotsKeptForAccepts, others.admit(.send, others_free));
+    try others.admit(.cancel, others_free);
+    try testing.expectEqual(cancels_max - 1, share.cancels_in_flight);
+    try testing.expectEqual(cancels_max - 1, share.total());
+}
+
+test "io: operationPeer names the peer of exactly the kinds a connection counts" {
+    const buffer: []u8 = &.{};
+    try testing.expectEqual(@as(?PeerId, 7), operationPeer(.{ .send = .{ .peer = 7, .bytes = "x" } }));
+    try testing.expectEqual(@as(?PeerId, 8), operationPeer(.{ .receive = .{ .peer = 8, .buffer = buffer } }));
+    try testing.expectEqual(@as(?PeerId, 9), operationPeer(.{ .cancel = .{ .peer = 9 } }));
+    try testing.expectEqual(@as(?PeerId, null), operationPeer(.{ .accept = .{ .listener = 3 } }));
+    try testing.expectEqual(@as(?PeerId, null), operationPeer(.{ .execute = .{ .statement = "select 1" } }));
 }

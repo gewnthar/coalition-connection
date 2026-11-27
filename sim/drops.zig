@@ -265,12 +265,12 @@ fn send(w: *Workload, index: u32) Error!void {
     w.sim.submit(submission) catch |err| switch (err) {
         // The share is full; with the accept in flight too, so is the ring.
         error.SlotsKeptForAccepts, error.QueueFull => {
-            if (sendsInFlight(w) != constants.io_non_accepts_in_flight_max) return error.InvariantBroken;
+            if (sendsInFlight(w) != constants.io_shared_in_flight_max) return error.InvariantBroken;
             if (err == error.QueueFull and !w.accept_in_flight) return error.InvariantBroken;
             w.counts.refused_share += 1;
             return;
         },
-        error.AcceptTooSoon => return error.InvariantBroken, // Only for an accept.
+        error.AcceptTooSoon, error.CancelsFull => return error.InvariantBroken, // Only for an accept or a cancel.
     };
     const stuck = w.sim.sends_stuck != stuck_before;
     if (w.sim.sends_stuck - stuck_before > 1) return error.InvariantBroken;
@@ -422,6 +422,7 @@ fn checkSend(w: *Workload, completion: io.Completion, ended: bool) Error!void {
             if (ended) return error.InvariantBroken;
             outcome = 3;
         },
+        error.Canceled => return error.InvariantBroken, // Nothing here cancels.
     }
     trace(w, outcome | (completion.id << 8) | (@as(u64, tick) << 40));
 }
@@ -461,7 +462,7 @@ fn drain(w: *Workload) Error!void {
                 if (completion[0].id < accept_id_first or ended != 0) return error.InvariantBroken;
                 try checkAccept(w, completion[0]);
             },
-            .execute => return error.InvariantBroken, // None submitted.
+            .execute, .receive, .cancel => return error.InvariantBroken, // None submitted.
         }
     }
     // Each poll before the empty one took an operation in flight.
@@ -513,7 +514,7 @@ fn reconnect(w: *Workload, index: u32) Error!void {
     const peer = w.peers[index].?;
     assert(peer.state == .closing and peer.sends == 0);
     const socket = w.table.release(peer.id) catch |err| switch (err) {
-        error.SendsInFlight => return error.InvariantBroken,
+        error.OperationsInFlight => return error.InvariantBroken,
     };
     if (socket != peer.socket) return error.InvariantBroken;
     w.peers[index] = null;
@@ -564,7 +565,7 @@ fn keepAccepting(w: *Workload) Error!void {
     w.sim.submit(submission) catch |err| switch (err) {
         error.AcceptTooSoon => return, // Tried again next tick.
         // An accept takes a slot kept for accepts, and only this one is ever in flight.
-        error.QueueFull, error.SlotsKeptForAccepts => return error.InvariantBroken,
+        error.QueueFull, error.SlotsKeptForAccepts, error.CancelsFull => return error.InvariantBroken,
     };
     w.next_accept += 1;
     w.accept_in_flight = true;
@@ -633,7 +634,7 @@ fn checkEnd(w: *Workload) Error!void {
             if (peer.sends != 0 or socket != peer.socket) return error.InvariantBroken;
             w.peers[index] = null;
         } else |err| switch (err) {
-            error.SendsInFlight => {
+            error.OperationsInFlight => {
                 if (peer.state != .exhausted or peer.sends == 0) return error.InvariantBroken;
                 if (!std.meta.eql(entry_before, w.table.get(peer.id).*)) return error.InvariantBroken;
             },
