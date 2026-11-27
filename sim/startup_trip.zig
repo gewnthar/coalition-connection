@@ -293,18 +293,21 @@ const Tripwire = struct {
 };
 
 const setup_len: u32 = 16;
-/// The budget `main` gives the allocator; the table and the setup bytes each fit in it.
-const budget_bytes: u64 = 128;
+/// The budget `main` gives the allocator; the table and the setup bytes each fit in it. The
+/// real and simulator tables hold an entry for each cancel a full queue keeps in flight.
+const budget_bytes: u64 = 2048;
 /// The fixed child allocator's backing. Each allocation may be padded to its alignment, so
 /// the backing leaves room for the whole budget plus padding on each of the two
 /// allocations the table makes.
-const backing_len: u32 = 256;
+const backing_len: u32 = 2048 + 256;
 
 comptime {
     assert(2 * setup_len <= budget_bytes);
     assert(trip.table_size * cc.live.connections.entry_bytes <= budget_bytes);
     assert(trip.real_table_size * cc.live.connections.entry_bytes <= budget_bytes);
     assert(trip.sim_table_size * cc.live.connections.entry_bytes <= budget_bytes);
+    // A full queue holds every cancel its share allows.
+    assert(trip.cancels_fill == cc.constants.io_cancels_in_flight_max);
     assert(budget_bytes + 2 * @alignOf(cc.live.connections.Entry) <= backing_len);
     assert(@TypeOf(trip.socket_base) == cc.live.connections.Socket);
 }
@@ -464,7 +467,7 @@ fn bytesExpected(call: trip.AllocatorCall) ?u64 {
         .free, .resize_zero => 0,
         .free_oversize, .get_allocator, .finish_startup, .begin_shutdown => null,
     };
-    // Every expectation fits the 128-byte budget main gives the allocator.
+    // Every expectation fits the budget main gives the allocator.
     assert(bytes == null or bytes.? <= 2 * setup_len);
     return bytes;
 }
@@ -677,7 +680,7 @@ fn runTableCase(startup: *cc.StartupAllocator, call: trip.TableCall, case: trip.
     table.setState(trip.writing_id, .writing);
     // The harness never counts a send, so nothing holds a release back.
     const freed = table.release(trip.free_id) catch |err| switch (err) {
-        error.SendsInFlight => setupFailed(case, "found a send counted on the entry to free"),
+        error.OperationsInFlight => setupFailed(case, "found a send counted on the entry to free"),
     };
     assert(freed == socketOf(trip.free_id));
     startup.finishStartup();
@@ -733,7 +736,7 @@ fn callTable(table: *connections.Table, call: trip.TableCall) connections.Socket
         // The harness never counts a send, so a refusal can only mean the table is wrong:
         // -2 matches no socket, and the control fails.
         => table.release(id) catch |err| switch (err) {
-            error.SendsInFlight => -2,
+            error.OperationsInFlight => -2,
         },
         .get_free,
         .get_free_stale_socket,
@@ -849,7 +852,7 @@ const Real = cc.io.real.Real;
 const slots_max: u32 = cc.constants.io_operations_in_flight_max;
 /// Sends the real type holds in flight before it refuses the next with SlotsKeptForAccepts; the
 /// rest of the ring is kept for accepts.
-const send_slots_max: u32 = cc.constants.io_non_accepts_in_flight_max;
+const send_slots_max: u32 = cc.constants.io_shared_in_flight_max;
 /// Empty polls `drain` and `drainReading` allow, 1 ms apart, over the whole drain. Reason:
 /// a socketpair send completes during the submitting system call, or, when the far end's
 /// buffer is full, as soon as `drainReading` reads it; a second is ample even on a loaded
@@ -1026,6 +1029,9 @@ const RealResult = struct {
     /// Whether a submit returned AcceptTooSoon, which no call here should meet: the harness
     /// never completes an accept with Backpressure.
     accept_too_soon: bool = false,
+    /// Whether a submit returned CancelsFull, which no call here should meet: none is a
+    /// cancel.
+    cancels_full: bool = false,
 };
 
 /// The state a real-I/O control's call must leave as it was, or change as it says.
@@ -1083,15 +1089,7 @@ fn runRealCase(startup: *cc.StartupAllocator, call: trip.RealCall, case: trip.Ca
         => table.entries[trip.real_free_id].socket = local,
         else => {},
     }
-    if (realCallFillsRing(call)) fillRing(&real, case);
-    // The accept waits on a listener nobody connects to; the case trips before it matters.
-    var accept_listener: linux.fd_t = -1;
-    if (realCallFillsAccept(call)) accept_listener = fillAccept(&real, case);
-    // Checked before the call is armed, so a broken setup is a setup panic (exit 1), never
-    // a trip: a second accept meets the first, still in flight, on the listener it uses.
-    assert(realCallFillsAccept(call) == (accept_listener >= 0));
-    assert(!realCallSecondAccept(call) or real.share.accepts_in_flight == 1);
-    if (realCallDuplicatesId(call)) assertFirstFillInFlight(&real);
+    const accept_listener = fillRealCase(&real, call, case);
 
     var before: RealBefore = undefined;
     @memcpy(&before.entries, table.entries);
@@ -1120,6 +1118,26 @@ fn runRealCase(startup: *cc.StartupAllocator, call: trip.RealCall, case: trip.Ca
         std.process.exit(exit_control_failed);
     }
     std.process.exit(trip.exit_finished);
+}
+
+/// Fills what the case's call must meet before it is armed: the sends' share of the ring,
+/// the cancels' slots and the accept's, as the call asks. Returns the listener the accept
+/// waits on, or -1 with no accept.
+fn fillRealCase(real: *Real, call: trip.RealCall, case: trip.Case) linux.fd_t {
+    assert(!armed);
+    if (realCallFillsRing(call)) fillRing(real, case);
+    // A full ring holds the cancels' share too: the ring's slots past the sends' are the
+    // cancels' and the accept's.
+    if (realCallFillsRing(call) and realCallFillsAccept(call)) fillCancels(real, case);
+    // The accept waits on a listener nobody connects to; the case trips before it matters.
+    var accept_listener: linux.fd_t = -1;
+    if (realCallFillsAccept(call)) accept_listener = fillAccept(real, case);
+    // Checked before the call is armed, so a broken setup is a setup panic (exit 1), never
+    // a trip: a second accept meets the first, still in flight, on the listener it uses.
+    assert(realCallFillsAccept(call) == (accept_listener >= 0));
+    assert(!realCallSecondAccept(call) or real.share.accepts_in_flight == 1);
+    if (realCallDuplicatesId(call)) assertFirstFillInFlight(real);
+    return accept_listener;
 }
 
 /// Both ends of a fresh stream socketpair: the first goes in the table, the second is the
@@ -1155,7 +1173,7 @@ fn realTable(startup: *cc.StartupAllocator, case: trip.Case, local: linux.fd_t) 
     assert(id == trip.real_table_size);
     // Nothing has been sent yet, so nothing holds the release back.
     const freed = table.release(trip.real_free_id) catch |err| switch (err) {
-        error.SendsInFlight => setupFailed(case, "found a send counted on the entry to free"),
+        error.OperationsInFlight => setupFailed(case, "found a send counted on the entry to free"),
     };
     assert(freed == local);
     assert(table.count() == trip.real_table_size - 1);
@@ -1172,6 +1190,7 @@ fn fillRing(real: *Real, case: trip.Case) void {
         const send: cc.io.Send = .{ .peer = trip.real_peer_id, .bytes = &.{fill_byte} };
         real.submit(.{ .id = first_fill_id + filled, .operation = .{ .send = send } }) catch |err| switch (err) {
             error.QueueFull, error.SlotsKeptForAccepts => setupFailed(case, "the ring filled early"),
+            error.CancelsFull => setupFailed(case, "a refusal only a cancel meets"),
             error.AcceptTooSoon => setupFailed(case, "a send was refused as an early accept"),
         };
     }
@@ -1179,14 +1198,35 @@ fn fillRing(real: *Real, case: trip.Case) void {
     assert(real.free_count == slots_max - send_slots_max);
 }
 
+/// Puts a cancel of each of the `cancels_fill` entries from `real_cancel_first` in every
+/// slot kept for cancels, after `fillRing`. Each entry holds the same socket as the entry
+/// in use, so the kernel may cancel the fill's sends: no case polls before it trips.
+fn fillCancels(real: *Real, case: trip.Case) void {
+    assert(!armed);
+    assert(real.inFlight() == send_slots_max);
+    var filled: u32 = 0;
+    while (filled < trip.cancels_fill) : (filled += 1) {
+        const cancel: cc.io.Cancel = .{ .peer = trip.real_cancel_first + filled };
+        const id = first_fill_id + send_slots_max + filled;
+        real.submit(.{ .id = id, .operation = .{ .cancel = cancel } }) catch |err| switch (err) {
+            error.QueueFull, error.CancelsFull => setupFailed(case, "the cancels' slots filled early"),
+            error.SlotsKeptForAccepts => setupFailed(case, "a cancel was refused as a send"),
+            error.AcceptTooSoon => setupFailed(case, "a cancel was refused as an early accept"),
+        };
+    }
+    assert(filled == trip.cancels_fill);
+    assert(real.share.cancels_in_flight == trip.cancels_fill);
+}
+
 /// Puts an accept, on a fresh loopback listener nobody connects to, in the slot kept for
-/// accepts after `fillRing`, so every slot of the ring is in use, or on an empty ring.
+/// accepts after `fillRing` and `fillCancels`, so every slot of the ring is in use, or on an
+/// empty ring.
 /// Returns the listener, which is never closed: the case trips while the accept still
 /// waits on it, and the process ends.
 fn fillAccept(real: *Real, case: trip.Case) linux.fd_t {
     assert(!armed);
     const in_flight_before = real.inFlight();
-    assert(in_flight_before == send_slots_max or in_flight_before == 0);
+    assert(in_flight_before == send_slots_max + trip.cancels_fill or in_flight_before == 0);
     const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
     const opened = linux.socket(linux.AF.INET, flags, 0);
     if (linux.errno(opened) != .SUCCESS) setupFailed(case, "no listener socket");
@@ -1200,6 +1240,7 @@ fn fillAccept(real: *Real, case: trip.Case) linux.fd_t {
     const accept: cc.io.Operation = .{ .accept = .{ .listener = listener } };
     real.submit(.{ .id = slots_max, .operation = accept }) catch |err| switch (err) {
         error.QueueFull, error.SlotsKeptForAccepts => setupFailed(case, "the accepts' slot was taken"),
+        error.CancelsFull => setupFailed(case, "a refusal only a cancel meets"),
         error.AcceptTooSoon => setupFailed(case, "an accept wait ran with no Backpressure"),
     };
     assert(real.inFlight() == in_flight_before + 1);
@@ -1245,6 +1286,7 @@ fn callReal(
             switch (err) {
                 error.QueueFull => return .{ .queue_full = true },
                 error.SlotsKeptForAccepts => return .{ .slots_kept_for_accepts = true },
+                error.CancelsFull => return .{ .cancels_full = true },
                 error.AcceptTooSoon => return .{ .accept_too_soon = true },
             }
         };
@@ -1261,6 +1303,7 @@ fn callReal(
             real.submit(.{ .id = send_peer_id, .operation = .{ .execute = execute } }) catch |err| switch (err) {
                 error.QueueFull => return .{ .queue_full = true },
                 error.SlotsKeptForAccepts => return .{ .slots_kept_for_accepts = true },
+                error.CancelsFull => return .{ .cancels_full = true },
                 error.AcceptTooSoon => return .{ .accept_too_soon = true },
             };
             return .{};
@@ -1298,6 +1341,7 @@ fn submitSecondAccept(real: *Real, listener: linux.fd_t) RealResult {
     real.submit(.{ .id = send_peer_id, .operation = .{ .accept = accept } }) catch |err| switch (err) {
         error.QueueFull => return .{ .queue_full = true },
         error.SlotsKeptForAccepts => return .{ .slots_kept_for_accepts = true },
+        error.CancelsFull => return .{ .cancels_full = true },
         error.AcceptTooSoon => return .{ .accept_too_soon = true },
     };
     return .{};
@@ -1364,7 +1408,7 @@ fn realControlHeld(
 fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
     assert(!armed);
     assert(before.in_flight == 0);
-    if (result.queue_full or result.slots_kept_for_accepts or result.accept_too_soon) return false;
+    if (result.queue_full or result.slots_kept_for_accepts or result.accept_too_soon or result.cancels_full) return false;
     if (real.submitted != before.submitted + 1) return false;
     if (real.last != before.last) return false;
     // `submit` hands the send to the kernel at once, unless the kernel refused for a moment.
@@ -1376,7 +1420,7 @@ fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remo
     if (real.table.get(trip.real_peer_id).sends_in_flight != 0) return false;
     const sent = switch (completions[0].result) {
         .send => |sent| sent catch return false,
-        .execute, .accept => return false,
+        .execute, .accept, .receive, .cancel => return false,
     };
     if (sent != trip.real_send_bytes.len) return false;
     // One byte of room past the message, so a send that wrote extra bytes reads longer.
@@ -1392,7 +1436,7 @@ fn sendPeerHeld(real: *Real, before: *const RealBefore, result: RealResult, remo
 fn slotsFullHeld(real: *Real, before: *const RealBefore, result: RealResult, remote: linux.fd_t) bool {
     assert(!armed);
     assert(before.in_flight == send_slots_max);
-    if (!result.slots_kept_for_accepts or result.queue_full or result.accept_too_soon) return false;
+    if (!result.slots_kept_for_accepts or result.queue_full or result.accept_too_soon or result.cancels_full) return false;
     if (real.inFlight() != before.in_flight or real.free_count != before.free_count) return false;
     if (real.submitted != before.submitted or real.completed != before.completed) return false;
     if (real.ring.sq.sqe_tail != before.sqe_tail or real.last != before.last) return false;
@@ -1409,7 +1453,7 @@ fn slotsFullHeld(real: *Real, before: *const RealBefore, result: RealResult, rem
         seen[index] = true;
         const sent = switch (completion.result) {
             .send => |sent| sent catch return false,
-            .execute, .accept => return false,
+            .execute, .accept, .receive, .cancel => return false,
         };
         if (sent != 1) return false;
     }
@@ -2092,7 +2136,7 @@ fn simTable(startup: *cc.StartupAllocator, case: trip.Case) connections.Table {
     assert(index == trip.sim_table_size);
     // Nothing has been sent yet, so nothing holds either release back.
     _ = table.release(trip.sim_reused_index) catch |err| switch (err) {
-        error.SendsInFlight => setupFailed(case, "found a send counted on the entry to reuse"),
+        error.OperationsInFlight => setupFailed(case, "found a send counted on the entry to reuse"),
     };
     const again = table.acquire(simSocket(trip.sim_reused_index)) catch |err| switch (err) {
         error.TableFull => setupFailed(case, "found the table full on reuse"),
@@ -2100,28 +2144,34 @@ fn simTable(startup: *cc.StartupAllocator, case: trip.Case) connections.Table {
     const parts: connections.IdParts = @bitCast(again);
     assert(parts.index == trip.sim_reused_index and parts.generation == 1);
     _ = table.release(trip.sim_free_index) catch |err| switch (err) {
-        error.SendsInFlight => setupFailed(case, "found a send counted on the entry to free"),
+        error.OperationsInFlight => setupFailed(case, "found a send counted on the entry to free"),
     };
     assert(table.count() == trip.sim_table_size - 1);
     return table;
 }
 
 /// Fills `count` slots before the call: a one-byte send to the entry in use in each slot a
-/// send may take, then, when `count` is every slot, an accept in each slot kept for
-/// accepts, so the next submission of any kind meets a full queue. With `count` equal to
-/// the sends' share, the next send meets SlotsKeptForAccepts and the queue still has room.
+/// send may take, then, when `count` is every slot, a cancel of each of the `cancels_fill`
+/// entries from `sim_cancel_first` in each slot kept for cancels and an accept in each slot
+/// kept for accepts, so the next submission of any kind meets a full queue. With `count`
+/// equal to the sends' share, the next send meets SlotsKeptForAccepts and the queue still
+/// has room.
 fn fillSim(sim: *Sim, case: trip.Case, count: u32) void {
     assert(!armed);
     assert(sim.in_flight == 0);
     assert(count == slots_max or count == send_slots_max);
     var filled: u32 = 0;
     while (filled < count) : (filled += 1) {
+        const cancels_end = send_slots_max + trip.cancels_fill;
         const operation: cc.io.Operation = if (filled < send_slots_max)
             .{ .send = .{ .peer = trip.sim_peer_index, .bytes = &.{fill_byte} } }
+        else if (filled < cancels_end)
+            .{ .cancel = .{ .peer = trip.sim_cancel_first + (filled - send_slots_max) } }
         else
             .{ .accept = .{ .listener = fill_listener } };
         sim.submit(.{ .id = first_fill_id + filled, .operation = operation }) catch |err| switch (err) {
             error.QueueFull, error.SlotsKeptForAccepts => setupFailed(case, "the simulator filled early"),
+            error.CancelsFull => setupFailed(case, "a refusal only a cancel meets"),
             error.AcceptTooSoon => setupFailed(case, "the fill was refused as an early accept"),
         };
     }
@@ -2138,6 +2188,7 @@ fn firstAcceptSim(sim: *Sim, case: trip.Case) void {
     const accept: cc.io.Operation = .{ .accept = .{ .listener = fill_listener } };
     sim.submit(.{ .id = first_fill_id + send_slots_max, .operation = accept }) catch |err| switch (err) {
         error.QueueFull, error.SlotsKeptForAccepts => setupFailed(case, "the simulator refused the first accept"),
+        error.CancelsFull => setupFailed(case, "a refusal only a cancel meets"),
         error.AcceptTooSoon => setupFailed(case, "an accept wait ran with no Backpressure"),
     };
     assert(sim.in_flight == 1);
@@ -2153,11 +2204,12 @@ fn releaseUnderSend(sim: *Sim, table: *connections.Table, case: trip.Case) void 
     const send: cc.io.Send = .{ .peer = trip.sim_peer_index, .bytes = sim_send_bytes };
     sim.submit(.{ .id = send_peer_id, .operation = .{ .send = send } }) catch |err| switch (err) {
         error.QueueFull, error.SlotsKeptForAccepts => setupFailed(case, "the simulator was full"),
+        error.CancelsFull => setupFailed(case, "a refusal only a cancel meets"),
         error.AcceptTooSoon => setupFailed(case, "a send was refused as an early accept"),
     };
     table.entries[trip.sim_peer_index].sends_in_flight = 0;
     _ = table.release(trip.sim_peer_index) catch |err| switch (err) {
-        error.SendsInFlight => setupFailed(case, "the cleared entry still refused to release"),
+        error.OperationsInFlight => setupFailed(case, "the cleared entry still refused to release"),
     };
     var ticks: u32 = 0;
     while (ticks <= cc.constants.sim_completion_delay_ticks_max) : (ticks += 1) sim.tick();
@@ -2166,7 +2218,7 @@ fn releaseUnderSend(sim: *Sim, table: *connections.Table, case: trip.Case) void 
 }
 
 /// How the simulator answered the case's call.
-const SimRefusal = enum { none, queue_full, slots_kept_for_accepts, accept_too_soon };
+const SimRefusal = enum { none, queue_full, slots_kept_for_accepts, cancels_full, accept_too_soon };
 
 /// Makes the case's one call, a send or (for `complete_released`) a poll; nothing else
 /// runs while `armed` is set. Returns which refusal, if any, the simulator gave a send.
@@ -2184,6 +2236,7 @@ fn callSim(sim: *Sim, call: trip.SimCall) SimRefusal {
         sim.submit(.{ .id = send_peer_id, .operation = accept }) catch |err| switch (err) {
             error.QueueFull => return .queue_full,
             error.SlotsKeptForAccepts => return .slots_kept_for_accepts,
+            error.CancelsFull => return .cancels_full,
             error.AcceptTooSoon => return .accept_too_soon,
         };
         return .none;
@@ -2195,6 +2248,7 @@ fn callSim(sim: *Sim, call: trip.SimCall) SimRefusal {
     sim.submit(.{ .id = id, .operation = .{ .send = send } }) catch |err| switch (err) {
         error.QueueFull => return .queue_full,
         error.SlotsKeptForAccepts => return .slots_kept_for_accepts,
+        error.CancelsFull => return .cancels_full,
         error.AcceptTooSoon => return .accept_too_soon,
     };
     return .none;
@@ -2227,7 +2281,7 @@ fn simControlHeld(
             if (sim.submitted != before.submitted + 1 or sim.in_flight != 1) return false;
             const held = table.get(peer).*;
             if (table.release(peer)) |_| return false else |err| switch (err) {
-                error.SendsInFlight => {},
+                error.OperationsInFlight => {},
             }
             if (!std.meta.eql(held, table.get(peer).*)) return false;
             var completions: [1]cc.io.Completion = undefined;
@@ -2235,7 +2289,7 @@ fn simControlHeld(
             if (completions[0].id != send_peer_id) return false;
             const sent = switch (completions[0].result) {
                 .send => |sent| sent catch return false,
-                .execute, .accept => return false,
+                .execute, .accept, .receive, .cancel => return false,
             };
             if (sent != sim_send_bytes.len) return false;
         },
@@ -2276,13 +2330,16 @@ fn simQueueFullHeld(sim: *Sim, table: *const connections.Table, before: *const S
         if (seen[index]) return false;
         seen[index] = true;
         const filled_send = index < send_slots_max;
+        const filled_cancel = !filled_send and index < send_slots_max + trip.cancels_fill;
         switch (completion.result) {
             .send => |sent| {
                 if (!filled_send) return false;
                 if ((sent catch return false) != 1) return false;
             },
+            // Nothing is in flight to the cancelled entries, so each cancel reaches nothing.
+            .cancel => |reached| if (!filled_cancel or reached != 0) return false,
             .accept => |accepted| {
-                if (filled_send) return false;
+                if (filled_send or filled_cancel) return false;
                 // The one free entry takes the arrival, under a generation past the one
                 // it was released under, and the id names it as live.
                 const peer = accepted catch return false;
@@ -2290,7 +2347,7 @@ fn simQueueFullHeld(sim: *Sim, table: *const connections.Table, before: *const S
                 if (parts.index != trip.sim_free_index) return false;
                 if (table.lookup(peer) == null) return false;
             },
-            .execute => return false,
+            .execute, .receive => return false,
         }
     }
     return sim.sends_in_flight == 0 and table.count() == trip.sim_table_size;

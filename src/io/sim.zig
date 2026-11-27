@@ -10,10 +10,11 @@
 //!   outcomes   each operation's delay and result, drawn when it is submitted
 //!   schedule   which free slot an operation takes and where each poll starts its scan
 //!   random     the bytes `randomBytes` hands out
-//!   stick      whether a send sticks, drawn for every send while sticking is on
-//!   drops      which drops fail, and how a drop ends each pending send
-//! So how often a workload polls, how many nonces it draws, or when it drops a connection
-//! never changes any operation's own drawn result, or which sends stick by draw.
+//!   stick      whether a send or a receive sticks, drawn for each while sticking is on
+//!   drops      which drops fail, and how a drop or a cancel ends each pending operation
+//! So how often a workload polls, how many nonces it draws, or when it drops or cancels a
+//! connection never changes any operation's own drawn result, or which operations stick
+//! by draw.
 //!
 //! Accepts: an accept's delay is the wait for a connection to arrive. When it completes, the
 //! arrival takes an entry in the connection table attached with `attachTable`, under a fake
@@ -28,27 +29,49 @@
 //! most `constants.accepts_in_flight_max` accepts may be in flight; another crashes, before
 //! the queue is checked (`io.SlotShare.assertAcceptRoom`).
 //!
-//! Sends: a send goes through the attached table with the same calls the real type makes.
-//! Its peer is looked up at submit, before the queue is checked, so a free, stale or
-//! out-of-range peer crashes as it does on the real type; the send is counted on its entry
-//! (`Table.sendSubmitted`) until its completion uncounts it (`Table.sendCompleted`), so the
-//! table refuses to release that entry with `error.SendsInFlight` meanwhile. Code that
-//! releases early or sends on a stale id fails in simulation, not first on the real type.
+//! Sends, receives and cancels go through the attached table with the same calls the real
+//! type makes. The peer is looked up at submit, before the queue is checked, so a free,
+//! stale or out-of-range peer, or an entry with no room for the operation
+//! (`Table.assertRoomFor`), crashes as it does on the real type; the operation is counted
+//! on its entry (`Table.operationSubmitted`) until its completion uncounts it
+//! (`Table.operationCompleted`), so the table refuses to release that entry with
+//! `error.OperationsInFlight` meanwhile. Code that releases early or sends on a stale id
+//! fails in simulation, not first on the real type.
+//!
+//! Receives: every connection's client sends the same bytes, set with `setClientStream`,
+//! and then closes. Each receive draws at submit how much of what is left it reads: 1 to
+//! the least of its buffer, what is left and the chunk bound, so a client can send a byte
+//! at a time; or, as a fault, a reset (`error.PeerDown`), a moment's shortage
+//! (`error.Backpressure`) or a client that closes early, mid-request (0 bytes). Once the
+//! client has sent everything, a receive reads end of stream. The bytes land in the buffer
+//! at completion. At submit the buffer is filled with `receive_poison` and hashed, so a
+//! caller that writes into it while the receive is in flight crashes at the completion.
+//! With sticking on, a receive may stick, drawn as for sends: a client that goes silent,
+//! which only a drop, a cancel or the caller's deadline ends.
+//!
+//! Cancels: a cancel reaches, at submit, every send and receive in flight to its connection
+//! that isn't due yet or is stuck: each completes with `error.Canceled` within the longest
+//! delay, drawn from the drop stream. One due already had finished, and one a drop ended is
+//! settled, so each keeps its result. The cancel completes after its own drawn delay with
+//! the number it reached.
 //!
 //! Sticking and dropping: after `setDropFaults`, each send may stick, drawn at submit: it
 //! never completes on its own, as a send to a client that stopped reading never does on the
 //! real type, and every later send to that connection sticks too. `drop` ends it as the real type's shutdown does: every stuck send to that
 //! connection completes with `error.PeerDown` within the longest delay, every send to it
 //! still pending ends that way or keeps its own result (drawn), and every send submitted to
-//! it afterwards completes with `error.PeerDown`. A drop can fail, drawn too, leaving the
+//! it afterwards completes with `error.PeerDown`. A receive to it ends the same way, as
+//! end of stream or `error.PeerDown`, drawn, as the real type's shutdown ends one as end
+//! of stream. A drop can fail, drawn too, leaving the
 //! sends stuck; once one has worked, dropping again changes nothing and never fails, as a
 //! second shutdown on the real type returns success or ENOTCONN. Each drop goes through the table's `dropAdmit` and each failure through its
 //! `dropFailed`, the calls the real type makes, so `error.DropsExhausted` comes at the same
 //! count. A connection the table has since released and handed out again is a new one: its
 //! id carries the entry's next generation, so the drop of the old one doesn't reach it.
 //!
-//! Inputs: a seed, a fault rate in percent (at most `constants.sim_fault_percent_max`) and,
-//! for sends and accepts, a connection table.
+//! Inputs: a seed, a fault rate in percent (at most `constants.sim_fault_percent_max`), for
+//! sends, receives, cancels and accepts a connection table, and for receives the bytes each
+//! client sends.
 //! Outputs: the same contract as io/root.zig, plus counters a test can assert on.
 //! Limits: at most `constants.sim_ticks_max` ticks per run, at most
 //! `constants.io_operations_in_flight_max` operations in flight, and delays of at most
@@ -66,9 +89,9 @@ const connections = @import("../live/connections.zig");
 const io = @import("root.zig");
 
 const slots_count = constants.io_operations_in_flight_max;
-/// Operations in flight that may be anything but accepts; the rest are kept for accepts, as
-/// on the real type.
-const shared_slots_max = constants.io_non_accepts_in_flight_max;
+/// Operations in flight that may be anything but accepts and cancels; the rest are kept for
+/// those, as on the real type.
+const shared_slots_max = constants.io_shared_in_flight_max;
 
 /// The first fake socket an arrival gets: above any descriptor a test or workload names as
 /// its listener, so an arrival never shares a number with one, as with a real kernel.
@@ -83,9 +106,17 @@ const random_salt: u64 = 0xc2b2_ae3d_27d4_eb4f;
 const drop_salt: u64 = 0x1656_67b1_9e37_79f9;
 const stick_salt: u64 = 0x27d4_eb2f_1656_67c5;
 
-/// An entry's slot in `Sim.dropped_ids` when no drop of it has worked: index 0xffff, past
-/// any table, so it never equals a live id.
+/// An entry's slot in `Sim.dropped_ids` when no drop of it has worked, and in
+/// `Sim.stream_ids` before any receive: index 0xffff, past any table, so it never equals a
+/// live id.
 const no_drop: io.PeerId = std.math.maxInt(io.PeerId);
+
+/// What `submit` fills a receive's buffer with, so a caller's write into it shows.
+pub const receive_poison: u8 = 0xa5;
+
+/// Bytes one client may send: what one connection's request buffer holds, several times
+/// over, so a stream can carry a few requests kept alive.
+pub const client_stream_bytes_max: u32 = 4 * constants.http_request_size_max;
 
 comptime {
     // The sentinel's index is past every entry the table may have.
@@ -102,14 +133,21 @@ pub const Faults = struct {
     /// Accepts whose connection failed before it arrived, or that found the system short.
     accept_peer_down: u32 = 0,
     accept_backpressure: u32 = 0,
+    /// Receives whose connection reset, that found the system short, or whose client
+    /// closed early, before it had sent everything.
+    receive_peer_down: u32 = 0,
+    receive_backpressure: u32 = 0,
+    receive_closed_early: u32 = 0,
 
     pub fn total(self: Faults) u64 {
         const sends = @as(u64, self.peer_down) + self.backpressure;
         const executes = @as(u64, self.unavailable) + self.timeout;
         const accepts = @as(u64, self.accept_peer_down) + self.accept_backpressure;
+        const receives = @as(u64, self.receive_peer_down) + self.receive_backpressure +
+            self.receive_closed_early;
         assert(sends >= self.peer_down and sends >= self.backpressure);
         assert(executes >= self.unavailable and executes >= self.timeout);
-        return sends + executes + accepts;
+        return sends + executes + accepts + receives;
     }
 };
 
@@ -118,11 +156,15 @@ pub const Faults = struct {
 const ArrivalError = error{ PeerDown, Backpressure };
 
 /// What `submit` draws for an operation. A send's and a statement's result is final; an
-/// accept draws only whether its connection fails, and takes its table entry on completion.
+/// accept draws only whether its connection fails, and takes its table entry on completion;
+/// a receive draws how many bytes it reads, copied at completion; a cancel counts what it
+/// reached.
 const Drawn = union(io.Kind) {
     send: io.SendError!u32,
     execute: io.DatabaseError!void,
     accept: ArrivalError!void,
+    receive: io.ReceiveError!u32,
+    cancel: u32,
 };
 
 const Slot = struct {
@@ -132,11 +174,18 @@ const Slot = struct {
     drawn: Drawn,
     /// Hash of the operation's bytes at submit; they must be unchanged at completion.
     bytes_hash: u64,
-    /// A send that completes only once its connection is dropped; `due_tick` waits till then.
+    /// A send or a receive that completes only once its connection is dropped or
+    /// cancelled; `due_tick` waits till then.
     stuck: bool = false,
-    /// A send whose connection was dropped: it completes with `error.PeerDown`, counted in
-    /// `sends_dropped`, not as an injected fault.
+    /// A send or a receive whose connection was dropped: it completes with
+    /// `error.PeerDown` (or, a receive, as end of stream), counted in `sends_dropped` or
+    /// `receives_dropped`, not as an injected fault.
     by_drop: bool = false,
+    /// A send or a receive a cancel reached: it completes with `error.Canceled`, counted in
+    /// `canceled`, not as an injected fault.
+    by_cancel: bool = false,
+    /// Where a receive's bytes start in the client stream; 0 for every other kind.
+    stream_at: u32 = 0,
 };
 
 pub const Sim = struct {
@@ -177,6 +226,25 @@ pub const Sim = struct {
     faults: Faults,
     /// Where arrivals take their entries; set once by `attachTable`, before any accept.
     table: ?*connections.Table,
+    /// The bytes every connection's client sends, then closes; set once by
+    /// `setClientStream`, before any receive.
+    client_stream: ?[]const u8,
+    /// The most bytes one receive reads, however much room its buffer has.
+    receive_chunk_max: u32,
+    /// By entry index, the connection whose client stream `stream_read` counts, or
+    /// `no_drop` before its first receive; a new id on the entry starts the stream again.
+    stream_ids: [constants.http_connections_max]io.PeerId,
+    /// By entry index, how much of the client stream receives have taken so far.
+    stream_read: [constants.http_connections_max]u32,
+    /// Bytes receives handed back, receives that read end of stream, receives a drop ended,
+    /// operations a cancel reached, and cancels completed.
+    bytes_received: u64,
+    /// Receives that stuck: their clients went silent.
+    receives_stuck: u32,
+    receives_ended: u32,
+    receives_dropped: u32,
+    canceled: u32,
+    cancels: u32,
     /// Arrivals that took a table entry, and arrivals a full table refused.
     accepted: u64,
     refused: u64,
@@ -215,6 +283,16 @@ pub const Sim = struct {
             .random_bytes = 0,
             .faults = .{},
             .table = null,
+            .client_stream = null,
+            .receive_chunk_max = constants.http_request_size_max,
+            .stream_ids = @splat(no_drop),
+            .stream_read = @splat(0),
+            .bytes_received = 0,
+            .receives_stuck = 0,
+            .receives_ended = 0,
+            .receives_dropped = 0,
+            .canceled = 0,
+            .cancels = 0,
             .accepted = 0,
             .refused = 0,
             .accept_wait = .{},
@@ -234,9 +312,22 @@ pub const Sim = struct {
         self.table = table;
     }
 
-    /// Lets sends stick and drops fail, each at its chance in percent: sticking at most
-    /// `constants.sim_fault_percent_max`, failing drops at most 100, so a test can make
-    /// every drop fail and reach the bound. Call it before the first submission, so a seed
+    /// Gives every connection's client `stream` to send, at most `chunk_max` bytes a
+    /// receive (1 sends a byte at a time), then end of stream. Call it once, before the
+    /// first submission, so a seed replays the same run; the bytes are the caller's and
+    /// must outlive every receive.
+    pub fn setClientStream(self: *Sim, stream: []const u8, chunk_max: u32) void {
+        assert(self.submitted == 0);
+        assert(self.client_stream == null);
+        assert(stream.len > 0 and stream.len <= client_stream_bytes_max);
+        assert(chunk_max > 0 and chunk_max <= constants.http_request_size_max);
+        self.client_stream = stream;
+        self.receive_chunk_max = chunk_max;
+    }
+
+    /// Lets sends and receives stick and drops fail, each at its chance in percent:
+    /// sticking at most `constants.sim_fault_percent_max`, failing drops at most 100, so a
+    /// test can make every drop fail and reach the bound. Call it before the first submission, so a seed
     /// replays the same run; both start at 0, and then nothing sticks or fails to drop.
     pub fn setDropFaults(self: *Sim, stick_percent: u8, drop_fail_percent: u8) void {
         assert(self.submitted == 0);
@@ -262,35 +353,44 @@ pub const Sim = struct {
 
     /// Queues one operation to complete after a seeded delay of 0 to
     /// `sim_completion_delay_ticks_max` ticks, capped at the run's last tick, with its result
-    /// drawn now. A full table returns `error.QueueFull`; anything but an accept, with those
-    /// holding their whole share (`shared_slots_max`), `error.SlotsKeptForAccepts`; and an
-    /// accept while the wait after a Backpressure runs `error.AcceptTooSoon`, as on the real
-    /// type, in that order when more than one holds; each draws nothing and takes no slot,
-    /// and only the last changes a count, the wait's refusals. An id already in flight
-    /// breaks the contract and crashes, full table or not, and so does an accept past
-    /// `constants.accepts_in_flight_max`, through the same check as on the real type. The
-    /// one exception to the delay: a send that sticks (`setDropFaults`) completes only once
-    /// its connection is dropped.
+    /// drawn now. A full table returns `error.QueueFull`; a send, receive or statement, with
+    /// those holding their whole share (`shared_slots_max`), `error.SlotsKeptForAccepts`; a
+    /// cancel, with cancels holding theirs, `error.CancelsFull`; and an accept while the
+    /// wait after a Backpressure runs `error.AcceptTooSoon`, as on the real type, in that
+    /// order when more than one holds; each draws nothing and takes no slot, and only the
+    /// last changes a count, the wait's refusals. An id already in flight breaks the
+    /// contract and crashes, full table or not, and so do an accept past
+    /// `constants.accepts_in_flight_max` and an operation its peer's entry has no room for,
+    /// through the same checks as on the real type. The one exception to the delay: a send
+    /// or a receive that sticks (`setDropFaults`) completes only once its connection is
+    /// dropped or cancelled.
     pub fn submit(self: *Sim, submission: io.Submission) io.SubmitError!void {
         comptime assertSimulationAllowed();
         assert(self.in_flight <= slots_count);
         assertOperation(submission.operation);
-        // A send names its peer's entry, and an arrival takes one, so both need a table.
+        // A peer's operation names its entry, and an arrival takes one, so both need a
+        // table; a receive needs the bytes its client sends.
         assert(submission.operation == .execute or self.table != null);
-        // Looked up before anything changes, as the real type does: a send naming a peer
-        // that isn't live in the table (free, stale or past its end) is a caller's bug and
-        // crashes, full queue or not.
-        const sends_before = self.sendsCounted(submission.operation);
+        assert(submission.operation != .receive or self.client_stream != null);
+        // Looked up before anything changes, as the real type does: an operation naming a
+        // peer that isn't live in the table (free, stale or past its end), or whose entry
+        // has no room for it, is a caller's bug and crashes, full queue or not.
+        if (io.operationPeer(submission.operation)) |peer| {
+            self.table.?.assertRoomFor(peer, submission.operation);
+        }
+        const counted_before = self.countedOnPeer(submission.operation);
         self.assertIdNotInFlight(submission.id);
         // A second accept past `constants.accepts_in_flight_max` is a caller's bug, checked
         // before the queue through the same call as on the real type.
         self.share.assertAcceptRoom(submission.operation);
         assert(self.sends_in_flight <= shared_slots_max);
         if (self.in_flight == slots_count) return error.QueueFull;
-        // The operations past shared_slots_max are kept for accepts.
+        // The operations past shared_slots_max are kept for accepts and cancels.
         try self.share.admit(submission.operation, slots_count - self.in_flight);
         if (submission.operation == .accept) try self.accept_wait.admit(self.now_ns);
 
+        // Admitted: from here the buffer of a receive belongs to this type.
+        if (submission.operation == .receive) @memset(submission.operation.receive.buffer, receive_poison);
         const index = self.freeSlot();
         const delay_max = constants.sim_completion_delay_ticks_max;
         const delay = self.outcomes.random().uintAtMost(u32, delay_max);
@@ -309,22 +409,22 @@ pub const Sim = struct {
         self.submitted += 1;
         // Counted on the peer's entry until it completes, through the same call the real
         // type makes, so the table refuses to release the entry meanwhile.
-        if (submission.operation == .send) self.table.?.sendSubmitted(submission.operation.send.peer);
-        const sends_added: connections.SendCount = if (submission.operation == .send) 1 else 0;
-        assert(self.sendsCounted(submission.operation) == sends_before + sends_added);
+        if (self.table) |table| table.operationSubmitted(submission.operation);
+        const added: u32 = @intFromBool(io.operationPeer(submission.operation) != null);
+        assert(self.countedOnPeer(submission.operation) == counted_before + added);
         assert(self.slots[index] != null);
         assert(self.completed + self.in_flight == self.submitted);
     }
 
-    /// Sends counted on a send's peer, read through `Table.get`, which crashes unless the
-    /// peer is live; 0 for an accept or a statement, which name no peer.
-    fn sendsCounted(self: *const Sim, operation: io.Operation) connections.SendCount {
-        const count: connections.SendCount = switch (operation) {
-            .send => |send| self.table.?.get(send.peer).sends_in_flight,
-            .accept, .execute => 0,
+    /// What the peer's entry counts of an operation's kind, read through `Table.get`, which
+    /// crashes unless the peer is live; 0 for an accept or a statement, which name no peer,
+    /// and for a statement with no table attached.
+    fn countedOnPeer(self: *const Sim, operation: io.Operation) u32 {
+        const table = self.table orelse {
+            assert(operation == .execute); // `submit` checked every other kind has a table.
+            return 0;
         };
-        // Only a send names a peer, so only a send can have a count.
-        assert(operation == .send or count == 0);
+        const count = table.operationCount(operation);
         assert(count <= slots_count);
         return count;
     }
@@ -370,8 +470,8 @@ pub const Sim = struct {
 
     /// Drops `peer`'s connection, which must be live, as the real type's shutdown does: see
     /// "Sticking and dropping" above. Takes no slot and completes nothing itself. A drawn
-    /// failure leaves every send as it was and counts on the entry; the failure that reaches
-    /// `constants.io_drop_attempts_max`, and every drop after it, returns
+    /// failure leaves every operation as it was and counts on the entry; the failure that
+    /// reaches `constants.io_drop_attempts_max`, and every drop after it, returns
     /// `error.DropsExhausted`, the later ones drawing nothing.
     pub fn drop(self: *Sim, peer: io.PeerId) io.DropError!void {
         comptime assertSimulationAllowed();
@@ -384,7 +484,7 @@ pub const Sim = struct {
         try table.dropAdmit(peer);
         self.dropped += 1;
         // Shut down already: on the real type a second shutdown returns success or
-        // ENOTCONN, neither a failure, and every send was settled by the first.
+        // ENOTCONN, neither a failure, and everything was settled by the first.
         if (self.isDropped(peer)) return;
         if (self.chance(self.drop_fail_percent)) {
             self.drops_failed += 1;
@@ -392,24 +492,27 @@ pub const Sim = struct {
         }
         const parts: connections.IdParts = @bitCast(peer);
         self.dropped_ids[parts.index] = peer;
-        self.endSends(peer);
-        // Nothing sent to a dropped connection waits any more.
-        assert(self.stuckSendsTo(peer) == 0);
+        self.endOperations(peer);
+        // Nothing sent to or received from a dropped connection waits any more.
+        assert(self.stuckTo(peer) == 0);
     }
 
-    /// Ends the sends to a just dropped `peer`: each stuck one completes with PeerDown
-    /// within the longest delay, capped at the run's last tick; each one still pending
-    /// either keeps its own result or completes with PeerDown on its own tick, drawn. One
-    /// due already had finished before the drop, and keeps its result. At most
-    /// `slots_count` steps.
-    fn endSends(self: *Sim, peer: io.PeerId) void {
+    /// Ends the sends and the receive in flight to a just dropped `peer`: each stuck one
+    /// completes within the longest delay, capped at the run's last tick; each one still
+    /// pending either keeps its own result or ends on its own tick, drawn. One due already
+    /// had finished before the drop, and one a cancel reached is settled; each keeps its
+    /// result. A send ends with PeerDown; a receive with PeerDown or end of stream, drawn.
+    /// At most `slots_count` steps.
+    fn endOperations(self: *Sim, peer: io.PeerId) void {
         assert(self.isDropped(peer));
         const ended_before = self.sendsEndedBy(peer);
         var index: u32 = 0;
         while (index < slots_count) : (index += 1) {
             const slot = if (self.slots[index]) |*slot| slot else continue;
-            if (slot.submission.operation != .send) continue;
-            if (slot.submission.operation.send.peer != peer) continue;
+            const kind: io.Kind = slot.submission.operation;
+            if (kind != .send and kind != .receive) continue;
+            if (io.operationPeer(slot.submission.operation).? != peer) continue;
+            if (slot.by_cancel) continue;
             if (slot.stuck) {
                 const delay = self.drop_source.random().uintAtMost(u32, constants.sim_completion_delay_ticks_max);
                 slot.due_tick = @min(self.ticks + delay, constants.sim_ticks_max);
@@ -417,12 +520,54 @@ pub const Sim = struct {
             } else if (slot.by_drop or slot.due_tick <= self.ticks or self.drop_source.random().boolean()) {
                 continue;
             }
-            slot.drawn = .{ .send = error.PeerDown };
+            slot.drawn = self.endedByDrop(kind);
             slot.by_drop = true;
         }
         assert(index == slots_count);
         // A drop only ever adds sends it ends, never takes one back.
         assert(self.sendsEndedBy(peer) >= ended_before);
+    }
+
+    /// The result a drop gives a send or a receive it ends: a send PeerDown; a receive
+    /// PeerDown or end of stream, drawn from the drop stream.
+    fn endedByDrop(self: *Sim, kind: io.Kind) Drawn {
+        assert(kind == .send or kind == .receive);
+        const result: Drawn = if (kind == .send)
+            .{ .send = error.PeerDown }
+        else if (self.drop_source.random().boolean())
+            .{ .receive = error.PeerDown }
+        else
+            .{ .receive = 0 };
+        assert(@as(io.Kind, result) == kind);
+        return result;
+    }
+
+    /// Reaches, for a cancel of `peer` being submitted, every send and receive in flight to
+    /// it that isn't settled: stuck, or not due yet and not ended by a drop. Each completes
+    /// with `error.Canceled` within the longest delay, drawn from the drop stream. Returns
+    /// how many it reached. At most `slots_count` steps.
+    fn cancelReach(self: *Sim, peer: io.PeerId) u32 {
+        assert(self.table != null); // A cancel names a peer in a table.
+        var reached: u32 = 0;
+        var index: u32 = 0;
+        while (index < slots_count) : (index += 1) {
+            const slot = if (self.slots[index]) |*slot| slot else continue;
+            const kind: io.Kind = slot.submission.operation;
+            if (kind != .send and kind != .receive) continue;
+            if (io.operationPeer(slot.submission.operation).? != peer) continue;
+            if (slot.by_drop or slot.by_cancel) continue;
+            if (!slot.stuck and slot.due_tick <= self.ticks) continue;
+            const delay = self.drop_source.random().uintAtMost(u32, constants.sim_completion_delay_ticks_max);
+            slot.due_tick = @min(self.ticks + delay, constants.sim_ticks_max);
+            slot.stuck = false;
+            slot.by_cancel = true;
+            slot.drawn = if (kind == .send) .{ .send = error.Canceled } else .{ .receive = error.Canceled };
+            reached += 1;
+        }
+        assert(index == slots_count);
+        // Nothing to the cancelled connection waits on its own any more.
+        assert(self.stuckTo(peer) == 0);
+        return reached;
     }
 
     /// Sends in flight to `peer` that a drop has ended. At most `slots_count` steps.
@@ -431,6 +576,7 @@ pub const Sim = struct {
         var ended: u32 = 0;
         for (self.slots) |maybe| {
             const slot = maybe orelse continue;
+            if (slot.submission.operation != .send) continue;
             if (slot.by_drop and slot.submission.operation.send.peer == peer) ended += 1;
         }
         // Each is a send in flight, counted on the peer's entry.
@@ -453,7 +599,7 @@ pub const Sim = struct {
         var stuck: u32 = 0;
         for (self.slots) |maybe| {
             const slot = maybe orelse continue;
-            if (slot.stuck) stuck += 1;
+            if (slot.stuck and slot.submission.operation == .send) stuck += 1;
         }
         assert(stuck <= self.sends_in_flight);
         assert(stuck <= self.sends_stuck);
@@ -466,22 +612,45 @@ pub const Sim = struct {
         var stuck: u32 = 0;
         for (self.slots) |maybe| {
             const slot = maybe orelse continue;
-            if (slot.stuck and slot.submission.operation.send.peer == peer) stuck += 1;
+            if (!slot.stuck or slot.submission.operation != .send) continue;
+            if (slot.submission.operation.send.peer == peer) stuck += 1;
         }
         assert(stuck <= self.table.?.get(peer).sends_in_flight);
         return stuck;
     }
 
-    /// A new slot as its connection's state leaves it: a send to a dropped connection is
+    /// Stuck sends and receives in flight to `peer`. At most `slots_count` steps.
+    fn stuckTo(self: *const Sim, peer: io.PeerId) u32 {
+        assert(self.table != null); // Both name peers in a table.
+        var stuck: u32 = 0;
+        for (self.slots) |maybe| {
+            const slot = maybe orelse continue;
+            if (!slot.stuck) continue;
+            // Only a send or a receive sticks.
+            assert(slot.submission.operation == .send or slot.submission.operation == .receive);
+            if (io.operationPeer(slot.submission.operation).? == peer) stuck += 1;
+        }
+        const entry = self.table.?.get(peer);
+        assert(stuck <= @as(u32, entry.sends_in_flight) + @intFromBool(entry.receiving));
+        return stuck;
+    }
+
+    /// A new slot as its connection's state leaves it. A send to a dropped connection is
     /// PeerDown; a send to a connection with a send stuck already sticks too, as every
     /// later send on a socket whose client stopped reading waits on the real type; any
-    /// other send sticks at the drawn chance. The stick roll comes from its own stream,
-    /// drawn for every send while sticking is on, so neither drops nor other connections'
-    /// states change which sends stick.
+    /// other send sticks at the drawn chance. A receive is settled by `fatedReceive`, and a
+    /// cancel reaches what is in flight to its connection (`cancelReach`). The stick roll
+    /// comes from its own stream, drawn for every send and receive while sticking is on, so
+    /// neither drops nor other connections' states change which operations stick.
     fn fated(self: *Sim, slot: Slot) Slot {
         var result = slot;
         const send = switch (slot.submission.operation) {
             .send => |send| send,
+            .receive => return self.fatedReceive(slot),
+            .cancel => |cancel| {
+                result.drawn = .{ .cancel = self.cancelReach(cancel.peer) };
+                return result;
+            },
             .execute, .accept => return result,
         };
         const stuck_before = self.sends_stuck;
@@ -496,6 +665,61 @@ pub const Sim = struct {
         assert(result.by_drop == self.isDropped(send.peer));
         assert(self.sends_stuck == stuck_before + @intFromBool(result.stuck));
         return result;
+    }
+
+    /// A new receive's slot: on a dropped connection it ends as a drop ends one; otherwise
+    /// it sticks at the drawn chance (a client gone silent), or takes the bytes it drew from
+    /// its client's stream, which land in its buffer at completion.
+    fn fatedReceive(self: *Sim, slot: Slot) Slot {
+        var result = slot;
+        const receive = slot.submission.operation.receive;
+        const read_before = self.streamRead(receive.peer);
+        const rolled = self.stickRoll();
+        if (self.isDropped(receive.peer)) {
+            result.drawn = self.endedByDrop(.receive);
+            result.by_drop = true;
+        } else if (rolled) {
+            result.stuck = true;
+            self.receives_stuck += 1;
+        } else {
+            // A reset or a client that closed early has sent its last byte: the rest of its
+            // stream is gone, so every later receive reads end of stream.
+            const left: u32 = @intCast(self.client_stream.?.len - read_before);
+            const ends = if (slot.drawn.receive) |count| count == 0 else |err| err == error.PeerDown;
+            const count = slot.drawn.receive catch 0;
+            result.stream_at = self.streamTake(receive.peer, count);
+            if (ends) _ = self.streamTake(receive.peer, left - count);
+        }
+        // Only bytes that will land are taken from the stream, or all of it when it ends.
+        const taken = self.streamRead(receive.peer) - read_before;
+        assert(taken == 0 or !(result.stuck or result.by_drop));
+        assert(taken <= self.client_stream.?.len - read_before);
+        return result;
+    }
+
+    /// How much of its client's stream `peer`'s connection has received; 0 for a
+    /// connection that hasn't received yet, a new one on its entry included.
+    fn streamRead(self: *const Sim, peer: io.PeerId) u32 {
+        const stream = self.client_stream.?; // `submit` checked it for every receive.
+        const parts: connections.IdParts = @bitCast(peer);
+        assert(parts.index < constants.http_connections_max);
+        if (self.stream_ids[parts.index] != peer) return 0;
+        const read = self.stream_read[parts.index];
+        assert(read <= stream.len);
+        return read;
+    }
+
+    /// Takes `count` bytes of `peer`'s client stream, starting a new connection's stream
+    /// from its first byte, and returns where they start.
+    fn streamTake(self: *Sim, peer: io.PeerId, count: u32) u32 {
+        const at = self.streamRead(peer);
+        const parts: connections.IdParts = @bitCast(peer);
+        // `drawReceive` never draws past what is left.
+        assert(count <= self.client_stream.?.len - at);
+        self.stream_ids[parts.index] = peer;
+        self.stream_read[parts.index] = at + count;
+        assert(self.streamRead(peer) == at + count);
+        return at;
     }
 
     /// One roll of the stick stream at `stick_percent`; draws nothing while it is 0, so a
@@ -524,20 +748,23 @@ pub const Sim = struct {
         var occupied: u32 = 0;
         var sends: u32 = 0;
         var accepts: u32 = 0;
+        var cancels: u32 = 0;
         var index: u32 = 0;
         while (index < slots_count) : (index += 1) {
             const slot = self.slots[index] orelse continue;
             occupied += 1;
             if (slot.submission.operation == .send) sends += 1;
             if (slot.submission.operation == .accept) accepts += 1;
+            if (slot.submission.operation == .cancel) cancels += 1;
             assert(slot.submission.id != id);
         }
-        // The count of occupied slots, `in_flight`, `sends_in_flight` and the share kept
-        // from accepts are kept separately; they must agree.
+        // The count of occupied slots, `in_flight`, `sends_in_flight` and the shares kept
+        // for accepts and cancels are kept separately; they must agree.
         assert(occupied == self.in_flight);
         assert(sends == self.sends_in_flight);
-        assert(occupied - accepts == self.share.others_in_flight);
+        assert(occupied - accepts - cancels == self.share.others_in_flight);
         assert(accepts == self.share.accepts_in_flight);
+        assert(cancels == self.share.cancels_in_flight);
     }
 
     /// Takes a free slot, scanning from a seeded offset.
@@ -559,6 +786,9 @@ pub const Sim = struct {
             .send => |send| .{ .send = self.drawSend(send) },
             .execute => .{ .execute = self.drawExecute() },
             .accept => .{ .accept = self.drawArrival() },
+            .receive => |receive| .{ .receive = self.drawReceive(receive) },
+            // What a cancel reaches depends on what is in flight, not on a draw (`fated`).
+            .cancel => .{ .cancel = 0 },
         };
         assert(@as(io.Kind, result) == @as(io.Kind, operation));
         return result;
@@ -577,6 +807,35 @@ pub const Sim = struct {
             return 1 + self.outcomes.random().uintLessThan(u32, length - 1);
         }
         return length;
+    }
+
+    /// A receive's connection resets, the system is short, or its client closes early as a
+    /// fault; otherwise it reads 1 to the least of its buffer, what its client has left and
+    /// `receive_chunk_max`, or end of stream once its client has sent everything.
+    fn drawReceive(self: *Sim, receive: io.Receive) io.ReceiveError!u32 {
+        assert(receive.buffer.len > 0);
+        assert(receive.buffer.len <= constants.http_request_size_max);
+        const left: u32 = @intCast(self.client_stream.?.len - self.streamRead(receive.peer));
+        // Every receive makes the same draws, whatever its connection's state, so a drop or
+        // a stuck receive never shifts a later operation's draws: whether it faults, which
+        // fault, and a raw count scaled into what is left.
+        const faulted = self.fault();
+        const which = self.outcomes.random().uintLessThan(u8, 3);
+        const raw = self.outcomes.random().int(u32);
+        if (faulted) {
+            return switch (which) {
+                0 => error.PeerDown,
+                1 => error.Backpressure,
+                else => 0, // The client closes before it has sent everything.
+            };
+        }
+        if (left == 0) return 0;
+        const most = @min(@min(left, self.receive_chunk_max), @as(u32, @intCast(receive.buffer.len)));
+        assert(most > 0);
+        // Multiply-high: `raw` scaled into 0 to most - 1, with no rejection loop.
+        const count: u32 = 1 + @as(u32, @intCast((@as(u64, raw) * most) >> 32));
+        assert(count >= 1 and count <= most);
+        return count;
     }
 
     fn drawExecute(self: *Sim) io.DatabaseError!void {
@@ -611,22 +870,16 @@ pub const Sim = struct {
         assert(self.completed < self.submitted);
         assert(hashOperation(slot.submission.operation) == slot.bytes_hash);
         self.share.released(slot.submission.operation);
+        // The table refused to release the peer while this was counted, so the id is still
+        // live; `operationCompleted` crashes if it isn't.
+        if (io.operationPeer(slot.submission.operation) != null) {
+            self.table.?.operationCompleted(slot.submission.operation);
+        }
         const result: io.Result = switch (slot.drawn) {
             .send => |sent| sent: {
                 assert(self.sends_in_flight > 0); // Counted at submit.
                 self.sends_in_flight -= 1;
-                // The table refused to release the peer while this send was counted, so
-                // the id is still live; `sendCompleted` crashes if it isn't.
-                const send = slot.submission.operation.send;
-                const table = self.table.?;
-                const sends_before = table.get(send.peer).sends_in_flight;
-                table.sendCompleted(send.peer);
-                assert(table.get(send.peer).sends_in_flight == sends_before - 1);
-                if (slot.by_drop) {
-                    // A drop ends a send only with PeerDown, never with bytes sent.
-                    assert(std.meta.isError(sent));
-                    self.sends_dropped += 1;
-                } else self.countSend(sent, send);
+                self.countSendEnd(slot, sent);
                 break :sent .{ .send = sent };
             },
             .execute => |executed| executed: {
@@ -634,10 +887,66 @@ pub const Sim = struct {
                 break :executed .{ .execute = executed };
             },
             .accept => |arrival| .{ .accept = self.arrive(arrival) },
+            .receive => |received| .{ .receive = self.land(slot, received) },
+            .cancel => |reached| cancel: {
+                self.cancels += 1;
+                break :cancel .{ .cancel = reached };
+            },
         };
         assert(@as(io.Kind, result) == @as(io.Kind, slot.submission.operation));
         self.completed += 1;
         return .{ .id = slot.submission.id, .result = result };
+    }
+
+    /// Counts how a send ended: by a drop, by a cancel, or as drawn.
+    fn countSendEnd(self: *Sim, slot: Slot, sent: io.SendError!u32) void {
+        const send = slot.submission.operation.send;
+        // A drop ends a send only with PeerDown, and a cancel only with Canceled.
+        assert(!slot.by_drop or sent == error.PeerDown);
+        assert(slot.by_cancel == (sent == error.Canceled));
+        if (slot.by_drop) {
+            self.sends_dropped += 1;
+        } else if (slot.by_cancel) {
+            self.table.?.assertCanceled(send.peer); // The check the real type makes.
+            self.canceled += 1;
+        } else self.countSend(sent, send);
+    }
+
+    /// A receive's result: its drawn bytes copied from its client's stream into its buffer,
+    /// or how a fault, a drop or a cancel ended it, each counted.
+    fn land(self: *Sim, slot: Slot, received: io.ReceiveError!u32) io.ReceiveError!u32 {
+        const receive = slot.submission.operation.receive;
+        assert(!slot.by_cancel or received == error.Canceled);
+        assert(slot.by_cancel == (received == error.Canceled));
+        const faults_before = self.faults.total();
+        const count = received catch |err| {
+            if (slot.by_drop) {
+                self.receives_dropped += 1;
+            } else switch (err) {
+                error.PeerDown => self.faults.receive_peer_down += 1,
+                error.Backpressure => self.faults.receive_backpressure += 1,
+                error.Canceled => {
+                    self.table.?.assertCanceled(receive.peer); // The check the real type makes.
+                    self.canceled += 1;
+                },
+            }
+            return err;
+        };
+        if (count == 0) {
+            if (slot.by_drop) {
+                self.receives_dropped += 1;
+            } else if (slot.stream_at < self.client_stream.?.len) {
+                self.faults.receive_closed_early += 1;
+            } else self.receives_ended += 1;
+            return 0;
+        }
+        assert(!slot.by_drop and !slot.by_cancel);
+        const stream = self.client_stream.?;
+        assert(slot.stream_at + count <= stream.len); // Taken from the stream at submit.
+        @memcpy(receive.buffer[0..count], stream[slot.stream_at..][0..count]);
+        self.bytes_received += count;
+        assert(self.faults.total() == faults_before);
+        return count;
     }
 
     /// An arrival takes a table entry under a fresh fake socket; a full table refuses it and
@@ -684,6 +993,7 @@ pub const Sim = struct {
             switch (err) {
                 error.PeerDown => self.faults.peer_down += 1,
                 error.Backpressure => self.faults.backpressure += 1,
+                error.Canceled => unreachable, // `countSendEnd` counts those.
             }
             assert(self.faults.total() == faults_before + 1);
             return;
@@ -722,15 +1032,28 @@ fn assertOperation(operation: io.Operation) void {
             assert(execute.statement.len <= constants.postgres_message_size_max);
         },
         .accept => |accept| assert(accept.listener >= 0),
+        .receive => |receive| {
+            const peer: connections.IdParts = @bitCast(receive.peer);
+            assert(peer.index < constants.http_connections_max);
+            assert(receive.buffer.len > 0);
+            assert(receive.buffer.len <= constants.http_request_size_max);
+        },
+        .cancel => |cancel| {
+            const peer: connections.IdParts = @bitCast(cancel.peer);
+            assert(peer.index < constants.http_connections_max);
+        },
     }
 }
 
-/// An accept names no caller bytes; its listener is hashed, so every kind is checked alike.
+/// An accept and a cancel name no caller bytes; the listener or the peer is hashed, so every
+/// kind is checked alike. A receive's buffer is hashed as `submit` poisoned it.
 fn hashOperation(operation: io.Operation) u64 {
     const bytes: []const u8 = switch (operation) {
         .send => |send| send.bytes,
         .execute => |execute| execute.statement,
         .accept => |*accept| std.mem.asBytes(&accept.listener),
+        .receive => |receive| receive.buffer,
+        .cancel => |*cancel| std.mem.asBytes(&cancel.peer),
     };
     assert(bytes.len > 0);
     assert(bytes.len <= @max(constants.http_response_size_max, constants.postgres_message_size_max));
@@ -832,12 +1155,18 @@ fn testSubmission(id: io.OperationId) io.Submission {
 }
 
 /// The submission each id fills a whole table with: `testSubmission` within the share kept
-/// from accepts, and an accept in each slot past it.
+/// from accepts and cancels, a cancel of one of the entries past the test peers in each
+/// slot kept for cancels, and an accept in each slot past those. Needs a table of
+/// `full_peers` entries.
 fn fullSubmission(id: io.OperationId) io.Submission {
     assert(id < slots_count);
-    // The share leaves at least one slot for the accepts.
-    comptime assert(shared_slots_max < slots_count);
+    // The share leaves at least one slot for the cancels and one for the accepts.
+    comptime assert(shared_slots_max + constants.io_cancels_in_flight_max < slots_count);
     if (id < shared_slots_max) return testSubmission(id);
+    const cancel = id - shared_slots_max;
+    if (cancel < constants.io_cancels_in_flight_max) {
+        return .{ .id = id, .operation = .{ .cancel = .{ .peer = test_peers + cancel } } };
+    }
     return .{ .id = id, .operation = .{ .accept = .{ .listener = test_listener } } };
 }
 
@@ -940,7 +1269,8 @@ test "sim: a zero fault rate never fails and never sends short" {
     for (completions[0..count]) |completion| switch (completion.result) {
         .send => |sent| try testing.expectEqual(@as(u32, 5), try sent),
         .execute => |executed| try executed,
-        .accept => return error.TestUnexpectedResult, // Nothing here submits an accept.
+        // Nothing here submits an accept, a receive or a cancel.
+        .accept, .receive, .cancel => return error.TestUnexpectedResult,
     };
     try testing.expectEqual(@as(u64, 0), sim.faults.total());
     try testing.expectEqual(@as(u64, 5), sim.bytes_sent);
@@ -949,7 +1279,7 @@ test "sim: a zero fault rate never fails and never sends short" {
 
 test "sim: a full table refuses a submission and changes nothing" {
     var fixture: TableFixture = undefined;
-    try fixture.setUpPeers(test_peers);
+    try fixture.setUpPeers(full_peers);
     defer fixture.tearDown();
     var sim = Sim.init(3, 0);
     sim.attachTable(&fixture.table);
@@ -960,8 +1290,12 @@ test "sim: a full table refuses a submission and changes nothing" {
     const refused = testSubmission(id);
     try testing.expectEqual(io.Kind.send, @as(io.Kind, refused.operation));
     const entry_before = fixture.table.get(refused.operation.send.peer).*;
-    try testing.expectEqual(@as(connections.SendCount, slots_count / test_peers), entry_before.sends_in_flight);
+    const peer_sends = (shared_slots_max + test_peers - 1) / test_peers;
+    try testing.expectEqual(@as(connections.SendCount, peer_sends), entry_before.sends_in_flight);
     try testing.expectError(error.QueueFull, sim.submit(refused));
+    // A full queue wins over a full share, for a cancel as for a send.
+    const cancel: io.Submission = .{ .id = id, .operation = .{ .cancel = .{ .peer = test_peers - 1 } } };
+    try testing.expectError(error.QueueFull, sim.submit(cancel));
     try testing.expectEqual(entry_before, fixture.table.get(refused.operation.send.peer).*);
     try testing.expectEqual(slots_count, sim.in_flight);
     try testing.expectEqual(@as(u64, slots_count), sim.submitted);
@@ -970,14 +1304,15 @@ test "sim: a full table refuses a submission and changes nothing" {
     var ticks: u32 = 0;
     while (ticks <= constants.sim_completion_delay_ticks_max) : (ticks += 1) sim.tick();
     try testing.expectEqual(@as(u32, 1), sim.poll(&completions));
-    // The freed slot takes the kind that left it: an accept's slot stays kept for accepts.
+    // The freed slot takes the kind that left it: an accept's slot stays kept for accepts,
+    // and a cancel's for cancels.
     try sim.submit(fullSubmission(completions[0].id));
     try testing.expectEqual(slots_count, sim.in_flight);
 }
 
 test "sim: past the share kept from accepts, a send and a statement are refused and an accept still goes in" {
     var fixture: TableFixture = undefined;
-    try fixture.setUpPeers(test_peers);
+    try fixture.setUpPeers(full_peers);
     defer fixture.tearDown();
     var sim = Sim.init(5, 0);
     sim.attachTable(&fixture.table);
@@ -1003,12 +1338,21 @@ test "sim: past the share kept from accepts, a send and a statement are refused 
     try testing.expectEqualDeep(slots_before, sim.slots);
     try testing.expectEqual(outcomes_before, sim.outcomes.s);
 
-    // The operations kept back take an accept; then the table is full for every kind. A
-    // second accept would pass `constants.accepts_in_flight_max`, a caller's bug that stops
-    // the process before the queue is checked (the startup-trip harness covers it).
+    // The operations kept back take an accept and the cancels; then the table is full for
+    // every kind. A second accept would pass `constants.accepts_in_flight_max`, a caller's
+    // bug that stops the process before the queue is checked (the startup-trip harness
+    // covers it).
     const accept: io.Submission = .{ .id = id, .operation = .{ .accept = .{ .listener = test_listener } } };
     try sim.submit(accept);
+    try testing.expectEqual(shared_slots_max + 1, sim.in_flight);
+    var cancel: u32 = 0;
+    while (cancel < constants.io_cancels_in_flight_max) : (cancel += 1) {
+        // Ids past any the test hands out elsewhere.
+        const cancel_id: io.OperationId = 2 * slots_count + cancel;
+        try sim.submit(.{ .id = cancel_id, .operation = .{ .cancel = .{ .peer = test_peers + cancel } } });
+    }
     try testing.expectEqual(slots_count, sim.in_flight);
+    try testing.expectEqual(constants.io_cancels_in_flight_max, sim.share.cancels_in_flight);
     try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
     try testing.expectEqual(constants.accepts_in_flight_max, sim.share.accepts_in_flight);
     try testing.expectError(error.QueueFull, sim.submit(.{ .id = id + 1, .operation = statement.operation }));
@@ -1022,13 +1366,14 @@ test "sim: past the share kept from accepts, a send and a statement are refused 
     try testing.expectEqual(@as(u32, 0), sim.sends_in_flight);
     try testing.expectEqual(@as(u32, 0), sim.share.others_in_flight);
     try testing.expectEqual(@as(u32, 0), sim.share.accepts_in_flight);
+    try testing.expectEqual(@as(u32, 0), sim.share.cancels_in_flight);
     try testing.expectEqual(@as(u32, 0), sim.in_flight);
     try fixture.expectNoSendsCounted();
 }
 
-test "sim: an accept counts against no share, so a send still takes the last free slot" {
+test "sim: an accept counts against no share, so a send still takes the share's last place" {
     // The share counts operations, not free slots: with an accept in flight beside one
-    // operation fewer than the share, the last free slot goes to a send.
+    // operation fewer than the share, the share's last place goes to a send.
     var fixture: TableFixture = undefined;
     try fixture.setUpPeers(test_peers);
     defer fixture.tearDown();
@@ -1037,10 +1382,10 @@ test "sim: an accept counts against no share, so a send still takes the last fre
     try sim.submit(.{ .id = 0, .operation = .{ .accept = .{ .listener = test_listener } } });
     var id: io.OperationId = 1;
     while (id < shared_slots_max) : (id += 1) try sim.submit(testSubmission(id));
-    try testing.expectEqual(slots_count - 1, sim.in_flight);
+    try testing.expectEqual(shared_slots_max, sim.in_flight);
     try testing.expectEqual(shared_slots_max - 1, sim.share.others_in_flight);
     try sim.submit(.{ .id = id, .operation = .{ .send = .{ .peer = 1, .bytes = "s" } } });
-    try testing.expectEqual(slots_count, sim.in_flight);
+    try testing.expectEqual(shared_slots_max + 1, sim.in_flight);
     try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
 
     // Once the accept completes, its slot is free but kept: a statement is refused, and
@@ -1059,19 +1404,19 @@ test "sim: an accept counts against no share, so a send still takes the last fre
         }
     }
     try testing.expect(accept_done);
-    try testing.expectEqual(slots_count - 1, sim.in_flight);
+    try testing.expectEqual(shared_slots_max, sim.in_flight);
     try testing.expectEqual(shared_slots_max, sim.share.others_in_flight);
     const statement: io.Submission = .{ .id = id + 1, .operation = .{ .execute = .{ .statement = "select 1" } } };
     try testing.expectError(error.SlotsKeptForAccepts, sim.submit(statement));
     try sim.submit(.{ .id = id + 1, .operation = .{ .accept = .{ .listener = test_listener } } });
-    try testing.expectEqual(slots_count, sim.in_flight);
+    try testing.expectEqual(shared_slots_max + 1, sim.in_flight);
 }
 
 test "sim: an id may be reused once its operation has completed" {
     // Ids need be distinct only while in flight. With every other slot still full, the id
     // that just completed is accepted again, three times over.
     var fixture: TableFixture = undefined;
-    try fixture.setUpPeers(test_peers);
+    try fixture.setUpPeers(full_peers);
     defer fixture.tearDown();
     var sim = Sim.init(17, 0);
     sim.attachTable(&fixture.table);
@@ -1208,6 +1553,9 @@ const TableFixture = struct {
 
 /// The peers the send tests name: `testSubmission` sends to peer `id % test_peers`.
 const test_peers: u32 = 8;
+/// The test peers, then one entry for each cancel `fullSubmission` keeps in flight, apart
+/// from the peers sends go to, since a cancelled entry takes no more sends.
+const full_peers: u32 = test_peers + constants.io_cancels_in_flight_max;
 
 /// The fake socket a send test's entry holds: below any arrival's, and distinct per entry.
 fn peerSocket(index: u32) io.Socket {
@@ -1424,7 +1772,7 @@ test "sim: with the share full, the slot kept for accepts still waits out a Back
     // `constants.accepts_in_flight_max` accepts, so another would be a caller's bug. The
     // nearest case is the share full and the kept slot free: the accept is refused by the
     // wait, not by the share, and the wait's count says so.
-    comptime assert(slots_count - shared_slots_max == constants.accepts_in_flight_max);
+    comptime assert(slots_count - shared_slots_max == constants.accepts_in_flight_max + constants.io_cancels_in_flight_max);
     var fixture: TableFixture = undefined;
     try fixture.setUpPeers(test_peers);
     defer fixture.tearDown();
@@ -1438,18 +1786,18 @@ test "sim: with the share full, the slot kept for accepts still waits out a Back
     try testing.expectError(error.AcceptTooSoon, sim.submit(accept));
     try testing.expectEqual(@as(u64, 1), sim.accept_wait.refused);
     try testing.expectEqual(@as(u32, 0), sim.share.accepts_in_flight);
-    // Once the wait is over, the accept takes the kept slot and fills the queue.
+    // Once the wait is over, the accept takes the kept slot; only the cancels' stay free.
     var ticks: u32 = 0;
     while (ticks < wait_ticks) : (ticks += 1) sim.tick();
     try sim.submit(accept);
-    try testing.expectEqual(slots_count, sim.in_flight);
+    try testing.expectEqual(slots_count - constants.io_cancels_in_flight_max, sim.in_flight);
     try testing.expectEqual(constants.accepts_in_flight_max, sim.share.accepts_in_flight);
     var completions: [slots_count]io.Completion = undefined;
-    try testing.expectEqual(slots_count, drainAll(&sim, &completions));
+    try testing.expectEqual(shared_slots_max + 1, drainAll(&sim, &completions));
     try fixture.expectNoSendsCounted();
     // Every entry holds a test peer, so the arrival finds the table full.
     var accepts: u32 = 0;
-    for (completions) |completion| {
+    for (completions[0 .. shared_slots_max + 1]) |completion| {
         if (completion.result != .accept) continue;
         try testing.expectError(error.TableFull, completion.result.accept);
         accepts += 1;
@@ -1469,7 +1817,7 @@ test "sim: a release with a send in flight is refused until the send completes" 
     try sim.submit(.{ .id = 2, .operation = .{ .send = send } });
     try testing.expectEqual(@as(connections.SendCount, 2), fixture.table.get(peer).sends_in_flight);
     const entry_before = fixture.table.get(peer).*;
-    try testing.expectError(error.SendsInFlight, fixture.table.release(peer));
+    try testing.expectError(error.OperationsInFlight, fixture.table.release(peer));
     try testing.expectEqual(entry_before, fixture.table.get(peer).*);
     try testing.expectEqual(test_peers, fixture.table.count());
 
@@ -1486,7 +1834,7 @@ test "sim: a release with a send in flight is refused until the send completes" 
             try testing.expectEqual(@as(u32, send.bytes.len), try completions[0].result.send);
             const left: connections.SendCount = @intCast(2 - done);
             try testing.expectEqual(left, fixture.table.get(peer).sends_in_flight);
-            if (left > 0) try testing.expectError(error.SendsInFlight, fixture.table.release(peer));
+            if (left > 0) try testing.expectError(error.OperationsInFlight, fixture.table.release(peer));
         }
     }
     try testing.expectEqual(@as(u32, 2), done);
@@ -1543,7 +1891,7 @@ const Soak = struct {
         const table = soak.table;
         const before = table.get(soak.ids[entry]).*;
         const socket = table.release(soak.ids[entry]) catch |err| {
-            try testing.expectEqual(error.SendsInFlight, err);
+            try testing.expectEqual(error.OperationsInFlight, err);
             try testing.expect(soak.sends[entry] > 0);
             try testing.expectEqual(before, table.get(soak.ids[entry]).*);
             soak.counts.releases_refused += 1;
@@ -1685,7 +2033,7 @@ test "sim: a stuck send completes only once its connection is dropped, then with
     for (completions[0..done]) |completion| try testing.expect(completion.id != stuck_id);
     try testing.expectEqual(sim.stuckSends(), sim.in_flight);
     try testing.expect(sim.in_flight >= 1);
-    try testing.expectError(error.SendsInFlight, fixture.table.release(peer));
+    try testing.expectError(error.OperationsInFlight, fixture.table.release(peer));
 
     try sim.drop(peer);
     try testing.expectEqual(@as(u32, 0), sim.stuckSends());
@@ -1916,7 +2264,7 @@ const DropSoak = struct {
         soak.sim.submit(.{ .id = id, .operation = accept }) catch |err| switch (err) {
             error.QueueFull, error.AcceptTooSoon => return,
             // Never for an accept.
-            error.SlotsKeptForAccepts => return error.TestUnexpectedResult,
+            error.SlotsKeptForAccepts, error.CancelsFull => return error.TestUnexpectedResult,
         };
         soak.accepts_submitted += 1;
         soak.accept_in_flight = true;
@@ -1934,7 +2282,8 @@ const DropSoak = struct {
                 soak.counts.refused_share += 1;
                 return;
             },
-            error.AcceptTooSoon => return error.TestUnexpectedResult, // Only for an accept.
+            // Only for an accept or a cancel.
+            error.AcceptTooSoon, error.CancelsFull => return error.TestUnexpectedResult,
         };
         soak.send_entry[@intCast(id)] = @intCast(entry);
         soak.sends[entry] += 1;
@@ -1970,7 +2319,7 @@ const DropSoak = struct {
                     soak.counts.accepts += 1;
                     if (share_full) soak.counts.accepts_while_share_full += 1;
                 },
-                .execute => return error.TestUnexpectedResult,
+                .execute, .receive, .cancel => return error.TestUnexpectedResult,
             }
         }
         var entry: u32 = 0;
@@ -2039,4 +2388,280 @@ test "sim: seeded stuck sends fill the share while accepts keep completing; drop
         try testing.expect(counts.dropped > 0);
         try testing.expectEqual(counts, try dropSoak(seed));
     }
+}
+
+const client_request = "GET /status HTTP/1.1\r\nHost: coalition.example\r\n\r\n";
+
+/// Receives on `peer` into `buffer`, one at a time, each taken back before the next goes in,
+/// until one reads end of stream or fails, appending what lands after `filled`. Returns how
+/// many bytes landed; `ended` says how the last receive ended. At most `receives_max`.
+fn receiveAll(sim: *Sim, peer: io.PeerId, buffer: []u8, first: io.OperationId, ended: *?io.ReceiveError!u32) !u32 {
+    const receives_max: u32 = 4 * client_stream_bytes_max;
+    var filled: u32 = 0;
+    var receives: u32 = 0;
+    while (receives < receives_max) : (receives += 1) {
+        if (filled == buffer.len) return error.TestBufferFull;
+        const into = buffer[filled..];
+        try sim.submit(.{ .id = first + receives, .operation = .{ .receive = .{ .peer = peer, .buffer = into } } });
+        // The buffer belongs to the simulator until the completion: it holds the poison.
+        try testing.expect(std.mem.allEqual(u8, into, receive_poison));
+        var completions: [1]io.Completion = undefined;
+        try testing.expectEqual(@as(u32, 1), drainAll(sim, &completions));
+        try testing.expectEqual(first + receives, completions[0].id);
+        const received = completions[0].result.receive catch |err| {
+            ended.* = err;
+            return filled;
+        };
+        if (received == 0) {
+            ended.* = 0;
+            return filled;
+        }
+        filled += received;
+    }
+    return error.TestTooManyReceives;
+}
+
+test "sim: receives read the client's stream a byte at a time when bounded, then end of stream" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(21, 0);
+    sim.attachTable(&fixture.table);
+    sim.setClientStream(client_request, 1);
+    var buffer: [constants.http_request_size_max]u8 = undefined;
+    var ended: ?io.ReceiveError!u32 = null;
+    const filled = try receiveAll(&sim, 2, &buffer, 0, &ended);
+    // Every byte arrived once, in order, one per receive, and then the client closed.
+    try testing.expectEqualStrings(client_request, buffer[0..filled]);
+    try testing.expectEqual(@as(?io.ReceiveError!u32, 0), ended);
+    try testing.expectEqual(@as(u64, client_request.len), sim.bytes_received);
+    try testing.expectEqual(@as(u64, client_request.len + 1), sim.completed);
+    try testing.expectEqual(@as(u32, 1), sim.receives_ended);
+    try testing.expect(!fixture.table.get(2).receiving);
+    // Another connection's client sends its own copy from the start.
+    var other: [client_request.len + 1]u8 = undefined;
+    const other_filled = try receiveAll(&sim, 3, &other, 1000, &ended);
+    try testing.expectEqualStrings(client_request, other[0..other_filled]);
+}
+
+test "sim: unbounded receives read the stream in drawn chunks; a reused entry's client starts again" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(22, 0);
+    sim.attachTable(&fixture.table);
+    sim.setClientStream(client_request, constants.http_request_size_max);
+    var buffer: [constants.http_request_size_max]u8 = undefined;
+    var ended: ?io.ReceiveError!u32 = null;
+    const filled = try receiveAll(&sim, 4, &buffer, 0, &ended);
+    try testing.expectEqualStrings(client_request, buffer[0..filled]);
+    // Released and taken again under a new id, the entry's client sends from the start.
+    try testing.expectEqual(peerSocket(4), try fixture.table.release(4));
+    const reused = try fixture.table.acquire(peerSocket(4));
+    try testing.expect(reused != 4);
+    const again = try receiveAll(&sim, reused, &buffer, 100, &ended);
+    try testing.expectEqualStrings(client_request, buffer[0..again]);
+}
+
+test "sim: a seeded run draws every receive fault and short reads" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(23, constants.sim_fault_percent_max);
+    sim.attachTable(&fixture.table);
+    sim.setClientStream(client_request, constants.http_request_size_max);
+    var buffer: [constants.http_request_size_max]u8 = undefined;
+    var peers: [test_peers]io.PeerId = undefined;
+    for (&peers, 0..) |*peer, index| peer.* = index;
+    var rounds: u32 = 0;
+    var next: io.OperationId = 0;
+    while (rounds < 64) : (rounds += 1) {
+        var ended: ?io.ReceiveError!u32 = null;
+        const slot = rounds % test_peers;
+        const filled = try receiveAll(&sim, peers[slot], &buffer, next, &ended);
+        next += 1000;
+        // Whatever landed is the stream's start, however the receives ended.
+        try testing.expectEqualStrings(client_request[0..filled], buffer[0..filled]);
+        // The connection ends, and its entry comes back under a new id.
+        try testing.expectEqual(peerSocket(slot), try fixture.table.release(peers[slot]));
+        peers[slot] = try fixture.table.acquire(peerSocket(slot));
+    }
+    try testing.expect(sim.faults.receive_peer_down > 0);
+    try testing.expect(sim.faults.receive_backpressure > 0);
+    try testing.expect(sim.faults.receive_closed_early > 0);
+    try testing.expect(sim.receives_ended > 0);
+}
+
+test "sim: a cancel ends a stuck receive and stuck sends with Canceled, and counts what it reached" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(24, 0);
+    sim.attachTable(&fixture.table);
+    sim.setClientStream(client_request, 1);
+    // Every send and receive sticks, as on a client that went silent and stopped reading.
+    sim.setDropFaults(constants.sim_fault_percent_max, 0);
+    const peer: io.PeerId = 5;
+    var buffer: [8]u8 = undefined;
+    var id: io.OperationId = 0;
+    while (sim.receives_stuck == 0 and id < 64) : (id += 1) {
+        try sim.submit(.{ .id = id, .operation = .{ .receive = .{ .peer = peer, .buffer = &buffer } } });
+        var completions: [1]io.Completion = undefined;
+        if (sim.receives_stuck == 0) _ = drainAll(&sim, &completions);
+    }
+    try testing.expectEqual(@as(u32, 1), sim.receives_stuck);
+    const receive_id = id - 1;
+    const send_id = try submitUntilStuck(&sim, peer, 100, 64);
+    try testing.expect(sim.stuckTo(peer) >= 2);
+    const in_flight = sim.in_flight;
+    try sim.submit(.{ .id = 200, .operation = .{ .cancel = .{ .peer = peer } } });
+    try testing.expect(fixture.table.get(peer).canceled);
+    try testing.expectEqual(@as(u32, 0), sim.stuckTo(peer));
+    var completions: [slots_count]io.Completion = undefined;
+    try testing.expectEqual(in_flight + 1, drainAll(&sim, &completions));
+    var reached: u32 = 0;
+    var canceled: u32 = 0;
+    for (completions[0 .. in_flight + 1]) |completion| switch (completion.result) {
+        .cancel => |count| reached = count,
+        .receive => |received| {
+            try testing.expectEqual(receive_id, completion.id);
+            try testing.expectError(error.Canceled, received);
+            canceled += 1;
+        },
+        .send => |sent| {
+            // The sends before the stuck one completed on their own; the rest are cancelled.
+            if (completion.id >= send_id) try testing.expectError(error.Canceled, sent);
+            if (sent == error.Canceled) canceled += 1;
+        },
+        .accept, .execute => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(canceled, reached);
+    try testing.expectEqual(canceled, sim.canceled);
+    try testing.expect(reached >= 2);
+    try testing.expectEqual(@as(u32, 1), sim.cancels);
+    try testing.expectEqual(@as(u64, 0), sim.faults.total());
+    try testing.expect(!fixture.table.get(peer).busy());
+    _ = try fixture.table.release(peer);
+    _ = try fixture.table.acquire(peerSocket(peer));
+}
+
+test "sim: a drop ends a stuck receive with PeerDown or end of stream, both drawn over seeds" {
+    var ends: [2]u32 = .{ 0, 0 };
+    var seed: u64 = 1;
+    while (seed <= 32) : (seed += 1) {
+        var fixture: TableFixture = undefined;
+        try fixture.setUpPeers(test_peers);
+        defer fixture.tearDown();
+        var sim = Sim.init(seed, 0);
+        sim.attachTable(&fixture.table);
+        sim.setClientStream(client_request, 1);
+        sim.setDropFaults(constants.sim_fault_percent_max, 0);
+        var buffer: [8]u8 = undefined;
+        var id: io.OperationId = 0;
+        var completions: [1]io.Completion = undefined;
+        while (sim.receives_stuck == 0 and id < 64) : (id += 1) {
+            try sim.submit(.{ .id = id, .operation = .{ .receive = .{ .peer = 1, .buffer = &buffer } } });
+            if (sim.receives_stuck == 0) _ = drainAll(&sim, &completions);
+        }
+        try testing.expectEqual(@as(u32, 1), sim.receives_stuck);
+        try sim.drop(1);
+        try testing.expectEqual(@as(u32, 1), drainAll(&sim, &completions));
+        if (completions[0].result.receive) |received| {
+            try testing.expectEqual(@as(u32, 0), received);
+            ends[0] += 1;
+        } else |err| {
+            try testing.expectEqual(error.PeerDown, err);
+            ends[1] += 1;
+        }
+        try testing.expectEqual(@as(u32, 1), sim.receives_dropped);
+        try testing.expectEqual(@as(u64, 0), sim.faults.total());
+    }
+    try testing.expect(ends[0] > 0 and ends[1] > 0);
+}
+
+test "sim: past the cancels' share a cancel is refused with CancelsFull and changes nothing" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(full_peers + 1);
+    defer fixture.tearDown();
+    var sim = Sim.init(25, 0);
+    sim.attachTable(&fixture.table);
+    var cancel: u32 = 0;
+    while (cancel < constants.io_cancels_in_flight_max) : (cancel += 1) {
+        try sim.submit(.{ .id = cancel, .operation = .{ .cancel = .{ .peer = test_peers + cancel } } });
+    }
+    const last: io.PeerId = full_peers;
+    const entry_before = fixture.table.get(last).*;
+    const outcomes_before = sim.outcomes.s;
+    const refused: io.Submission = .{ .id = cancel, .operation = .{ .cancel = .{ .peer = last } } };
+    try testing.expectError(error.CancelsFull, sim.submit(refused));
+    try testing.expectEqual(entry_before, fixture.table.get(last).*);
+    try testing.expectEqual(outcomes_before, sim.outcomes.s);
+    try testing.expectEqual(constants.io_cancels_in_flight_max, sim.in_flight);
+    // A send still goes in beside a full cancels' share, and the cancel once one is back.
+    try sim.submit(.{ .id = cancel + 1, .operation = .{ .send = .{ .peer = 0, .bytes = "s" } } });
+    var completions: [slots_count]io.Completion = undefined;
+    try testing.expectEqual(constants.io_cancels_in_flight_max + 1, drainAll(&sim, &completions));
+    try sim.submit(refused);
+    try testing.expectEqual(@as(u32, 1), drainAll(&sim, &completions));
+    try testing.expectEqual(@as(u32, 0), completions[0].result.cancel);
+}
+
+test "sim: a cancel skips what a drop settled or what was due, and a later drop leaves Canceled alone" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(26, 0);
+    sim.attachTable(&fixture.table);
+    sim.setDropFaults(constants.sim_fault_percent_max, 0);
+    // Peer 1: a stuck send, ended by a working drop, then cancelled: the cancel reaches none.
+    const dropped_id = try submitUntilStuck(&sim, 1, 0, 64);
+    try sim.drop(1);
+    try sim.submit(.{ .id = 300, .operation = .{ .cancel = .{ .peer = 1 } } });
+    // Peer 2: a stuck send, cancelled, then dropped: it stays Canceled.
+    const canceled_id = try submitUntilStuck(&sim, 2, 100, 64);
+    try sim.submit(.{ .id = 301, .operation = .{ .cancel = .{ .peer = 2 } } });
+    try sim.drop(2);
+    var completions: [slots_count]io.Completion = undefined;
+    const count = drainAll(&sim, &completions);
+    var reached_by: [2]u32 = .{ 0, 0 };
+    var canceled_sends: u32 = 0;
+    for (completions[0..count]) |completion| switch (completion.result) {
+        .send => |sent| {
+            if (completion.id == dropped_id) try testing.expectError(error.PeerDown, sent);
+            if (completion.id == canceled_id) try testing.expectError(error.Canceled, sent);
+            // Only peer 2's sends, ids from 100, may be cancelled.
+            if (sent == error.Canceled) {
+                try testing.expect(completion.id >= 100);
+                canceled_sends += 1;
+            }
+        },
+        .cancel => |reached| reached_by[@intCast(completion.id - 300)] = reached,
+        .accept, .execute, .receive => return error.TestUnexpectedResult,
+    };
+    // Peer 1's sends were all settled by its drop; peer 2's pending ones were reached.
+    try testing.expectEqual(@as(u32, 0), reached_by[0]);
+    try testing.expectEqual(canceled_sends, reached_by[1]);
+    try testing.expect(canceled_sends >= 1);
+    try testing.expectEqual(canceled_sends, sim.canceled);
+}
+
+test "sim: a cancel leaves an operation that was due already with its own result" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(27, 0);
+    sim.attachTable(&fixture.table);
+    try sim.submit(.{ .id = 0, .operation = .{ .send = .{ .peer = 3, .bytes = "due" } } });
+    // Past the longest delay, so the send has finished, though nothing has polled it.
+    var ticks: u32 = 0;
+    while (ticks <= constants.sim_completion_delay_ticks_max) : (ticks += 1) sim.tick();
+    try sim.submit(.{ .id = 1, .operation = .{ .cancel = .{ .peer = 3 } } });
+    var completions: [2]io.Completion = undefined;
+    try testing.expectEqual(@as(u32, 2), drainAll(&sim, &completions));
+    for (completions) |completion| switch (completion.result) {
+        .send => |sent| try testing.expectEqual(@as(u32, 3), try sent),
+        .cancel => |reached| try testing.expectEqual(@as(u32, 0), reached),
+        .accept, .execute, .receive => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(u32, 0), sim.canceled);
 }

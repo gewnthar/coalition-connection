@@ -51,13 +51,22 @@
 //! socket closed in between, Linux would hand the same number to the next accepted
 //! connection, and the queued send would reach the wrong client. So each entry counts its
 //! sends in flight: `sendSubmitted` raises the count, `sendCompleted` lowers it, and
-//! `release` refuses with `error.SendsInFlight`, changing nothing, while it is above zero.
+//! `release` refuses with `error.OperationsInFlight`, changing nothing, while it is above zero.
 //! A refusal is a state the caller meets in normal running (a second send still queued
 //! when the first fails with `PeerDown`), so it is an error to handle, not a bug: the
 //! caller stops sending on that connection and releases it after its last completion. A
 //! send to a client that stops reading never completes on its own, so the caller first
 //! drops the connection through the I/O type (`drop` in the I/O contract), which fails
 //! every send still pending on its socket.
+//!
+//! Receives and cancels in flight (roadmap core 3b) hold the socket the same way, so the
+//! entry counts them too, and `release` refuses while either is in flight. Each entry has at
+//! most one receive in flight (`receiveSubmitted`), since two would split the connection's
+//! bytes between their buffers, and at most one cancel. Once a cancel has been submitted the
+//! entry is `canceled` until it is released, and no send or receive may be submitted on it:
+//! the cancel reaches only what was in flight when it went in, so anything later could be
+//! left stuck. A send or receive that completes with `error.Canceled` must have a canceled
+//! entry (`assertCanceled`).
 //!
 //! Failed drops: a drop can fail (an errno shutdown(2) doesn't document), leaving the sends
 //! pending. The I/O type counts each failure on the entry (`dropFailed`) and asks the entry
@@ -107,9 +116,9 @@ pub const HeadScan = http_request.HeadScan;
 
 pub const AcquireError = error{TableFull};
 
-/// `SendsInFlight`: the connection still has sends the kernel may act on, so its socket
-/// must stay open; release it after the last one completes.
-pub const ReleaseError = error{SendsInFlight};
+/// `OperationsInFlight`: the connection still has sends, a receive or a cancel the kernel may
+/// act on, so its socket must stay open; release it after the last one completes.
+pub const ReleaseError = error{OperationsInFlight};
 
 /// Sends in flight on one connection. Never more than the I/O type has slots for.
 pub const SendCount = u16;
@@ -139,6 +148,24 @@ pub const Entry = struct {
     /// Drops of this connection that failed, leaving its sends pending. Zero whenever
     /// `state` is `free`: `release` clears it.
     drops_failed: DropCount = 0,
+    /// A receive is in flight on this connection: at most one at a time. False whenever
+    /// `state` is `free`: `release` refuses while it is set.
+    receiving: bool = false,
+    /// A cancel is in flight on this connection: at most one at a time. False whenever
+    /// `state` is `free`: `release` refuses while it is set.
+    cancel_in_flight: bool = false,
+    /// A cancel has been submitted on this connection, so no send or receive may be any
+    /// more. False whenever `state` is `free`: `release` clears it.
+    canceled: bool = false,
+
+    /// Whether any operation in flight still names this entry's socket.
+    pub fn busy(self: *const Entry) bool {
+        // A receive or a cancel in flight names a live connection's socket.
+        assert(!(self.receiving or self.cancel_in_flight) or self.socket >= 0);
+        // A cancel in flight marks the entry canceled for the rest of its life.
+        assert(!self.cancel_in_flight or self.canceled);
+        return self.sends_in_flight > 0 or self.receiving or self.cancel_in_flight;
+    }
 };
 
 /// Bytes of table state one connection costs: its entry plus its slot on the free stack.
@@ -239,8 +266,9 @@ pub const Table = struct {
         assert(entry.state == .free); // A stacked index names a free entry.
         assert(entry.scan.resume_at == 0); // release empties the scan of every entry it frees.
         assert(entry.socket == -1); // release clears the socket of every entry it frees.
-        assert(entry.sends_in_flight == 0); // release refuses an entry with sends in flight.
+        assert(!entry.busy()); // release refuses an entry with anything in flight.
         assert(entry.drops_failed == 0); // release clears the failed drops of every entry.
+        assert(!entry.canceled); // release clears the cancel of every entry.
         entry.socket = socket;
         entry.state = .idle;
         const id: PeerId = @bitCast(IdParts{ .index = index, .generation = entry.generation });
@@ -250,8 +278,8 @@ pub const Table = struct {
 
     /// Returns `id`'s entry to the free stack, emptying its head scan and advancing its
     /// generation, so `id` is stale from now on. Hands back the socket, which the caller
-    /// must close. While the connection has sends in flight, returns
-    /// `error.SendsInFlight` and changes nothing. Releasing an entry not in use, or through
+    /// must close. While the connection has sends, a receive or a cancel in flight, returns
+    /// `error.OperationsInFlight` and changes nothing. Releasing an entry not in use, or through
     /// a stale id, is a bug.
     pub fn release(self: *Table, id: PeerId) ReleaseError!Socket {
         const count_before = self.count();
@@ -260,7 +288,7 @@ pub const Table = struct {
         const entry = &self.entries[index];
         const socket = entry.socket;
         assert(socket >= 0);
-        if (entry.sends_in_flight > 0) return error.SendsInFlight;
+        if (entry.busy()) return error.OperationsInFlight;
         const generation_next = entry.generation +% 1;
         entry.* = .{ .socket = -1, .state = .free, .generation = generation_next };
         assert(self.free_count < self.capacity()); // An entry in use has no slot on the stack.
@@ -330,6 +358,8 @@ pub const Table = struct {
         assert(entry.socket >= 0);
         // The I/O type has at most this many operations in flight, sends or not.
         assert(entry.sends_in_flight < constants.io_operations_in_flight_max);
+        // A cancel reaches only what was in flight when it went in.
+        assert(!entry.canceled);
         entry.sends_in_flight += 1;
     }
 
@@ -341,6 +371,122 @@ pub const Table = struct {
         assert(entry.socket >= 0);
         assert(entry.sends_in_flight > 0); // A completion for a send never counted.
         entry.sends_in_flight -= 1;
+    }
+
+    /// Counts a receive just submitted on `id`'s connection, which must be live, have no
+    /// receive in flight already and not be canceled. Until the matching `receiveCompleted`,
+    /// `release` refuses the entry.
+    pub fn receiveSubmitted(self: *Table, id: PeerId) void {
+        const entry = &self.entries[self.liveIndex(id)];
+        assert(entry.socket >= 0);
+        // Two receives would split the connection's bytes between their buffers.
+        assert(!entry.receiving);
+        // A cancel reaches only what was in flight when it went in.
+        assert(!entry.canceled);
+        entry.receiving = true;
+    }
+
+    /// Counts the receive on `id`'s connection as completed. `id` must still be live, as for
+    /// `sendCompleted`.
+    pub fn receiveCompleted(self: *Table, id: PeerId) void {
+        const entry = &self.entries[self.liveIndex(id)];
+        assert(entry.socket >= 0);
+        assert(entry.receiving); // A completion for a receive never counted.
+        entry.receiving = false;
+    }
+
+    /// Counts a cancel just submitted on `id`'s connection, which must be live and have no
+    /// cancel in flight already. The entry is canceled from now until it is released: no
+    /// send or receive may be submitted on it. Until the matching `cancelCompleted`,
+    /// `release` refuses the entry.
+    pub fn cancelSubmitted(self: *Table, id: PeerId) void {
+        const entry = &self.entries[self.liveIndex(id)];
+        assert(entry.socket >= 0);
+        // The caller waits for one cancel's completion before it submits another.
+        assert(!entry.cancel_in_flight);
+        entry.cancel_in_flight = true;
+        entry.canceled = true;
+    }
+
+    /// Counts the cancel on `id`'s connection as completed. `id` must still be live, as for
+    /// `sendCompleted`. The entry stays canceled.
+    pub fn cancelCompleted(self: *Table, id: PeerId) void {
+        const entry = &self.entries[self.liveIndex(id)];
+        assert(entry.canceled); // Set by cancelSubmitted, cleared only by release.
+        assert(entry.cancel_in_flight); // A completion for a cancel never counted.
+        entry.cancel_in_flight = false;
+    }
+
+    /// Stops the process unless `id`'s connection, which must be live, takes one more
+    /// operation of `kind` right now: a send or a receive only before any cancel, a second
+    /// receive or a second cancel never while one is in flight. The I/O type calls it
+    /// before it checks anything that can refuse the submission, so a caller's bug stops
+    /// the process however full the queue is. Changes nothing.
+    pub fn assertRoomFor(self: *const Table, id: PeerId, kind: io.Kind) void {
+        const entry = &self.entries[self.liveIndex(id)];
+        assert(entry.socket >= 0);
+        assert(kind != .accept and kind != .execute); // Neither names a connection.
+        switch (kind) {
+            .send => assert(!entry.canceled),
+            .receive => assert(!entry.canceled and !entry.receiving),
+            .cancel => assert(!entry.cancel_in_flight),
+            .accept, .execute => unreachable, // Asserted above.
+        }
+    }
+
+    /// Counts `operation` on its peer's entry, just submitted: a send, a receive or a
+    /// cancel, through the call for its kind. The real type and the simulator both call
+    /// this, so the counts can't differ between them.
+    pub fn operationSubmitted(self: *Table, operation: io.Operation) void {
+        const count_before = self.operationCount(operation);
+        switch (operation) {
+            .send => |send| self.sendSubmitted(send.peer),
+            .receive => |receive| self.receiveSubmitted(receive.peer),
+            .cancel => |cancel| self.cancelSubmitted(cancel.peer),
+            .accept, .execute => {},
+        }
+        const added: u32 = @intFromBool(io.operationPeer(operation) != null);
+        assert(self.operationCount(operation) == count_before + added);
+        // A cancel marks its entry for the rest of the connection's life.
+        assert(operation != .cancel or self.get(operation.cancel.peer).canceled);
+    }
+
+    /// Uncounts `operation` on its peer's entry, just completed, through the call for its
+    /// kind; the peer must still be live.
+    pub fn operationCompleted(self: *Table, operation: io.Operation) void {
+        const peer = io.operationPeer(operation).?; // Only a peer's operation is counted.
+        const count_before = self.operationCount(operation);
+        assert(count_before > 0);
+        switch (operation) {
+            .send => self.sendCompleted(peer),
+            .receive => self.receiveCompleted(peer),
+            .cancel => self.cancelCompleted(peer),
+            .accept, .execute => unreachable, // Asserted above: they name no peer.
+        }
+        assert(self.operationCount(operation) == count_before - 1);
+    }
+
+    /// What `operation`'s peer entry counts of its kind: the sends in flight, or 1 while a
+    /// receive or a cancel is; 0 for an accept or a statement, which name no peer.
+    pub fn operationCount(self: *const Table, operation: io.Operation) u32 {
+        const counted: u32 = switch (operation) {
+            .send => |send| self.get(send.peer).sends_in_flight,
+            .receive => |receive| @intFromBool(self.get(receive.peer).receiving),
+            .cancel => |cancel| @intFromBool(self.get(cancel.peer).cancel_in_flight),
+            .accept, .execute => 0,
+        };
+        assert(io.operationPeer(operation) != null or counted == 0);
+        assert(counted <= constants.io_operations_in_flight_max);
+        return counted;
+    }
+
+    /// Stops the process unless `id`'s connection, which must be live, has been canceled:
+    /// for an I/O type handing back a send or a receive that completed with
+    /// `error.Canceled`, which only a cancel of its connection causes.
+    pub fn assertCanceled(self: *const Table, id: PeerId) void {
+        const entry = &self.entries[self.liveIndex(id)];
+        assert(entry.socket >= 0);
+        assert(entry.canceled);
     }
 
     /// Refuses a drop of `id`'s connection, which must be live, with `error.DropsExhausted`
@@ -390,8 +536,9 @@ pub const Table = struct {
             assert(self.entries[index].state == .free);
             assert(self.entries[index].scan.resume_at == 0); // A free entry holds no scan.
             assert(self.entries[index].socket == -1);
-            assert(self.entries[index].sends_in_flight == 0); // release refuses those.
+            assert(!self.entries[index].busy()); // release refuses those.
             assert(self.entries[index].drops_failed == 0); // release clears them.
+            assert(!self.entries[index].canceled); // release clears it.
             assert(!stacked.isSet(index)); // An index on the free stack twice.
             stacked.set(index);
         }
@@ -535,13 +682,13 @@ test "connections: a connection with sends in flight is refused release, changin
     @memcpy(&free_indices_before, table.free_indices);
 
     // Refused while either send is in flight; the entry, its id and the stack stay as they were.
-    try testing.expectError(error.SendsInFlight, table.release(busy));
+    try testing.expectError(error.OperationsInFlight, table.release(busy));
     try testing.expectEqualSlices(Entry, &entries_before, table.entries);
     try testing.expectEqualSlices(Index, &free_indices_before, table.free_indices);
     try testing.expectEqual(@as(u32, 2), table.count());
     try testing.expectEqual(table.get(busy), table.lookup(busy).?);
     table.sendCompleted(busy);
-    try testing.expectError(error.SendsInFlight, table.release(busy));
+    try testing.expectError(error.OperationsInFlight, table.release(busy));
     try testing.expectEqual(@as(u32, 2), table.count());
     // The other connection's count is its own: it releases at once.
     try testing.expectEqual(@as(Socket, 11), try table.release(idle));
@@ -572,7 +719,7 @@ test "connections: one connection can count a send in every I/O slot" {
     var sends: u32 = 0;
     while (sends < sends_max) : (sends += 1) table.sendSubmitted(id);
     try testing.expectEqual(@as(SendCount, @intCast(sends_max)), table.get(id).sends_in_flight);
-    try testing.expectError(error.SendsInFlight, table.release(id));
+    try testing.expectError(error.OperationsInFlight, table.release(id));
     while (sends > 0) : (sends -= 1) table.sendCompleted(id);
     try testing.expectEqual(@as(SendCount, 0), table.get(id).sends_in_flight);
     try testing.expectEqual(@as(Socket, 10), try table.release(id));
@@ -768,7 +915,7 @@ const SeededModel = struct {
         const id = model.ids[index];
         if (model.sends[index] > 0) {
             const entry_before = table.entries[index];
-            try testing.expectError(error.SendsInFlight, table.release(id));
+            try testing.expectError(error.OperationsInFlight, table.release(id));
             try testing.expectEqual(entry_before, table.entries[index]);
             table.sendCompleted(id);
             model.sends[index] -= 1;
@@ -1007,4 +1154,68 @@ test "connections: failed drops are counted to the bound, per connection, and re
     startup.beginShutdown();
     table.deinit(gpa);
     try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "connections: a receive or a cancel in flight refuses release, changing nothing, and each is counted alone" {
+    var startup = StartupAllocator.init(testing.allocator, 4 * entry_bytes);
+    const gpa = startup.allocator();
+    var table = try Table.init(gpa, 4);
+    startup.finishStartup();
+
+    const reading = try table.acquire(10);
+    const closing = try table.acquire(11);
+    const receive: io.Operation = .{ .receive = .{ .peer = reading, .buffer = &.{} } };
+    const cancel: io.Operation = .{ .cancel = .{ .peer = closing } };
+    table.assertRoomFor(reading, .receive);
+    table.operationSubmitted(receive);
+    table.assertRoomFor(closing, .cancel);
+    table.operationSubmitted(cancel);
+    try testing.expect(table.get(reading).receiving);
+    try testing.expect(!table.get(reading).canceled);
+    try testing.expect(table.get(closing).cancel_in_flight and table.get(closing).canceled);
+    // Each kind is counted only on its own peer, and only as its own kind.
+    try testing.expectEqual(@as(u32, 1), table.operationCount(receive));
+    try testing.expectEqual(@as(u32, 1), table.operationCount(cancel));
+    try testing.expectEqual(@as(SendCount, 0), table.get(reading).sends_in_flight);
+    try testing.expect(!table.get(closing).receiving);
+
+    var entries_before: [4]Entry = undefined;
+    @memcpy(&entries_before, table.entries);
+    try testing.expectError(error.OperationsInFlight, table.release(reading));
+    try testing.expectError(error.OperationsInFlight, table.release(closing));
+    try testing.expectEqualSlices(Entry, &entries_before, table.entries);
+    try testing.expectEqual(@as(u32, 2), table.count());
+
+    // The completions uncount them; the cancelled entry stays cancelled until release.
+    table.operationCompleted(receive);
+    table.operationCompleted(cancel);
+    try testing.expectEqual(@as(u32, 0), table.operationCount(receive));
+    try testing.expectEqual(@as(u32, 0), table.operationCount(cancel));
+    try testing.expect(table.get(closing).canceled);
+    table.assertCanceled(closing);
+    // A second cancel may follow once the first is back, and a second receive likewise.
+    table.assertRoomFor(closing, .cancel);
+    table.assertRoomFor(reading, .receive);
+    table.assertRoomFor(reading, .send);
+
+    try testing.expectEqual(@as(Socket, 10), try table.release(reading));
+    try testing.expectEqual(@as(Socket, 11), try table.release(closing));
+    // A reused entry starts with nothing in flight and no cancel.
+    const reused = try table.acquire(12);
+    try testing.expect(!table.get(reused).receiving);
+    try testing.expect(!table.get(reused).cancel_in_flight and !table.get(reused).canceled);
+    table.assertRoomFor(reused, .send);
+    table.assertInvariants();
+
+    _ = try table.release(reused);
+    startup.beginShutdown();
+    table.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), startup.bytes_live);
+}
+
+test "connections: the entry still fits its budget with the receive and cancel flags" {
+    // The flags take bytes the generation's alignment already pads.
+    try testing.expect(entry_bytes <= constants.http_connection_entry_size_max);
+    // The same bytes as before the flags: they fill padding, so the memory table's row holds.
+    try testing.expectEqual(@as(u32, 26), entry_bytes);
 }
