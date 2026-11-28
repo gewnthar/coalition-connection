@@ -17,6 +17,7 @@
 //!   poll(self: *IO, []Completion) u32                   take finished operations
 //!   randomBytes(self: *IO, []u8) RandomError!void       fill a buffer with random bytes
 //!   drop(self: *IO, PeerId) DropError!void              shut a connection down both ways
+//!   release(self: *IO, PeerId) ReleaseError!void        free a connection's entry, close it
 //!
 //! Operation lifetime: the bytes an operation names belong to the caller and must stay valid
 //! and unchanged until its completion arrives, as with io_uring; the simulator checks this.
@@ -91,6 +92,13 @@
 //! nothing and never fails. The simulator and the real type both count through the same
 //! table calls (`Table.dropAdmit`, `Table.dropFailed`).
 //!
+//! Releasing a connection: once nothing is in flight on a connection, `release` frees its
+//! entry in the connection table and closes its socket, the way an accept took both, so
+//! the caller never holds a raw socket at either end of a connection's life. While a send,
+//! a receive or a cancel is still in flight on it, `release` returns
+//! `error.OperationsInFlight` and changes nothing. The simulator and the real type both
+//! release through the same table call (`Table.release`).
+//!
 //! Placeholders: `execute` stands in for database traffic until roadmap core 11 frames
 //! Postgres over sockets. Components should not build on `execute`.
 //!
@@ -164,6 +172,10 @@ pub const DatabaseError = error{ Unavailable, Timeout };
 /// `DropsExhausted`: dropping this connection has failed `constants.io_drop_attempts_max`
 /// times, so the I/O type no longer tries; its sends may still be pending.
 pub const DropError = error{DropsExhausted};
+
+/// `OperationsInFlight`: a send, a receive or a cancel is still in flight on the
+/// connection, so its entry and socket stay as they were.
+pub const ReleaseError = error{OperationsInFlight};
 
 /// Why an accept handed back no connection. `TableFull`: a connection arrived, but every
 /// entry of the connection table is in use, so it was closed. `PeerDown`: the connection
@@ -428,6 +440,7 @@ pub fn contractError(comptime IO: type) ?[]const u8 {
         methodError(IO, "poll", fn (*IO, []Completion) u32),
         methodError(IO, "randomBytes", fn (*IO, []u8) RandomError!void),
         methodError(IO, "drop", fn (*IO, PeerId) DropError!void),
+        methodError(IO, "release", fn (*IO, PeerId) ReleaseError!void),
     };
     var first: ?[]const u8 = null;
     for (messages) |message| {
@@ -510,8 +523,8 @@ test "io: a stand-in with a wrong signature is refused" {
 }
 
 /// The contract's methods, so a test can name which one a stand-in gets wrong.
-const Method = enum { now, submit, poll, random_bytes, drop };
-const methods_count: u32 = 5;
+const Method = enum { now, submit, poll, random_bytes, drop, release };
+const methods_count: u32 = 6;
 
 /// The name each method has in the contract.
 fn methodName(comptime method: Method) []const u8 {
@@ -521,6 +534,7 @@ fn methodName(comptime method: Method) []const u8 {
         .poll => "poll",
         .random_bytes => "randomBytes",
         .drop => "drop",
+        .release => "release",
     };
     assert(name.len > 0);
     assert(name.len <= "randomBytes".len);
@@ -536,6 +550,7 @@ fn Signature(comptime IO: type, comptime method: Method) type {
         .poll => fn (*IO, []Completion) u32,
         .random_bytes => fn (*IO, []u8) RandomError!void,
         .drop => fn (*IO, PeerId) DropError!void,
+        .release => fn (*IO, PeerId) ReleaseError!void,
     };
     assert(@typeInfo(result) == .@"fn");
     assert(@typeInfo(result).@"fn".param_types.len >= 1);
@@ -589,6 +604,10 @@ fn StandInMethods(comptime Self: type) type {
             _ = self;
             _ = peer;
         }
+        pub fn release(self: *Self, peer: PeerId) ReleaseError!void {
+            _ = self;
+            _ = peer;
+        }
     };
 }
 
@@ -609,6 +628,7 @@ const Correct = struct {
     pub const poll = StandInMethods(Correct).poll;
     pub const randomBytes = StandInMethods(Correct).randomBytes;
     pub const drop = StandInMethods(Correct).drop;
+    pub const release = StandInMethods(Correct).release;
 };
 
 /// `now` takes `*const Self` where the contract takes `*Self`, so it couldn't keep its last
@@ -622,6 +642,7 @@ const WrongNow = struct {
     pub const poll = StandInMethods(WrongNow).poll;
     pub const randomBytes = StandInMethods(WrongNow).randomBytes;
     pub const drop = StandInMethods(WrongNow).drop;
+    pub const release = StandInMethods(WrongNow).release;
 };
 
 /// `submit` widens its error set to `anyerror`, so callers lose an exhaustive switch.
@@ -634,6 +655,7 @@ const WrongSubmit = struct {
     pub const poll = StandInMethods(WrongSubmit).poll;
     pub const randomBytes = StandInMethods(WrongSubmit).randomBytes;
     pub const drop = StandInMethods(WrongSubmit).drop;
+    pub const release = StandInMethods(WrongSubmit).release;
 };
 
 /// `randomBytes` returns a count the contract doesn't have.
@@ -647,6 +669,7 @@ const WrongRandom = struct {
         return @intCast(buffer.len);
     }
     pub const drop = StandInMethods(WrongRandom).drop;
+    pub const release = StandInMethods(WrongRandom).release;
 };
 
 /// `drop` returns nothing, so a caller couldn't learn that a connection's drops are
@@ -659,6 +682,22 @@ const WrongDrop = struct {
     pub fn drop(self: *WrongDrop, peer: PeerId) void {
         _ = self;
         _ = peer;
+    }
+    pub const release = StandInMethods(WrongDrop).release;
+};
+
+/// `release` hands back the socket, so a caller would hold a raw descriptor again and
+/// close it itself, apart from the I/O type that took it.
+const WrongRelease = struct {
+    pub const now = StandInMethods(WrongRelease).now;
+    pub const submit = StandInMethods(WrongRelease).submit;
+    pub const poll = StandInMethods(WrongRelease).poll;
+    pub const randomBytes = StandInMethods(WrongRelease).randomBytes;
+    pub const drop = StandInMethods(WrongRelease).drop;
+    pub fn release(self: *WrongRelease, peer: PeerId) ReleaseError!Socket {
+        _ = self;
+        _ = peer;
+        return 0;
     }
 };
 
@@ -674,6 +713,7 @@ test "io: each method's signature is checked" {
     try expectMessage(WrongPoll, messageWrong(WrongPoll, .poll));
     try expectMessage(WrongRandom, messageWrong(WrongRandom, .random_bytes));
     try expectMessage(WrongDrop, messageWrong(WrongDrop, .drop));
+    try expectMessage(WrongRelease, messageWrong(WrongRelease, .release));
 }
 
 test "io: a private method counts as missing, for each method" {
@@ -689,6 +729,7 @@ test "io: a private method counts as missing, for each method" {
         pub const poll = StandInMethods(Self).poll;
         pub const randomBytes = StandInMethods(Self).randomBytes;
         pub const drop = StandInMethods(Self).drop;
+        pub const release = StandInMethods(Self).release;
     };
     const PrivateSubmit = struct {
         const Self = @This();
@@ -700,6 +741,7 @@ test "io: a private method counts as missing, for each method" {
         pub const poll = StandInMethods(Self).poll;
         pub const randomBytes = StandInMethods(Self).randomBytes;
         pub const drop = StandInMethods(Self).drop;
+        pub const release = StandInMethods(Self).release;
     };
     const PrivatePoll = struct {
         const Self = @This();
@@ -712,6 +754,7 @@ test "io: a private method counts as missing, for each method" {
         }
         pub const randomBytes = StandInMethods(Self).randomBytes;
         pub const drop = StandInMethods(Self).drop;
+        pub const release = StandInMethods(Self).release;
     };
     const PrivateRandom = struct {
         const Self = @This();
@@ -723,6 +766,7 @@ test "io: a private method counts as missing, for each method" {
             @memset(buffer, 0);
         }
         pub const drop = StandInMethods(Self).drop;
+        pub const release = StandInMethods(Self).release;
     };
     const PrivateDrop = struct {
         const Self = @This();
@@ -734,12 +778,26 @@ test "io: a private method counts as missing, for each method" {
             _ = self;
             _ = peer;
         }
+        pub const release = StandInMethods(Self).release;
+    };
+    const PrivateRelease = struct {
+        const Self = @This();
+        pub const now = StandInMethods(Self).now;
+        pub const submit = StandInMethods(Self).submit;
+        pub const poll = StandInMethods(Self).poll;
+        pub const randomBytes = StandInMethods(Self).randomBytes;
+        pub const drop = StandInMethods(Self).drop;
+        fn release(self: *Self, peer: PeerId) ReleaseError!void {
+            _ = self;
+            _ = peer;
+        }
     };
     try expectMessage(PrivateNow, messageMissing(PrivateNow, .now));
     try expectMessage(PrivateSubmit, messageMissing(PrivateSubmit, .submit));
     try expectMessage(PrivatePoll, messageMissing(PrivatePoll, .poll));
     try expectMessage(PrivateRandom, messageMissing(PrivateRandom, .random_bytes));
     try expectMessage(PrivateDrop, messageMissing(PrivateDrop, .drop));
+    try expectMessage(PrivateRelease, messageMissing(PrivateRelease, .release));
 }
 
 test "io: a type with several problems is blamed for the first, in contract order" {
@@ -780,6 +838,17 @@ test "io: a type with several problems is blamed for the first, in contract orde
             return @intCast(buffer.len);
         }
     };
+    const DropWrongReleaseMissing = struct {
+        const Self = @This();
+        pub const now = StandInMethods(Self).now;
+        pub const submit = StandInMethods(Self).submit;
+        pub const poll = StandInMethods(Self).poll;
+        pub const randomBytes = StandInMethods(Self).randomBytes;
+        pub fn drop(self: *Self, peer: PeerId) void {
+            _ = self;
+            _ = peer;
+        }
+    };
     const Empty = struct {};
     comptime assert(std.enums.values(Method).len == methods_count);
     try expectMessage(Empty, messageMissing(Empty, .now));
@@ -787,6 +856,7 @@ test "io: a type with several problems is blamed for the first, in contract orde
     try expectMessage(SubmitWrongRestMissing, messageWrong(SubmitWrongRestMissing, .submit));
     try expectMessage(PollWrongRandomMissing, messageWrong(PollWrongRandomMissing, .poll));
     try expectMessage(RandomWrongDropMissing, messageWrong(RandomWrongDropMissing, .random_bytes));
+    try expectMessage(DropWrongReleaseMissing, messageWrong(DropWrongReleaseMissing, .drop));
 }
 
 test {
