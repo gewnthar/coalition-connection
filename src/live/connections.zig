@@ -118,7 +118,7 @@ pub const AcquireError = error{TableFull};
 
 /// `OperationsInFlight`: the connection still has sends, a receive or a cancel the kernel may
 /// act on, so its socket must stay open; release it after the last one completes.
-pub const ReleaseError = error{OperationsInFlight};
+pub const ReleaseError = io.ReleaseError;
 
 /// Sends in flight on one connection. Never more than the I/O type has slots for.
 pub const SendCount = u16;

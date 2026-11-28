@@ -251,6 +251,8 @@ pub const Sim = struct {
     /// The wait after an accept completed with `Backpressure`, kept through the same calls
     /// as on the real type, and the accepts it refused.
     accept_wait: io.AcceptWait,
+    /// Connections `release` has freed.
+    released: u64,
 
     pub fn init(seed: u64, fault_percent: u8) Sim {
         comptime assertSimulationAllowed();
@@ -296,6 +298,7 @@ pub const Sim = struct {
             .accepted = 0,
             .refused = 0,
             .accept_wait = .{},
+            .released = 0,
         };
         assert(result.ticks == 0);
         assert(result.in_flight == 0);
@@ -495,6 +498,21 @@ pub const Sim = struct {
         self.endOperations(peer);
         // Nothing sent to or received from a dropped connection waits any more.
         assert(self.stuckTo(peer) == 0);
+    }
+
+    /// Frees `peer`'s entry, which must be live, through the table call the real type makes
+    /// (`Table.release`), so an early release fails in simulation as it would there: while a
+    /// send, a receive or a cancel is in flight on it, `error.OperationsInFlight`, and
+    /// nothing changes. The fake socket needs no closing. Draws nothing.
+    pub fn release(self: *Sim, peer: io.PeerId) io.ReleaseError!void {
+        comptime assertSimulationAllowed();
+        assert(self.table != null); // Only a connection in a table can be released.
+        const table = self.table.?;
+        assert(table.lookup(peer) != null); // A live connection only, as on the real type.
+        const socket = try table.release(peer);
+        assert(socket >= 0);
+        self.released += 1;
+        assert(table.lookup(peer) == null);
     }
 
     /// Ends the sends and the receive in flight to a just dropped `peer`: each stuck one
@@ -2077,6 +2095,29 @@ test "sim: a drop reaches only its connection, and a reused entry starts undropp
     try testing.expectEqual(@as(u32, 0), sim.sends_dropped);
     try testing.expectEqual(peerSocket(5), try fixture.table.release(reused));
     _ = try fixture.table.acquire(peerSocket(5));
+}
+
+test "sim: release refuses while a send is in flight, then frees the entry, drawing nothing" {
+    var fixture: TableFixture = undefined;
+    try fixture.setUpPeers(test_peers);
+    defer fixture.tearDown();
+    var sim = Sim.init(33, 0);
+    sim.attachTable(&fixture.table);
+    try sim.submit(.{ .id = 1, .operation = .{ .send = .{ .peer = 2, .bytes = "in flight" } } });
+    const outcomes_before = sim.outcomes;
+    try testing.expectError(error.OperationsInFlight, sim.release(2));
+    try testing.expect(fixture.table.lookup(2) != null);
+    try testing.expectEqual(@as(u64, 0), sim.released);
+    // A peer with nothing in flight goes at once, and its id is stale from then on.
+    try sim.release(3);
+    try testing.expectEqual(@as(?*const connections.Entry, null), fixture.table.lookup(3));
+    var completions: [1]io.Completion = undefined;
+    try testing.expectEqual(@as(u32, 1), drainAll(&sim, &completions));
+    try sim.release(2);
+    try testing.expectEqual(@as(u64, 2), sim.released);
+    try testing.expectEqual(test_peers - 2, fixture.table.count());
+    // Releasing drew nothing: the outcome stream is where the send's draw left it.
+    try testing.expectEqual(outcomes_before.s, sim.outcomes.s);
 }
 
 test "sim: drops draw only from their own stream, and never change what sticks" {

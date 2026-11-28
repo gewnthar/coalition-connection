@@ -116,6 +116,40 @@ pub const http_response_head_room: u32 = 4 * 1024;
 /// waits for a buffer. One buffer per connection would take 4 GiB. Provisional.
 pub const http_response_buffers_max: u32 = 64;
 
+/// How long a kept-alive connection may wait for its next request's first byte. Reason:
+/// nginx closes an idle upstream connection after its keepalive_timeout, 60 seconds by
+/// default (roadmap core 48); waiting longer lets nginx close first, so it never sends a
+/// request on a connection the server is closing at that moment. Provisional.
+pub const http_idle_timeout_ns: u64 = 75 * std.time.ns_per_s;
+
+/// How long a request may take to arrive once its first byte has: head and body together.
+/// Reason: nginx buffers a request's body before it passes the request on
+/// (proxy_request_buffering on), so a whole request crosses the local socket in
+/// milliseconds; 10 seconds only bounds a peer that stalls mid-request. Provisional.
+pub const http_read_timeout_ns: u64 = 10 * std.time.ns_per_s;
+
+/// How long a response may take to go out, and the pace of drop retries while a
+/// connection closes. Reason: nginx reads a response into its proxy buffers as fast as the
+/// local socket carries it (proxy_buffering on), so even a full 1 MiB response leaves in
+/// milliseconds; a send still pending after 30 seconds is stuck, and the connection is
+/// dropped so it gives back its response buffer. A drop that fails is tried again one
+/// write timeout later, so a connection whose drops all fail holds its entry, and any
+/// buffer its stuck send reads, for up to `io_drop_attempts_max` timeouts (2 minutes)
+/// before it is cancelled. Provisional.
+pub const http_write_timeout_ns: u64 = 30 * std.time.ns_per_s;
+
+/// Bytes of the server loop's own state for one connection: what it keeps beside the
+/// connection table's entry (the operation in flight, the deadline, the response going
+/// out). Reason: the loop sizes it once at startup and counts it in the memory table;
+/// `src/live/server.zig` checks at compile time that its state fits. Raising it means
+/// raising this number in review.
+pub const server_connection_state_size_max: u32 = 128;
+
+/// Completions the server loop takes from the I/O type in one poll. Reason: large enough
+/// that a busy tick takes most of what is ready in a few polls, small enough for the
+/// loop's stack; a tick polls until fewer than this come back.
+pub const server_completions_batch: u32 = 256;
+
 /// Open websockets. Reason: one per watching page; never more than the connections.
 pub const websocket_connections_max: u32 = http_connections_max;
 
@@ -377,8 +411,8 @@ pub const memory_table_rows_max: u32 = 64;
 
 /// Every buffer sized from the limits above. The comptime block after the limits adds it up
 /// and fails the build when the total exceeds `memory_budget_bytes`. Startup buffers not yet
-/// built are not rows yet: the slice that adds one (the response-buffer wait queue in roadmap
-/// core 3; lookup tables in core 33 and core 38) adds its row here in the same change. The
+/// built are not rows yet: the slice that adds one (lookup tables in roadmap core 33 and
+/// core 38) adds its row here in the same change. The
 /// table counts memory sized at startup (heap buffers, and the io_uring ring the kernel maps
 /// for the real I/O type, with its in-flight slots), not stacks or the program itself.
 pub const memory_table = [_]MemoryRow{
@@ -396,6 +430,21 @@ pub const memory_table = [_]MemoryRow{
         .name = "HTTP response buffer pool",
         .count = http_response_buffers_max,
         .size = http_response_size_max,
+    },
+    .{
+        .name = "Server loop state, one per connection",
+        .count = http_connections_max,
+        .size = server_connection_state_size_max,
+    },
+    .{
+        .name = "Server loop free-buffer stack, one slot per response buffer",
+        .count = http_response_buffers_max,
+        .size = @sizeOf(u16),
+    },
+    .{
+        .name = "Server loop queue of connections waiting for a response buffer, one slot per connection",
+        .count = http_connections_max,
+        .size = @sizeOf(u16),
     },
     .{
         .name = "Websocket send buffer, one per websocket",
@@ -523,6 +572,12 @@ comptime {
     assert(http_response_buffers_max <= http_connections_max);
     assert(http_connection_entry_size_max > 0);
     assert(http_requests_per_connection_max > 0);
+    // A connection's deadlines run in order of length: a request in flight gets less time
+    // than a connection waiting for its next one.
+    assert(http_read_timeout_ns > 0 and http_read_timeout_ns <= http_write_timeout_ns);
+    assert(http_write_timeout_ns <= http_idle_timeout_ns);
+    assert(server_completions_batch > 0 and server_completions_batch <= io_operations_in_flight_max);
+    assert(http_response_buffers_max <= std.math.maxInt(u16));
     // The backlog holds at least one event of the largest size.
     assert(live_events_backlog_bytes_max >= websocket_message_size_max);
     assert(memory_table.len <= memory_table_rows_max);
@@ -733,6 +788,9 @@ test "constants: the real memory table counts every planned buffer" {
     const expected: u64 = connections * http_connection_entry_size_max +
         connections * http_request_size_max +
         @as(u64, http_response_buffers_max) * http_response_size_max +
+        connections * server_connection_state_size_max +
+        @as(u64, http_response_buffers_max) * @sizeOf(u16) +
+        connections * @sizeOf(u16) +
         @as(u64, websocket_connections_max) * websocket_message_size_max +
         live_events_backlog_bytes_max +
         @as(u64, esi_requests_in_flight_max) * esi_response_size_max +
@@ -742,6 +800,6 @@ test "constants: the real memory table counts every planned buffer" {
         config_load_bytes_max +
         import_record_size_max;
     const rows: u32 = memory_table.len;
-    try std.testing.expectEqual(@as(u32, 11), rows);
+    try std.testing.expectEqual(@as(u32, 14), rows);
     try std.testing.expectEqual(expected, try memoryTableBytes(&memory_table));
 }

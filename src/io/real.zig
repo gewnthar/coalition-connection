@@ -263,6 +263,16 @@ pub const Real = struct {
     /// The latest of those errnos, or `.SUCCESS` if there has been none. Print it with
     /// `@backingInt`, as for sends.
     cancel_errno_undocumented_last: linux.E,
+    /// Connections `release` has freed and closed. For metrics and tests.
+    released: u64,
+    /// Closes, of released connections and of those refused for a full table, that failed
+    /// with an errno close(2) isn't documented to return for a socket; on Linux the
+    /// descriptor is freed either way. For metrics: any count above zero
+    /// means `closeErrno` is missing a case.
+    close_errno_undocumented_count: u64,
+    /// The latest of those errnos, or `.SUCCESS` if there has been none. Print it with
+    /// `@backingInt`, as for sends.
+    close_errno_undocumented_last: linux.E,
 
     /// Sets up the ring. `startup` proves the call happens during startup; nothing is
     /// mapped or allocated afterwards.
@@ -298,6 +308,9 @@ pub const Real = struct {
             .receive_errno_undocumented_last = .SUCCESS,
             .cancel_errno_undocumented_count = 0,
             .cancel_errno_undocumented_last = .SUCCESS,
+            .released = 0,
+            .close_errno_undocumented_count = 0,
+            .close_errno_undocumented_last = .SUCCESS,
         };
         // Push the indices in reverse, so the first submission takes slot 0.
         var position: u32 = 0;
@@ -474,6 +487,47 @@ pub const Real = struct {
         assert(self.table.lookup(peer) != null); // A live connection only.
         var kernel: ShutdownKernel = .{};
         return self.dropThrough(ShutdownKernel, &kernel, peer);
+    }
+
+    /// Frees `peer`'s entry in the connection table and closes its socket, once nothing is in
+    /// flight on it: the end of a connection's life, as an accept was its start. While a
+    /// send, a receive or a cancel is still in flight, returns `error.OperationsInFlight`
+    /// and changes nothing, so the socket stays open for the kernel to finish with. `peer`
+    /// must be live. Never waits: a stream socket's close returns at once.
+    pub fn release(self: *Real, peer: io.PeerId) io.ReleaseError!void {
+        comptime assertLinux();
+        assert(self.ring.fd >= 0); // Not after deinit.
+        assert(self.table.lookup(peer) != null); // A live connection only.
+        const count_before = self.table.count();
+        const socket = try self.table.release(peer);
+        assert(socket >= 0);
+        assert(socket != self.ring.fd);
+        self.closeResult(linux.errno(linux.close(socket)));
+        self.released += 1;
+        assert(self.table.count() == count_before - 1);
+        // The entry's generation moved on, so the id is stale.
+        assert(self.table.lookup(peer) == null);
+    }
+
+    /// Handles a released socket's close errno: nothing when it closed, a stop for a bug,
+    /// a count for an errno close(2) isn't documented to return for a socket.
+    fn closeResult(self: *Real, err: linux.E) void {
+        if (err == .SUCCESS) return;
+        const undocumented_before = self.close_errno_undocumented_count;
+        // The count and the latest errno change together, so neither is set without the other.
+        assert((undocumented_before == 0) == (self.close_errno_undocumented_last == .SUCCESS));
+        const outcome = closeErrno(err);
+        switch (outcome) {
+            .closed => {},
+            .bug => std.debug.panic("close of a released connection's socket: errno {d}", .{@backingInt(err)}),
+            .undocumented => {
+                self.close_errno_undocumented_count += 1;
+                self.close_errno_undocumented_last = err;
+            },
+        }
+        // Only an undocumented errno is counted, once each.
+        const counted: u64 = @intFromBool(outcome == .undocumented);
+        assert(self.close_errno_undocumented_count == undocumented_before + counted);
     }
 
     /// Everything `drop` does, with shutdown(2) taken from `shutdown`, so tests can inject
@@ -718,15 +772,9 @@ pub const Real = struct {
         const peer = self.table.acquire(socket) catch |err| switch (err) {
             error.TableFull => {
                 assert(count_before == self.table.capacity());
-                // Linux releases the descriptor even when close is interrupted or reports
-                // an I/O error, so neither is retried: a retry could close a descriptor
-                // handed out since. The kernel handed this one over a moment ago and
-                // nothing else holds it, so any other errno is a bug in this file.
-                const closed = linux.errno(linux.close(socket));
-                switch (closed) {
-                    .SUCCESS, .INTR, .IO => {},
-                    else => std.debug.panic("close of a refused connection: errno {d}", .{@backingInt(closed)}),
-                }
+                // The same rule as a released connection's close (`closeErrno`): never
+                // retried, since a retry could close a descriptor handed out since.
+                self.closeResult(linux.errno(linux.close(socket)));
                 self.refused += 1;
                 return error.TableFull;
             },
@@ -1024,6 +1072,31 @@ fn cancelErrno(err: linux.E) CancelOutcome {
         // these mean a bug or a kernel too old for cancelling by descriptor.
         .BADF, .INVAL => .bug,
         // Counted, not fatal: the caller's next deadline cancels again.
+        else => .undocumented,
+    };
+}
+
+/// What a failed close's errno means for `Real.release`. `closed`: the descriptor is freed
+/// all the same. `bug`: only a bug in this file or its caller causes it. `undocumented`: an
+/// errno close(2) isn't documented to return for a socket.
+const CloseOutcome = enum { closed, bug, undocumented };
+
+/// Maps a close's errno to its outcome. Pure, so tests can check every arm, including the
+/// one that stops the process.
+fn closeErrno(err: linux.E) CloseOutcome {
+    // Preconditions for any caller, tests included: a failure, in the kernel's errno range
+    // of 1 to 4095.
+    assert(err != .SUCCESS);
+    assert(@backingInt(err) < 4096);
+    return switch (err) {
+        // EINTR and EIO: Linux frees the descriptor even when close is interrupted or
+        // reports an I/O error, so retrying could close a number handed out since.
+        .INTR, .IO => .closed,
+        // A number that isn't open: the table handed back a socket closed already, or one
+        // never opened, which only a bug causes.
+        .BADF => .bug,
+        // ENOSPC and EDQUOT come from files with data to flush, never from a socket;
+        // counted, not fatal, since the descriptor is freed either way.
         else => .undocumented,
     };
 }
@@ -1944,7 +2017,62 @@ fn errnoCountersOnly() Real {
     real.receive_errno_undocumented_last = .SUCCESS;
     real.cancel_errno_undocumented_count = 0;
     real.cancel_errno_undocumented_last = .SUCCESS;
+    real.close_errno_undocumented_count = 0;
+    real.close_errno_undocumented_last = .SUCCESS;
     return real;
+}
+
+test "real: every close errno has an outcome, and only an undocumented one is counted" {
+    try testing.expectEqual(CloseOutcome.closed, closeErrno(.INTR));
+    try testing.expectEqual(CloseOutcome.closed, closeErrno(.IO));
+    try testing.expectEqual(CloseOutcome.bug, closeErrno(.BADF));
+    // Named in std but not documented for a socket's close(2), and a value std has no name for.
+    const undocumented = [_]linux.E{ .NOSPC, .DQUOT, .PIPE, @fromBackingInt(4000) };
+    for (undocumented) |err| try testing.expectEqual(CloseOutcome.undocumented, closeErrno(err));
+
+    var real = errnoCountersOnly();
+    real.closeResult(.SUCCESS);
+    real.closeResult(.INTR);
+    real.closeResult(.IO);
+    try testing.expectEqual(@as(u64, 0), real.close_errno_undocumented_count);
+    try testing.expectEqual(linux.E.SUCCESS, real.close_errno_undocumented_last);
+    var count: u64 = 0;
+    for (undocumented) |err| {
+        real.closeResult(err);
+        count += 1;
+        try testing.expectEqual(count, real.close_errno_undocumented_count);
+        try testing.expectEqual(err, real.close_errno_undocumented_last);
+    }
+    try testing.expectEqual(@as(u64, undocumented.len), count);
+}
+
+test "real: release refuses while a send is in flight, then frees the entry and closes its socket" {
+    var fixture: Fixture = undefined;
+    try fixture.setUp();
+    defer fixture.tearDown();
+    var fds: [2]linux.fd_t = undefined;
+    const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &fds)));
+    defer _ = linux.close(fds[1]);
+    const other = try fixture.table.acquire(fds[0]);
+    try fixture.real.submit(.{ .id = 1, .operation = .{ .send = .{ .peer = other, .bytes = "x" } } });
+    // In flight: refused, and nothing changed, the socket still open.
+    try testing.expectError(error.OperationsInFlight, fixture.real.release(other));
+    try testing.expect(fixture.table.lookup(other) != null);
+    try testing.expectEqual(@as(u64, 0), fixture.real.released);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(fds[0], linux.F.GETFD, 0)));
+    var completions: [1]io.Completion = undefined;
+    try pollUntil(&fixture.real, &completions, 1, -1);
+    try testing.expectEqual(@as(u32, 1), try completions[0].result.send);
+    try fixture.real.release(other);
+    // The entry is free, its id stale, and the socket closed: the far end reads end of stream.
+    try testing.expectEqual(@as(?*const connections.Entry, null), fixture.table.lookup(other));
+    try testing.expectEqual(@as(u64, 1), fixture.real.released);
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fds[0], linux.F.GETFD, 0)));
+    var byte: [2]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), linux.read(fds[1], &byte, byte.len));
+    try testing.expectEqual(@as(usize, 0), linux.read(fds[1], &byte, byte.len));
+    try testing.expectEqual(@as(u64, 0), fixture.real.close_errno_undocumented_count);
 }
 
 /// Raw completion result for a failed send.

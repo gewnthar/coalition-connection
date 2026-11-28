@@ -53,9 +53,10 @@ whose choice is written down, with the date it was made.
 
 Releases 0.1 to 0.6; the release plan above says which slices go in each.
 
-Built so far: core 2, core 4, core 5, core 6, core 8 and core 51, and the sends, accepts,
-receives and cancels of core 3. Next for 0.1: the loop that joins them, then the deployment
-slices.
+Built so far: core 2, core 4, core 5, core 6, core 8 and core 51, the sends, accepts,
+receives and cancels of core 3, and the server loop that joins them (`src/live/server.zig`),
+tested in simulation and over a real Unix socket. Next for 0.1: the server program running
+that loop, then the deployment slices.
 
 ### Foundations
 
@@ -63,7 +64,7 @@ slices.
 | --- | --- | --- |
 | core 1 | **Decided (2026-10-22):** the event loop is a hand-written io_uring loop of our own, not Zig's `std.Io`, so the core doesn't depend on the standard library's I/O interface while it keeps changing | - |
 | core 2 | Real I/O implementation: monotonic clock, random bytes, and an io_uring ring that submits and polls sends | unit; contract check |
-| core 3 | Real I/O: TCP accept, read and write with fixed buffers; the response-buffer wait queue adds its row to the memory table in `src/constants.zig` | unit; simulation |
+| core 3 | Real I/O: accept, read and write with fixed buffers, and the server loop that drives them; a connection that finds the response pool empty waits for a buffer, and the loop's per-connection state is a row of the memory table in `src/constants.zig` | unit; simulation |
 | core 4 | Connection table sized from `http_connections_max`, with its row in the memory table | unit; seeded random accepts and closes against a model, up to a full table |
 | core 5 | HTTP/1.1 request parser, bounded by `http_request_size_max` | unit; fuzz |
 | core 6 | HTTP response writer and router | unit |
