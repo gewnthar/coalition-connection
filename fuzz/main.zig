@@ -17,6 +17,11 @@
 //!                  named error, never a crash, and an unmutated file must give exactly the
 //!                  values the generator wrote. The run must reach success, syntax errors
 //!                  and the nesting limit.
+//!   connection_state  many connections walked from free back to free, each event drawn from
+//!                  a model of the books a server loop keeps for the connection, every answer
+//!                  checked against a second copy of the table, the books and the machine's
+//!                  rules, with every listed pair required to come up (see
+//!                  fuzz/connection_state.zig).
 //! Each component adds its own target as it lands (parsers first). A failing seed replays
 //! exactly.
 
@@ -25,6 +30,7 @@ const assert = std.debug.assert;
 const cc = @import("coalition_connection");
 const build_options = @import("build_options");
 const http_response_fuzz = @import("http_response.zig");
+const connection_state_fuzz = @import("connection_state.zig");
 
 const capacity: u32 = 16;
 const Queue = cc.BoundedQueue(u32, capacity);
@@ -1041,6 +1047,7 @@ pub fn main() FuzzError!void {
     try runQueue(seed);
     try runHttp(seed);
     try http_response_fuzz.run(seed);
+    try connection_state_fuzz.run(seed);
     var config_failure: ?FuzzError = null;
     var config_finished = false;
     const spawn_config: std.Thread.SpawnConfig = .{ .stack_size = config_stack_size };
